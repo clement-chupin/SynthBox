@@ -1,0 +1,190 @@
+#pragma once
+#include <Arduino.h>
+#include "HWConfig.h"
+
+// ==================== MODES ====================
+enum AppMode : uint8_t {
+    MODE_SYNTH = 0,
+    MODE_OMNI,
+    MODE_DRUMS,
+    MODE_SAMPLE,
+    MODE_FX,
+    MODE_LIGHT,
+    MODE_SEQ,       // 4-track × 8-step sample sequencer
+    MODE_LIGHTPLAY, // live light ripple mode
+    MODE_BATTERY,
+    MODE_SYSINFO,   // cyberpunk HUD — system info / visual test
+    MODE_HYBRID,    // synth note + assigned sample triggered simultaneously
+    MODE_MODULAR,   // 6-encoder modular: OSC/filter/env/LFO + joystick velocity
+    MODE_SYNTH2,    // Diapasonix full patch browser (258 Juno+DX7 patches)
+    MODE_MOD2,      // PolyAnalog-inspired: waveform morph, power-law filter, LFO dest toggle
+    MODE_303,       // TB-303 emulation: resonant LPF + filter envelope + slide + accent
+    MODE_COUNT
+};
+
+// ==================== MENU ====================
+#define MENU_COLS 3
+enum MenuItem : uint8_t {
+    MENU_SYNTH, MENU_OMNI, MENU_DRUMS,
+    MENU_SAMPLE, MENU_FX, MENU_LIGHT,
+    MENU_SEQ, MENU_LIGHTPLAY, MENU_SD,
+    MENU_ABOUT, MENU_HYBRID, MENU_MODULAR,
+    MENU_SYNTH2, MENU_MOD2, MENU_303, MENU_ITEM_COUNT
+};
+static const char* menuLabels[] = {
+    "SYNTH","OMNI","DRUMS",
+    "SAMPL","FX","LIGHT",
+    "SEQ","LPLY","SD",
+    "BATT","HYBRD","MODUL",
+    "SYN2","MOD2","303"
+};
+#define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
+
+// ==================== SYNTH SHAPES ====================
+enum SynthShape : uint8_t {
+    SHAPE_SAW = 0, SHAPE_SAW_FM, SHAPE_SQUARE, SHAPE_SINE, SHAPE_SUPERSAW,
+    SHAPE_ACID, SHAPE_BASS, SHAPE_PLUCK,
+    SHAPE_JUNO_BRASS, SHAPE_JUNO_STRINGS, SHAPE_JUNO_PIANO,
+    SHAPE_JUNO_ORGAN, SHAPE_JUNO_CHOIR,
+    SHAPE_DX7_EP, SHAPE_DX7_BELLS, SHAPE_DX7_BASS,
+    SHAPE_DX7_BRASS, SHAPE_DX7_STRINGS, SHAPE_DX7_ORGAN, SHAPE_DX7_VOICE,
+    SHAPE_PIANO,
+    SHAPE_TECHNO_LEAD,   // detuned supersaw + filter envelope sweep
+    SHAPE_RAVE_BASS,     // deep sub + filter pump
+    SHAPE_HOOVER,        // classic rave hoover (detuned + pitch/filter rise)
+    SHAPE_TECHNO_STAB,   // short staccato stab with sharp filter
+    SHAPE_ACID_WOBBLE,   // wobble bass: detuned SAW, slow filter wob via EG1
+    SHAPE_ELECTRO_PLUCK, // electro pluck: square wave, filter slams shut on trigger
+    SHAPE_INDUSTRIAL,    // dark industrial drone: heavy SAWs, resonant burst + long sustain
+    // ---- Evolving/saturation family (inspired by J:ORG FM modulator decay mechanism) ----
+    SHAPE_JUNO_ORGAN2,   // Juno A22 Organ II — FM ratio 1.932, 10s modulator decay, slightly darker
+    SHAPE_JUNO_FRONTIER, // Juno A63 Frontier Organ — FM ratio 5.263, instant EG1 sustain, brighter
+    SHAPE_FM_DRIFT,      // Custom ALGO: 10s FM index decay + resonant filter → slow timbral darkening
+    SHAPE_FM_BELL,       // Custom ALGO bell: 5s FM decay, inharmonic partials, long ring
+    SHAPE_SAT_DRIFT,     // Supersaw + Q=6.5 + EG1 sweeps filter 8s → builds saturation on held notes
+    SHAPE_COUNT
+};
+
+static const char* shapeNames[] = {
+    "SAW","SAWFM","SQR","SIN","SSAW","ACID","BASS","PLCK",
+    "J:BRS","J:STR","J:PNO","J:ORG","J:CHR",
+    "D:EP","D:BEL","D:BAS","D:BRS","D:STR","D:ORG","D:VOC",
+    "PIANO",
+    "T:LED","T:BAS","HOVR","STAB",
+    "WOBB","EPLK","INDS",
+    "J:OR2","J:FRG","FMDFT","FMBEL","SDFT"
+};
+
+// Patch numbers for preset shapes (-1 = custom wave, -2 = ALGO FM)
+static const int16_t shapePatch[] = {
+    -1,-2,-1,-1,-1,-1,-1,-1,   // custom waves (SAW, SAW_FM, SQR, SIN, SSAW, ACID, BASS, PLCK)
+    0,21,7,8,6,                 // Juno patches
+    138,153,142,128,131,144,157,// DX7 patches (128+offset)
+    256,                        // Piano
+    -1,-1,-1,-1,                // Techno: TECHNO_LEAD, RAVE_BASS, HOOVER, TECHNO_STAB
+    -1,-1,-1,                   // Acid/industrial: ACID_WOBBLE, ELECTRO_PLUCK, INDUSTRIAL
+    9,42,                       // Juno evolution presets: Organ II (ratio 1.932), Frontier (ratio 5.263)
+    -2,-2,-2                    // Custom ALGO: FM_DRIFT, FM_BELL, SAT_DRIFT
+};
+
+// Modular synth: limited shape palette for Pot2 selection
+enum ModShape : uint8_t {
+    MOD_SAW=0, MOD_SQR, MOD_SIN, MOD_SSAW, MOD_KS, MOD_SHAPE_COUNT
+};
+static const SynthShape modShapeMap[] = {
+    SHAPE_SAW, SHAPE_SQUARE, SHAPE_SINE, SHAPE_SUPERSAW, SHAPE_PLUCK
+};
+static const char* modShapeNames[] = {"SAW","SQR","SIN","SSAW","KS"};
+
+// ==================== ENVELOPES ====================
+enum EnvPreset : uint8_t {
+    ENV_NORMAL=0, ENV_FAST, ENV_PLUCK, ENV_PAD, ENV_PIANO,
+    ENV_PRESET_COUNT
+};
+
+static const char* envNames[] = {"Nrm","Fst","Plk","Pad","Pia"};
+
+struct EnvParams { uint16_t atk, dec, rel; float sus; };
+static const EnvParams envTable[] = {
+    {50, 200, 500, 0.5f},    // Normal
+    {1,  50,  50,  0.0f},    // Fast
+    {5,  100, 50,  0.0f},    // Pluck
+    {500,100, 2000,0.8f},    // Pad
+    {10, 500, 800, 0.3f},    // Piano
+};
+
+// ==================== SCALES ====================
+// Defined in NoteMap.h
+
+// ==================== EFFECTS ====================
+enum FxSlot : uint8_t { FX_LPF=0, FX_DRIVE, FX_DELAY, FX_REVERB, FX_SLOT_COUNT };
+static const char* fxNames[] = {"LPF","DRIVE","DELAY","REVERB"};
+
+// ==================== DRUMS ====================
+#define DRUM_ROWS 4
+#define DRUM_MAX_STEPS 16
+#define AMY_OSC_DRUM_BASE 200
+
+// ==================== TRACKER (removed — stub only) ====================
+// ==================== AUDIO ====================
+#define SYNTH_CH 1
+#define T303_CH  2
+#define NUM_SYNTH_VOICES 8
+#define OSCS_PER_VOICE 2
+#define AMY_OSC_STRUM 50
+#define PCM_PREVIEW_PRESET  100  // AMY preset slot for sample browser preview
+#define PCM_PREVIEW_OSC      60  // AMY oscillator for preview playback
+#define DRUM_PRESET_BASE    101  // AMY presets 101-132 for drum pads (32 slots)
+#define DRUM_OSC_BASE        70  // AMY oscillators 70-101 for drum pad playback
+#define DRUM_PAD_COUNT       32  // 32 unique drum samples (one per key)
+#define DRUM_SAMPLERATE    8000  // 16kHz source / 2 for hardware 2x compensation
+#define SAMPLE_PRESET_BASE  200  // AMY presets 200-231 for key-assigned samples
+#define SAMPLE_OSC_BASE     110  // AMY oscillators 110-141 for key sample playback
+#define SAMPLE_KEY_COUNT     32  // 4×8 keys, each can hold one RAM-loaded sample
+
+// ==================== BUTTON LABELS ====================
+// SEQ key base: use the last 8 slots of the SAMPLE key space (keyIdx 24-31) for 8 sequencer tracks
+#define SEQ_KEY_BASE 24
+
+// MOD2 waveform morph: 3 zones across encoder range
+static const SynthShape mod2ShapeSteps[] = {
+    SHAPE_SAW, SHAPE_SUPERSAW, SHAPE_SQUARE, SHAPE_SINE,
+    SHAPE_ACID, SHAPE_BASS, SHAPE_PLUCK, SHAPE_HOOVER
+};
+static const char* mod2ShapeStepNames[] = {"SAW","SSAW","SQR","SIN","ACID","BASS","PLCK","HOVR"};
+#define MOD2_SHAPE_COUNT 8
+
+// MOD2 LFO combined mode: destination × waveform shape
+// Btn1 cycles all 13 modes: Off, then Pitch×6 shapes, then Filter×6 shapes
+#define MOD2_LFO_MODE_COUNT 13
+// dest: 0=None 1=Pitch 2=Filter
+static const uint8_t mod2LfoModeDest[]  = {0, 1,1,1,1,1,1, 2,2,2,2,2,2};
+// shape: 0=Sine 1=Tri 2=Saw 3=RevSaw 4=Square 5=S&H
+static const uint8_t mod2LfoModeShape[] = {0, 0,1,2,3,4,5, 0,1,2,3,4,5};
+static const char* mod2LfoModeNames[]   = {
+    "Off",
+    "Pt:SIN","Pt:TRI","Pt:SAW","Pt:RSW","Pt:SQR","Pt:S&H",
+    "Ft:SIN","Ft:TRI","Ft:SAW","Ft:RSW","Ft:SQR","Ft:S&H"
+};
+
+// MOD2 play mode
+enum Mod2PlayMode : uint8_t { MOD2_POLY=0, MOD2_MONO, MOD2_SLIDE, MOD2_PLAY_COUNT };
+static const char* mod2PlayModeNames[] = {"Poly","Mono","Slid"};
+
+static const char* btnLabels[][4] = {
+    {"FX","Scl/Arp","Env","Instr"},  // SYNTH — btn0=FX overlay, btn1=Scale/Arp/Oct, btn2=Env, btn3=Instr
+    {"Shape","Mix","Sus","Oct"},    // OMNI
+    {"Patt","Play","Clr","Bank"},   // DRUMS
+    {"Bck","FX","Map","Opt"},       // SAMPLE — btn1=FX overlay, btn2=automap, btn3=SampOpt
+    {"Pres","Prm+","On/Of","Save"}, // FX
+    {"Spd","Sprd","Brt","Sat"},     // LIGHT
+    {"Play","FX","Opt","Pg"},       // SEQ — btn1=FX overlay, btn2=SeqOpt, btn3=page
+    {"","","",""},                  // LIGHTPLAY
+    {"","","",""},                  // BATTERY
+    {"","","",""},                  // SYSINFO
+    {"Scale","Env","Mix","Oct"},    // HYBRID — btn3=oct
+    {"OSC","Env","Flt","Oct"},      // MODULAR — btn1=env / btn3=oct
+    {"Ptch-","Ptch+","","Oct"},     // SYNTH2 — patch ±1 / octave
+    {"LFO","Mode","Oct",""},        // MOD2 — LFO mode / Poly-Mono / octave
+    {"FX","Wv/Arp","Sus","Tone"},    // 303 — btn0=FX, btn1=Wave/Oct/Acc/Sld/Arp overlay, btn2=Sustain toggle, btn3=Tone presets
+};

@@ -1,0 +1,1703 @@
+#include "audio_engine.h"
+#include "mp3dec.h"
+#include <esp_partition.h>
+// int8_t samples (format: static const int8_t name[], size via sizeof)
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/kick1.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/kick2.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snare1.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snare2.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snare3.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snareB3.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/hihat1.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/bongo1.h"
+// const int samples (format: const int name[], int nameLength — 16-bit values in 32-bit container)
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/kick3.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/hihat2.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/clap1.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/crash1.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/ride1.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snareB1.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snareB2.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/bass1.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/bass2.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx1.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx2.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx3.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx4.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx5.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx6.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx7.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx8.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx9.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx10.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx11.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx12.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/guitar1.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/synth1.h"
+#include "../old_project/clavier_v2/SOUNDS/Crunch_E/pad1.h"
+
+bool audioReady = false;
+
+// pcm_load: AMY internal function — allocates a RAM-based preset and returns pointer to fill
+extern "C" int16_t* pcm_load(uint16_t preset_number, uint32_t length,
+                              uint32_t samplerate, uint8_t channels,
+                              uint8_t midinote, uint32_t loopstart, uint32_t loopend);
+extern "C" int8_t* pcm_load8(uint16_t preset_number, uint32_t length,
+                              uint32_t samplerate, uint8_t channels,
+                              uint8_t midinote, uint32_t loopstart, uint32_t loopend);
+extern "C" void pcm_unload_all_presets();
+extern "C" void pcm_unload_preset(uint16_t preset_number);
+extern "C" void pcm_register_extern8(uint16_t preset_number, const int8_t* data,
+                                      uint32_t length, uint32_t samplerate,
+                                      uint8_t midinote, uint32_t loopstart, uint32_t loopend);
+
+// ---- Non-blocking sample loader: persistent service task + FreeRTOS queue ----
+// osc: which AMY oscillator to stop before loading and play on after (if vel>0).
+// vel: 0 = load into RAM only, don't trigger playback.
+struct LoadReq { char path[256]; uint16_t preset; uint8_t osc; float vel; };
+static void amyStopOsc(uint8_t osc);  // forward declaration
+static QueueHandle_t     s_loadQueue  = NULL;
+static volatile bool     s_svcAbort   = false;
+static volatile bool     s_svcDone    = true;
+static volatile uint8_t  s_currentOsc = 0xFF;  // OSC currently being loaded (0xFF = idle)
+// Tracks which key-assigned sample presets have finished loading.
+static volatile bool     s_keyLoaded[SAMPLE_KEY_COUNT]    = {};
+static uint32_t          s_keyLengthMs[SAMPLE_KEY_COUNT]  = {}; // playback duration per key
+static volatile uint8_t  s_keyError[SAMPLE_KEY_COUNT]     = {}; // KEY_ERR_* per key, 0=OK
+static uint8_t           s_loadError                      = KEY_ERR_NONE; // set by loaders before return false
+static float s_sampleVolume  = 1.0f;  // 0.0–2.0; applied to vel on sample playback
+static float s_pcmLPFCutoff  = 0.0f;  // 0 = no filter applied to PCM oscillators
+static float s_pcmLPFReso    = 1.5f;
+void bgServiceTask(void* param);  // forward declaration
+
+// ==================== INIT ====================
+void audioInit() {
+    amy_config_t cfg = amy_default_config();
+    cfg.features.startup_bleep = 0;
+    cfg.features.default_synths = 0;
+    cfg.platform.multithread = 1;
+    cfg.platform.multicore = 1;
+    cfg.audio = AMY_AUDIO_IS_I2S;
+    cfg.features.audio_in = 0;
+    cfg.i2s_mclk = 9;
+    cfg.i2s_bclk = 9;
+    cfg.i2s_lrc = 7;
+    cfg.i2s_dout = 8;
+    // No file hooks — we load samples synchronously into RAM instead
+    amy_start(cfg);
+    esp32_setup_i2s();
+    delay(500);
+
+    // Setup synth voices — no filter here; filter is owned entirely by the FX system.
+    // audioInit-applied filters would be invisible to applyAllFx() and cause a volume jump
+    // the first time any FX is activated (applyAllFx resets inactive LPF to FILTER_NONE).
+    {
+        amy_event e = amy_default_event();
+        e.synth = SYNTH_CH;
+        e.num_voices = NUM_SYNTH_VOICES;
+        e.oscs_per_voice = OSCS_PER_VOICE;
+        e.wave = SAW_DOWN;
+        amy_add_event(&e);
+    }
+    // Explicitly set FILTER_NONE so AMY and FX system share the same initial state
+    {
+        amy_event e = amy_default_event();
+        e.synth = SYNTH_CH;
+        e.filter_type = FILTER_NONE;
+        amy_add_event(&e);
+    }
+
+    flashCacheInit();  // map pcmcache partition before the service task starts
+
+    s_loadQueue = xQueueCreate(33, sizeof(LoadReq));  // 32 key slots + 1 preview front-insert slot
+    xTaskCreatePinnedToCore(bgServiceTask, "audioSvc", 16384, NULL, 2, NULL, 0);
+
+    audioReady = true;
+    audioLoadDrumSamples();
+    Serial.printf("Audio OK: AMY_SAMPLE_RATE=%u AMY_BLOCK_SIZE=%u\n",
+                  (uint32_t)AMY_SAMPLE_RATE, (uint32_t)AMY_BLOCK_SIZE);
+}
+
+// ==================== NOTE CONTROL ====================
+void audioAllNotesOff() {
+    for (int n = 0; n < 128; n++) {
+        amy_event e = amy_default_event();
+        e.synth = SYNTH_CH; e.midi_note = n; e.velocity = 0;
+        amy_add_event(&e);
+    }
+    for (int o = AMY_OSC_STRUM; o < AMY_OSC_STRUM + 5; o++) {
+        amy_event e = amy_default_event();
+        e.osc = o; e.velocity = 0;
+        amy_add_event(&e);
+    }
+    {
+        amy_event e = amy_default_event();
+        e.osc = PCM_PREVIEW_OSC; e.velocity = 0;
+        amy_add_event(&e);
+    }
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH; e.pitch_bend = 1.0f;
+    amy_add_event(&e);
+}
+
+void audioStopAllSamples() {
+    for (int i = 0; i < SAMPLE_KEY_COUNT; i++) {
+        amy_event e = amy_default_event();
+        e.osc = (uint16_t)(SAMPLE_OSC_BASE + i); e.velocity = 0;
+        amy_add_event(&e);
+    }
+}
+
+// config_eq uses SAMPLE (s8.23 fixed-point int32_t) for its gain params — NOT float.
+// Passing floats with the wrong prototype would deliver their IEEE-754 bit patterns
+// (e.g. 1.0f → 0x3F800000 ≈ 127× gain in s8.23) causing a permanent ×100 volume boost.
+extern "C" void config_eq(uint8_t bus, SAMPLE eq_l, SAMPLE eq_m, SAMPLE eq_h);
+
+void audioSetEq(float low, float mid, float high) {
+    if (!audioReady) return;
+    config_eq(0, F2S(low), F2S(mid), F2S(high));
+}
+
+void audioNoteOn(uint8_t note, float velocity) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH; e.midi_note = note; e.velocity = velocity;
+    amy_add_event(&e);
+}
+
+void audioNoteOff(uint8_t note) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH; e.midi_note = note; e.velocity = 0;
+    amy_add_event(&e);
+}
+
+// ==================== SYNTH PARAMS ====================
+void audioSetFilter(float cutoffHz, float resonance) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH;
+    e.filter_type = FILTER_LPF;
+    e.filter_freq_coefs[COEF_CONST] = cutoffHz;
+    e.resonance = resonance;
+    amy_add_event(&e);
+}
+
+// Apply LPF to synth channel; update state so future audioPlayKey/amyPlayPcm triggers carry it.
+// Pass cutoffHz=0 to bypass (FILTER_NONE on the synth channel, clears PCM filter state).
+// Do NOT send per-osc events — PCM oscillators mishandle filter_freq_coefs and explode in volume.
+// When active (non-bypass), zero COEF_EG0/EG1 so shape-internal filter envelopes (HOOVER etc.)
+// cannot fight the FX cutoff. audioRestoreShapeFilter() reverts this when the FX turns off.
+void audioSetAllFilters(float cutoffHz, float resonance) {
+    if (!audioReady) return;
+    bool bypass = (cutoffHz <= 10.0f);
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH;
+    e.filter_type = bypass ? FILTER_NONE : FILTER_LPF24;
+    e.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
+    if (!bypass) {
+        e.filter_freq_coefs[COEF_EG0] = 0.0f;
+        e.filter_freq_coefs[COEF_EG1] = 0.0f;
+    }
+    e.resonance = bypass ? 1.0f : resonance;
+    amy_add_event(&e);
+    s_pcmLPFCutoff = bypass ? 0.0f : cutoffHz;
+    s_pcmLPFReso   = bypass ? 1.5f : resonance;
+}
+
+// Update only the cutoff/resonance of an already-active LPF — does NOT send filter_type.
+// Sending filter_type on every smooth-tick tick causes AMY to re-init the biquad state,
+// which is heard as an audible "pop" or "reset" on each encoder step.
+void audioSetFilterFreq(float cutoffHz, float resonance) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH;
+    e.filter_freq_coefs[COEF_CONST] = cutoffHz;
+    e.resonance = resonance;
+    amy_add_event(&e);
+    s_pcmLPFCutoff = cutoffHz;
+    s_pcmLPFReso   = resonance;
+}
+
+void audioSetEnvelope(const EnvParams &env) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH;
+    e.eg0_times[0] = env.atk;  e.eg0_values[0] = 1.0f;
+    e.eg0_times[1] = env.dec;  e.eg0_values[1] = env.sus;
+    e.eg0_times[2] = env.rel;  e.eg0_values[2] = 0.0f;
+    amy_add_event(&e);
+}
+
+// Per-shape filter state — used to restore native filter after FX LPF/Overdrive turns off.
+// Indexed by SynthShape. Patches (Juno/DX7/Piano) restore to FILTER_NONE (patch self-manages).
+// Must stay in sync with SynthShape enum order in config.h.
+struct ShapeFilterSave { uint8_t ft; float cc, ce0, ce1, res; };
+static const ShapeFilterSave kShapeFilter[] = {
+    // ft           CONST     EG0     EG1     Reso
+    { FILTER_NONE,  18000,    0,      0,      1    }, // SAW
+    { FILTER_LPF,   4000,     0,      0,      2    }, // SAW_FM (ALGO)
+    { FILTER_NONE,  18000,    0,      0,      1    }, // SQUARE
+    { FILTER_NONE,  18000,    0,      0,      1    }, // SINE
+    { FILTER_NONE,  18000,    0,      0,      1    }, // SUPERSAW
+    { FILTER_LPF,   700,      0,      0,      14   }, // ACID
+    { FILTER_LPF,   1200,     0,      0,      3    }, // BASS
+    { FILTER_NONE,  18000,    0,      0,      1    }, // PLUCK (KS)
+    { FILTER_NONE,  18000,    0,      0,      1    }, // JUNO_BRASS
+    { FILTER_NONE,  18000,    0,      0,      1    }, // JUNO_STRINGS
+    { FILTER_NONE,  18000,    0,      0,      1    }, // JUNO_PIANO
+    { FILTER_NONE,  18000,    0,      0,      1    }, // JUNO_ORGAN
+    { FILTER_NONE,  18000,    0,      0,      1    }, // JUNO_CHOIR
+    { FILTER_NONE,  18000,    0,      0,      1    }, // DX7_EP
+    { FILTER_NONE,  18000,    0,      0,      1    }, // DX7_BELLS
+    { FILTER_NONE,  18000,    0,      0,      1    }, // DX7_BASS
+    { FILTER_NONE,  18000,    0,      0,      1    }, // DX7_BRASS
+    { FILTER_NONE,  18000,    0,      0,      1    }, // DX7_STRINGS
+    { FILTER_NONE,  18000,    0,      0,      1    }, // DX7_ORGAN
+    { FILTER_NONE,  18000,    0,      0,      1    }, // DX7_VOICE
+    { FILTER_NONE,  18000,    0,      0,      1    }, // PIANO
+    { FILTER_LPF,   200,      0,      3200,   4    }, // TECHNO_LEAD
+    { FILTER_LPF,   80,       1400,   0,      2    }, // RAVE_BASS  (EG0!)
+    { FILTER_LPF,   400,      0,      2400,   6    }, // HOOVER
+    { FILTER_LPF,   4000,     0,      -3500,  5    }, // TECHNO_STAB
+    { FILTER_LPF,   150,      0,      2500,   10   }, // ACID_WOBBLE
+    { FILTER_LPF,   3000,     0,      -2500,  5    }, // ELECTRO_PLUCK
+    { FILTER_LPF,   200,      0,      2800,   12   }, // INDUSTRIAL
+    { FILTER_NONE,  18000,    0,      0,      1    }, // JUNO_ORGAN2
+    { FILTER_NONE,  18000,    0,      0,      1    }, // JUNO_FRONTIER
+    { FILTER_LPF,   450,      0,      1800,   4.5f }, // FM_DRIFT
+    { FILTER_NONE,  8000,     0,      0,      1    }, // FM_BELL (no LPF, open)
+    { FILTER_LPF,   200,      0,      3500,   6.5f }, // SAT_DRIFT
+};
+static_assert(sizeof(kShapeFilter)/sizeof(kShapeFilter[0]) == SHAPE_COUNT,
+              "kShapeFilter must have one entry per SynthShape");
+
+// Restore the shape's native filter+EG coefficients after FX LPF/Overdrive is turned off.
+// Sends only filter params — no num_voices/oscs_per_voice → no voice reset, no audio glitch.
+void audioRestoreShapeFilter(SynthShape shape) {
+    if (!audioReady || (uint8_t)shape >= SHAPE_COUNT) return;
+    const ShapeFilterSave& sf = kShapeFilter[(uint8_t)shape];
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH;
+    e.filter_type = sf.ft;
+    e.filter_freq_coefs[COEF_CONST] = sf.cc;
+    e.filter_freq_coefs[COEF_EG0]   = sf.ce0;
+    e.filter_freq_coefs[COEF_EG1]   = sf.ce1;
+    e.resonance = sf.res;
+    amy_add_event(&e);
+}
+
+void audioSetPitchBend(float ratio) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH; e.pitch_bend = ratio;
+    amy_add_event(&e);
+}
+
+void audioSetShape(SynthShape shape) {
+    if (!audioReady) return;
+    int16_t patch = shapePatch[shape];
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH;
+
+    if (patch >= 0) {
+        // AMY preset patch (Juno / DX7 / Piano)
+        e.patch_number = patch;
+    } else if (patch == -2) {
+        // SAW_FM: 6-op ALGO with default LPF so pots 3-4 (cutoff/reso) have something to bite
+        e.wave = ALGO;
+        e.algorithm = 3;
+        e.num_voices = 4;
+        e.oscs_per_voice = 6;
+        e.filter_type = FILTER_LPF;
+        e.filter_freq_coefs[COEF_CONST] = 4000.0f;
+        e.resonance = 2.0f;
+    } else {
+        // Custom waveforms
+        e.num_voices = NUM_SYNTH_VOICES;
+        e.oscs_per_voice = OSCS_PER_VOICE;
+        switch (shape) {
+            case SHAPE_SAW:    e.wave = SAW_DOWN; break;
+            case SHAPE_SQUARE: e.wave = PULSE;    break;
+            case SHAPE_SINE:   e.wave = SINE;     break;
+            case SHAPE_PLUCK:  e.wave = KS;       break;
+            case SHAPE_ACID:
+                // TB-303 style: sawtooth + resonant LPF + fast envelope
+                e.wave = SAW_DOWN;
+                e.filter_type = FILTER_LPF;
+                e.resonance = 14.0f;
+                e.filter_freq_coefs[COEF_CONST] = 700.0f;
+                e.eg0_times[0] = 2;   e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 300; e.eg0_values[1] = 0.0f;
+                e.eg0_times[2] = 100; e.eg0_values[2] = 0.0f;
+                break;
+            case SHAPE_BASS:
+                // Deep bass: square wave + moderate LPF
+                e.wave = PULSE;
+                e.filter_type = FILTER_LPF;
+                e.resonance = 3.0f;
+                e.filter_freq_coefs[COEF_CONST] = 1200.0f;
+                e.eg0_times[0] = 5;   e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 500; e.eg0_values[1] = 0.2f;
+                e.eg0_times[2] = 200; e.eg0_values[2] = 0.0f;
+                break;
+            case SHAPE_SUPERSAW:
+                // Thick saw: use SAW with max voices for width
+                e.wave = SAW_DOWN;
+                e.num_voices = NUM_SYNTH_VOICES;
+                e.oscs_per_voice = 4;
+                break;
+            case SHAPE_TECHNO_LEAD:
+                // Detuned supersaw + filter envelope: starts dark, sweeps bright
+                e.wave = SAW_DOWN;
+                e.num_voices = NUM_SYNTH_VOICES;
+                e.oscs_per_voice = 4;
+                e.filter_type = FILTER_LPF;
+                e.resonance = 4.0f;
+                e.filter_freq_coefs[COEF_CONST] = 200.0f;   // closed at rest
+                e.filter_freq_coefs[COEF_EG1]   = 3200.0f;  // EG1 opens filter
+                e.eg1_times[0] = 150;  e.eg1_values[0] = 1.0f;
+                e.eg1_times[1] = 600;  e.eg1_values[1] = 0.4f;
+                e.eg1_times[2] = 1500; e.eg1_values[2] = 0.0f;
+                e.eg0_times[0] = 5;    e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 200;  e.eg0_values[1] = 0.6f;
+                e.eg0_times[2] = 800;  e.eg0_values[2] = 0.0f;
+                break;
+            case SHAPE_RAVE_BASS:
+                // Sub bass: sine-core + filter tracks amplitude for punchy pump
+                e.wave = SINE;
+                e.num_voices = 4;
+                e.oscs_per_voice = 2;
+                e.filter_type = FILTER_LPF;
+                e.resonance = 2.0f;
+                e.filter_freq_coefs[COEF_CONST] = 80.0f;
+                e.filter_freq_coefs[COEF_EG0]   = 1400.0f;  // filter burst on attack
+                e.eg0_times[0] = 5;    e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 80;   e.eg0_values[1] = 0.3f;
+                e.eg0_times[2] = 300;  e.eg0_values[2] = 0.0f;
+                break;
+            case SHAPE_HOOVER:
+                // Rave hoover: detuned saws, filter + pitch rise envelope
+                e.wave = SAW_DOWN;
+                e.num_voices = NUM_SYNTH_VOICES;
+                e.oscs_per_voice = 6;
+                e.filter_type = FILTER_LPF;
+                e.resonance = 6.0f;
+                e.filter_freq_coefs[COEF_CONST] = 400.0f;
+                e.filter_freq_coefs[COEF_EG1]   = 2400.0f;  // filter sweeps up fast
+                e.eg1_times[0] = 80;   e.eg1_values[0] = 1.0f;
+                e.eg1_times[1] = 400;  e.eg1_values[1] = 0.5f;
+                e.eg1_times[2] = 1200; e.eg1_values[2] = 0.0f;
+                e.eg0_times[0] = 10;   e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 1000; e.eg0_values[1] = 0.5f;
+                e.eg0_times[2] = 500;  e.eg0_values[2] = 0.0f;
+                break;
+            case SHAPE_TECHNO_STAB:
+                // Short stabby hit: bright saw, instant filter close
+                e.wave = SAW_DOWN;
+                e.num_voices = 4;
+                e.oscs_per_voice = 2;
+                e.filter_type = FILTER_LPF;
+                e.resonance = 5.0f;
+                e.filter_freq_coefs[COEF_CONST] = 4000.0f;
+                e.filter_freq_coefs[COEF_EG1]   = -3500.0f; // filter snaps shut
+                e.eg1_times[0] = 2;    e.eg1_values[0] = 1.0f;
+                e.eg1_times[1] = 120;  e.eg1_values[1] = 0.0f;
+                e.eg1_times[2] = 50;   e.eg1_values[2] = 0.0f;
+                e.eg0_times[0] = 2;    e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 60;   e.eg0_values[1] = 0.0f;
+                e.eg0_times[2] = 30;   e.eg0_values[2] = 0.0f;
+                break;
+            case SHAPE_ACID_WOBBLE:
+                // Wobble bass: detuned SAW, filter opened by EG1 then slowly closes
+                e.wave = SAW_DOWN;
+                e.num_voices = NUM_SYNTH_VOICES;
+                e.oscs_per_voice = 4;
+                e.filter_type = FILTER_LPF;
+                e.resonance = 10.0f;
+                e.filter_freq_coefs[COEF_CONST] = 150.0f;   // dark at rest
+                e.filter_freq_coefs[COEF_EG1]   = 2500.0f;  // filter sweeps up on trigger
+                e.eg1_times[0] = 20;   e.eg1_values[0] = 1.0f;  // fast open
+                e.eg1_times[1] = 1200; e.eg1_values[1] = 0.1f;  // slow wob decay
+                e.eg1_times[2] = 800;  e.eg1_values[2] = 0.0f;
+                e.eg0_times[0] = 5;    e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 200;  e.eg0_values[1] = 0.7f;  // sustained
+                e.eg0_times[2] = 600;  e.eg0_values[2] = 0.0f;
+                break;
+            case SHAPE_ELECTRO_PLUCK:
+                // Electro pluck: square wave, filter snaps shut on attack (staccato)
+                e.wave = PULSE;
+                e.num_voices = 4;
+                e.oscs_per_voice = 2;
+                e.filter_type = FILTER_LPF;
+                e.resonance = 5.0f;
+                e.filter_freq_coefs[COEF_CONST] = 3000.0f;
+                e.filter_freq_coefs[COEF_EG1]   = -2500.0f;  // filter slams shut
+                e.eg1_times[0] = 1;    e.eg1_values[0] = 1.0f;
+                e.eg1_times[1] = 180;  e.eg1_values[1] = 0.0f;
+                e.eg1_times[2] = 80;   e.eg1_values[2] = 0.0f;
+                e.eg0_times[0] = 1;    e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 150;  e.eg0_values[1] = 0.0f;  // short pluck, no sustain
+                e.eg0_times[2] = 50;   e.eg0_values[2] = 0.0f;
+                break;
+            case SHAPE_INDUSTRIAL:
+                // Dark industrial drone: heavy detuned SAWs, very dark resonant filter bursts
+                e.wave = SAW_DOWN;
+                e.num_voices = NUM_SYNTH_VOICES;
+                e.oscs_per_voice = 6;
+                e.filter_type = FILTER_LPF;
+                e.resonance = 12.0f;
+                e.filter_freq_coefs[COEF_CONST] = 200.0f;   // almost closed
+                e.filter_freq_coefs[COEF_EG1]   = 2800.0f;  // brief metallic burst
+                e.eg1_times[0] = 10;   e.eg1_values[0] = 1.0f;
+                e.eg1_times[1] = 350;  e.eg1_values[1] = 0.0f;  // snap back dark
+                e.eg1_times[2] = 200;  e.eg1_values[2] = 0.0f;
+                e.eg0_times[0] = 2;    e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 800;  e.eg0_values[1] = 0.3f;  // long sustain for drones
+                e.eg0_times[2] = 1500; e.eg0_values[2] = 0.0f;
+                break;
+            // ---- Evolving / saturation family ----
+            case SHAPE_FM_DRIFT:
+                // Inspired by J:ORG: ALGO FM, EG1 decays FM index over 10s → timbre slowly darkens.
+                // High resonance (Q=4.5) near harmonic peaks → polyphonic saturation builds with notes.
+                e.wave = ALGO;
+                e.algorithm = 3;              // 4-op serial chain: mod3→mod2→mod1→carrier
+                e.num_voices = NUM_SYNTH_VOICES;
+                e.oscs_per_voice = 4;
+                e.filter_type = FILTER_LPF;
+                e.resonance = 4.5f;
+                e.filter_freq_coefs[COEF_CONST] = 450.0f;
+                e.filter_freq_coefs[COEF_EG1]   = 1800.0f;  // EG1 also sweeps filter open
+                // EG1: FM index 1.0→0.2 over 10s (10 000ms, same as J:ORG modulator envelope)
+                e.eg1_times[0] = 30;    e.eg1_values[0] = 1.0f;
+                e.eg1_times[1] = 10000; e.eg1_values[1] = 0.2f;
+                e.eg1_times[2] = 2000;  e.eg1_values[2] = 0.0f;
+                // Carrier amplitude: instant on, slight settle, organ-style sustain
+                e.eg0_times[0] = 5;     e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 300;   e.eg0_values[1] = 0.8f;
+                e.eg0_times[2] = 1000;  e.eg0_values[2] = 0.0f;
+                break;
+
+            case SHAPE_FM_BELL:
+                // FM bell: algorithm 5 (one modulator, three parallel carriers → inharmonic partials).
+                // EG1 decays FM depth over 5s: starts metallic/complex, rings out to a pure tone.
+                e.wave = ALGO;
+                e.algorithm = 5;              // one mod → 3 parallel carriers (bright inharmonic partials)
+                e.num_voices = 4;
+                e.oscs_per_voice = 4;
+                // No LPF — bells are open, bright
+                e.filter_freq_coefs[COEF_CONST] = 8000.0f;
+                e.resonance = 1.0f;
+                // EG1: FM index decays from full to zero over 5s
+                e.eg1_times[0] = 5;     e.eg1_values[0] = 1.0f;
+                e.eg1_times[1] = 5000;  e.eg1_values[1] = 0.0f;
+                e.eg1_times[2] = 500;   e.eg1_values[2] = 0.0f;
+                // Amplitude: instant attack, 6s natural exponential decay (bell ring)
+                e.eg0_times[0] = 5;     e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 6000;  e.eg0_values[1] = 0.0f;
+                e.eg0_times[2] = 500;   e.eg0_values[2] = 0.0f;
+                break;
+
+            case SHAPE_SAT_DRIFT:
+                // Supersaw with Q=6.5 (near self-oscillation) + EG1 sweeps filter from 200→3700Hz over 8s.
+                // Stacking notes causes beating between detuned voices → dense evolving saturation.
+                e.wave = SAW_DOWN;
+                e.num_voices = NUM_SYNTH_VOICES;
+                e.oscs_per_voice = 4;
+                e.filter_type = FILTER_LPF;
+                e.resonance = 6.5f;           // near self-oscillation — amplifies harmonics at cutoff
+                e.filter_freq_coefs[COEF_CONST] = 200.0f;   // starts very dark
+                e.filter_freq_coefs[COEF_EG1]   = 3500.0f;  // EG1 slowly opens — builds brightness
+                // EG1: filter opens over 8s → gradual harmonic build-up and saturation
+                e.eg1_times[0] = 8000;  e.eg1_values[0] = 1.0f;
+                e.eg1_times[1] = 5000;  e.eg1_values[1] = 0.8f;
+                e.eg1_times[2] = 3000;  e.eg1_values[2] = 0.0f;
+                // Amplitude: slow attack (pad-like), long sustain
+                e.eg0_times[0] = 600;   e.eg0_values[0] = 1.0f;
+                e.eg0_times[1] = 300;   e.eg0_values[1] = 0.9f;
+                e.eg0_times[2] = 2500;  e.eg0_values[2] = 0.0f;
+                break;
+
+            default: e.wave = SAW_DOWN; break;
+        }
+    }
+    amy_add_event(&e);
+    // Shape events with num_voices/oscs_per_voice trigger patches_load_patch → reset_osc()
+    // which sets filter_type = FILTER_NONE on all oscillators, silently killing any active FX LPF.
+    // Re-assert the LPF immediately after — AMY processes this event right after the shape reset.
+    if (s_pcmLPFCutoff > 10.0f)
+        audioSetAllFilters(s_pcmLPFCutoff, s_pcmLPFReso);
+}
+
+// FM-specific real-time param control for SHAPE_SAW_FM.
+// depth: FM feedback 0..1 (0=clean, 1=max harmonic richness)
+// cutoffHz: LPF frequency
+// resonance: LPF resonance
+void audioSetFmParams(float depth, float cutoffHz, float resonance) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH;
+    e.feedback = depth;
+    e.filter_type = FILTER_LPF;
+    e.filter_freq_coefs[COEF_CONST] = cutoffHz;
+    e.resonance = resonance;
+    amy_add_event(&e);
+}
+
+void audioSetOverdrive(float drive) {
+    if (!audioReady) return;
+    if (drive < 0.01f) {
+        audioSetAllFilters(0.0f, 1.5f);  // 0 → open filter on everything
+    } else {
+        float cut = 3500.0f - drive * 2500.0f;  // 3500 → 1000 Hz
+        float res = 1.5f  + drive * 2.5f;       // 1.5 → 4.0
+        audioSetAllFilters(cut, res);
+    }
+}
+
+void audioSetVolume(float vol) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH; e.volume[0] = vol * 5.0f;
+    amy_add_event(&e);
+}
+
+// ==================== EFFECTS (bus 0) ====================
+void audioSetReverb(float level, float liveness, float damping, float xover_hz) {
+    if (!audioReady) return;
+    config_reverb(0, level, liveness, damping, xover_hz);
+}
+
+void audioSetChorus(float level, float lfo_freq, float depth) {
+    if (!audioReady) return;
+    config_chorus(0, level, 320, lfo_freq, depth);
+}
+
+void audioSetDelay(float level, float delay_ms, float feedback, float filter_coef) {
+    if (!audioReady) return;
+    // max_delay_ms=700 → enclosing_power_of_2(30870)=32768 samples = 256KB PSRAM (vs 512KB at 800ms)
+    config_echo(0, level, delay_ms, 700.0f, feedback, filter_coef);
+}
+
+// ==================== SAMPLE PLAYBACK ====================
+void audioPlaySamplePreset(uint16_t preset, float vel) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.osc = PCM_PREVIEW_OSC;
+    e.wave = PCM;
+    e.preset = preset;
+    e.midi_note = 69;
+    e.velocity = vel;
+    amy_add_event(&e);
+}
+
+void audioStopSamplePreset(uint16_t /*preset*/) {
+    if (!audioReady) return;
+    s_svcAbort = true;
+    amyStopOsc(PCM_PREVIEW_OSC);
+}
+
+// ==================== DRUM PAD SAMPLES ====================
+// 32 unique pads: padIdx = row*8 + col (row 0=bottom, col 0=rightmost).
+// Supports two .h formats: int8_t[] (8-bit) and const int[] (16-bit values in 32-bit containers).
+struct DrumPadDesc {
+    const void*  data;
+    uint32_t     len;
+    const char*  label;
+    bool         is16bit;
+};
+
+static const DrumPadDesc kDrumPads[DRUM_PAD_COUNT] = {
+    // Row 0 (bottom), cols 0-7 right→left: standard drums (int8_t)
+    {kick1,   (uint32_t)sizeof(kick1),   "KK1", false},
+    {kick2,   (uint32_t)sizeof(kick2),   "KK2", false},
+    {snare1,  (uint32_t)sizeof(snare1),  "SN1", false},
+    {snare2,  (uint32_t)sizeof(snare2),  "SN2", false},
+    {snare3,  (uint32_t)sizeof(snare3),  "SN3", false},
+    {hihat1,  (uint32_t)sizeof(hihat1),  "HH1", false},
+    {bongo1,  (uint32_t)sizeof(bongo1),  "BNG", false},
+    {snareB3, (uint32_t)sizeof(snareB3), "SNB", false},
+    // Row 1, cols 0-7: extended percussion (const int)
+    {kick3,   15872U, "KK3", true},
+    {hihat2,  7936U,  "HH2", true},
+    {clap1,   8960U,  "CLP", true},
+    {crash1,  7804U,  "CRS", true},
+    {ride1,   11264U, "RDE", true},
+    {snareB1, 5888U,  "SB1", true},
+    {snareB2, 7680U,  "SB2", true},
+    {bass1,   19584U, "BS1", true},
+    // Row 2, cols 0-7: bass + sfx
+    {bass2,   5120U,  "BS2", true},
+    {sfx1,    4608U,  "SX1", true},
+    {sfx2,    3448U,  "SX2", true},
+    {sfx3,    5632U,  "SX3", true},
+    {sfx4,    2256U,  "SX4", true},
+    {sfx5,    7168U,  "SX5", true},
+    {sfx6,    18944U, "SX6", true},
+    {sfx7,    14332U, "SX7", true},
+    // Row 3 (top), cols 0-7: more sfx + melodic
+    {sfx8,    9984U,  "SX8", true},
+    {sfx9,    3076U,  "SX9", true},
+    {sfx10,   4608U,  "S10", true},
+    {sfx11,   9216U,  "S11", true},
+    {sfx12,   10496U, "S12", true},
+    {guitar1, 6384U,  "GTR", true},
+    {synth1,  7496U,  "SYN", true},
+    {pad1,    7432U,  "PAD", true},
+};
+
+const char* audioDrumPadLabel(uint8_t padIdx) {
+    if (padIdx >= DRUM_PAD_COUNT) return "---";
+    return kDrumPads[padIdx].label;
+}
+
+void audioLoadDrumSamples() {
+    if (!audioReady) return;
+    for (uint8_t i = 0; i < DRUM_PAD_COUNT; i++) {
+        const DrumPadDesc& pad = kDrumPads[i];
+        int16_t* buf = pcm_load(DRUM_PRESET_BASE + i, pad.len, DRUM_SAMPLERATE, 1, 69, 0, 0);
+        if (!buf) { Serial.printf("DRUM: alloc fail pad %u (%s)\n", i, pad.label); continue; }
+        if (pad.is16bit) {
+            const int* src = (const int*)pad.data;
+            for (uint32_t j = 0; j < pad.len; j++) buf[j] = (int16_t)src[j];
+        } else {
+            const int8_t* src = (const int8_t*)pad.data;
+            for (uint32_t j = 0; j < pad.len; j++) buf[j] = (int16_t)src[j] * 256;
+        }
+        Serial.printf("DRUM: pad %u (%s) %u frames\n", i, pad.label, pad.len);
+    }
+}
+
+void audioPlayDrumPad(uint8_t padIdx, float vel) {
+    if (!audioReady || padIdx >= DRUM_PAD_COUNT) return;
+    amy_event e = amy_default_event();
+    e.osc       = DRUM_OSC_BASE + padIdx;
+    e.wave      = PCM;
+    e.preset    = DRUM_PRESET_BASE + padIdx;
+    e.midi_note = 69;
+    e.velocity  = vel;
+    amy_add_event(&e);
+}
+
+// ==================== NON-BLOCKING SAMPLE LOADER ====================
+// audioLoadAndPlay() returns in <1ms. bgServiceTask on Core 0 handles everything:
+// AMY stop → SD open/parse (provides stop safety window) → pcm_load → fill → play → continue.
+#define PCM_MIN_FRAMES         20000u  // guaranteed minimum head buffer (1s @ 20kHz)
+#define PCM_TARGET_RATE        20000u  // target playback rate; pcm_load gets /2 (2x hardware bug)
+// Maximum frames allocated from free PSRAM (int16_t = 2 bytes/frame).
+// Uses half the available PSRAM so other presets can coexist.
+// After first decode the sample is in flash — subsequent plays use 0 PSRAM.
+static uint32_t psramMaxFrames() {
+    uint32_t free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t m = free / 4;  // half free PSRAM in int16_t frames
+    return (m < PCM_MIN_FRAMES) ? PCM_MIN_FRAMES : m;
+}
+#define STREAM_PLAY_FRAMES      512u   // pre-fill before triggering AMY play event
+#define STREAM_BATCH_FRAMES    2048u   // frames per batch
+#define STREAM_SILENCE_GUARD   4096u   // zero-filled guard region at buffer start
+#define AMY_STOP_SAFETY_MS       15u   // ms to wait after AMY stop before freeing old preset
+
+bool audioIsStreamingDone() { return s_svcDone; }
+
+static void amyStopOsc(uint8_t osc) {
+    amy_event e = amy_default_event();
+    e.osc = osc; e.velocity = 0;
+    amy_add_event(&e);
+}
+static void amyPlayPcm(uint8_t osc, uint16_t preset, float vel) {
+    if (vel <= 0.0f) return;
+    amy_event e = amy_default_event();
+    float v = vel * s_sampleVolume;
+    if (v > 2.0f) v = 2.0f;
+    e.osc = osc; e.wave = PCM;
+    e.preset = preset; e.midi_note = 69; e.velocity = v;
+    // 5ms fade-in to suppress click; 40ms release for smooth stop on note-off
+    e.eg0_times[0]  = 5;    e.eg0_values[0]  = 1.0f;  // attack
+    e.eg0_times[1]  = 0;    e.eg0_values[1]  = 1.0f;  // instant decay → sustain at 1.0
+    e.eg0_times[2]  = 40;   e.eg0_values[2]  = 0.0f;  // 40ms release
+    // feedback=0 prevents PCM loop (AMY uses feedback flag to signal looping)
+    e.feedback = 0.0f;
+    if (s_pcmLPFCutoff > 10.0f) {
+        e.filter_type = FILTER_LPF24;
+        e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
+        e.resonance = s_pcmLPFReso;
+    }
+    amy_add_event(&e);
+}
+
+void audioSetPCMFilter(float cutoffHz, float resonance) {
+    s_pcmLPFCutoff = cutoffHz;
+    s_pcmLPFReso   = resonance;
+}
+
+// Read raw WAV samples (any bit depth/format) into dst as interleaved int16.
+// isFloat: true for IEEE 754 float32 (audioFormat=3), false for PCM integer.
+static bool wavReadRaw(File &f, uint16_t bps, uint32_t inFrames, uint16_t numCh, int16_t* dst, bool isFloat) {
+    uint32_t total = inFrames * numCh;
+    if (bps == 16) {
+        // Read all 16-bit samples in one shot — SD library handles multi-sector internally.
+        return (uint32_t)f.read((uint8_t*)dst, total * 2) == total * 2;
+    } else if (bps == 8) {
+        // Read in 512-byte chunks matching the SD sector size; yield between chunks to feed watchdog.
+        const uint32_t BATCH = 512;
+        uint8_t tmp[BATCH];
+        uint32_t pos = 0;
+        while (pos < total) {
+            uint32_t batch = total - pos; if (batch > BATCH) batch = BATCH;
+            if ((uint32_t)f.read(tmp, batch) != batch) return false;
+            for (uint32_t i = 0; i < batch; i++)
+                dst[pos + i] = (int16_t)((int32_t)(tmp[i] - 128) << 8);
+            pos += batch;
+            taskYIELD();
+        }
+        return true;
+    } else if (bps == 24) {
+        const uint32_t BATCH = 128;
+        uint8_t tmp[BATCH * 3];
+        uint32_t pos = 0;
+        while (pos < total) {
+            uint32_t batch = (total - pos < BATCH) ? (total - pos) : BATCH;
+            f.read(tmp, batch * 3);
+            for (uint32_t j = 0; j < batch; j++) {
+                int32_t v = (int32_t)tmp[j*3]
+                          | ((int32_t)tmp[j*3+1] << 8)
+                          | ((int32_t)(int8_t)tmp[j*3+2] << 16);
+                dst[pos + j] = (int16_t)(v >> 8);
+            }
+            pos += batch;
+            taskYIELD();
+        }
+        return true;
+    } else if (bps == 32) {
+        // IEEE Float (audioFmt=3) or PCM int32 (audioFmt=1)
+        const uint32_t BATCH = 64;
+        uint8_t tmp[BATCH * 4];
+        uint32_t pos = 0;
+        while (pos < total) {
+            uint32_t batch = total - pos; if (batch > BATCH) batch = BATCH;
+            if ((uint32_t)f.read(tmp, batch * 4) != batch * 4) return false;
+            for (uint32_t i = 0; i < batch; i++) {
+                uint32_t raw32 = (uint32_t)tmp[i*4]     | ((uint32_t)tmp[i*4+1] << 8)
+                               | ((uint32_t)tmp[i*4+2] << 16) | ((uint32_t)tmp[i*4+3] << 24);
+                if (isFloat) {
+                    float v; memcpy(&v, &raw32, 4);
+                    if      (v >  1.0f) v =  1.0f;
+                    else if (v < -1.0f) v = -1.0f;
+                    dst[pos + i] = (int16_t)(v * 32767.0f);
+                } else {
+                    dst[pos + i] = (int16_t)((int32_t)raw32 >> 16);
+                }
+            }
+            pos += batch;
+            taskYIELD();
+        }
+        return true;
+    }
+    Serial.printf("WAV: unsupported %u-bit\n", bps);
+    return false;
+}
+
+// Resample interleaved int16 (inFrames×numCh) → mono at AMY_SAMPLE_RATE.
+static void resampleToAmy(const int16_t* src, uint32_t inFrames, uint16_t numCh,
+                           int16_t* dst, uint32_t outFrames, float ratio) {
+    for (uint32_t oi = 0; oi < outFrames; oi++) {
+        float srcPos = oi * ratio;
+        uint32_t si0 = (uint32_t)srcPos;
+        float frac = srcPos - si0;
+        uint32_t si1 = si0 + 1;
+        if (si1 >= inFrames) si1 = inFrames - 1;
+
+        int32_t s0 = 0, s1 = 0;
+        for (uint16_t c = 0; c < numCh; c++) {
+            s0 += src[si0 * numCh + c];
+            s1 += src[si1 * numCh + c];
+        }
+        if (numCh > 1) { s0 /= numCh; s1 /= numCh; }
+        dst[oi] = (int16_t)(s0 + (int32_t)((s1 - s0) * frac));
+    }
+}
+
+// ==================== FLASH PCM CACHE ====================
+// Decoded int8_t samples are stored once in the 'pcmcache' flash partition (~9.875MB).
+// The partition is memory-mapped at boot; AMY presets point directly into it → zero PSRAM.
+//
+// Partition layout:
+//   [0x0000..0x1FFF]  FlashCacheDir (8KB = 2 sectors, max 64 entries)
+//   [0x2000..]        PCM data, packed sequentially, 4-byte aligned per entry
+//
+// First load of a sample: decode → PSRAM (stream-play as before) → write to flash.
+// Subsequent loads: flash hit → pcm_register_extern8 → play directly from flash (0 PSRAM).
+
+#define FLASH_PART_NAME     "pcmcache"
+#define FLASH_DIR_MAGIC     0xF1A5C4C5u  // bumped: invalidates old truncated entries
+#define FLASH_MAX_ENTRIES   64
+#define FLASH_DIR_SECTORS   2          // 2×4KB = 8KB for directory
+#define FLASH_DATA_OFFSET   0x2000u    // PCM data starts after the directory
+#define FLASH_SECTOR_SIZE   0x1000u    // 4096-byte erase unit
+
+struct FlashCacheEntry {
+    char     path[80];       // source file path (null-terminated, truncated if needed)
+    uint32_t srcSize;        // original file size — invalidation key
+    uint32_t dataOffset;     // byte offset from partition start to int8_t PCM data
+    uint32_t frameCount;     // number of int8_t mono frames
+    uint32_t sampleRate;     // stored PCM rate (pcm_register_extern8 receives this ÷2 for AMY 2× bug)
+    uint32_t reserved;
+};
+// 80+4+4+4+4+4 = 100 bytes; 64 entries = 6400 bytes < 8KB dir ✓
+
+struct FlashCacheDir {
+    uint32_t        magic;
+    uint32_t        count;
+    uint32_t        nextDataOffset;
+    uint32_t        reserved[13];       // pad header to 64 bytes
+    FlashCacheEntry entries[FLASH_MAX_ENTRIES];
+};
+
+static const esp_partition_t*      s_pcmPart    = nullptr;
+static esp_partition_mmap_handle_t s_mmapHandle = 0;
+static const void*                 s_mmapBase   = nullptr;
+static FlashCacheDir               s_flashDir;  // RAM mirror of the on-flash directory
+
+static void flashRemmap() {
+    if (s_mmapHandle) { esp_partition_munmap(s_mmapHandle); s_mmapHandle = 0; }
+    s_mmapBase = nullptr;
+    if (!s_pcmPart) return;
+    esp_err_t e = esp_partition_mmap(s_pcmPart, 0, s_pcmPart->size,
+                                      ESP_PARTITION_MMAP_DATA, &s_mmapBase, &s_mmapHandle);
+    if (e != ESP_OK) { Serial.printf("[FLASH] mmap err %d\n", (int)e); }
+}
+
+void flashCacheInit() {
+    s_pcmPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA,
+                                          ESP_PARTITION_SUBTYPE_ANY, FLASH_PART_NAME);
+    if (!s_pcmPart) { Serial.println("[FLASH] pcmcache partition not found"); return; }
+    Serial.printf("[FLASH] partition @ 0x%06X  size=%uKB\n",
+                  (unsigned)s_pcmPart->address, (unsigned)(s_pcmPart->size / 1024));
+
+    memset(&s_flashDir, 0, sizeof(s_flashDir));
+    esp_err_t e = esp_partition_read(s_pcmPart, 0, &s_flashDir, sizeof(FlashCacheDir));
+    bool valid = (e == ESP_OK) && (s_flashDir.magic == FLASH_DIR_MAGIC)
+              && (s_flashDir.count <= FLASH_MAX_ENTRIES)
+              && (s_flashDir.nextDataOffset >= FLASH_DATA_OFFSET)
+              && (s_flashDir.nextDataOffset <= s_pcmPart->size);
+    if (!valid) {
+        Serial.println("[FLASH] dir invalid, initializing...");
+        esp_partition_erase_range(s_pcmPart, 0, FLASH_DIR_SECTORS * FLASH_SECTOR_SIZE);
+        memset(&s_flashDir, 0, sizeof(s_flashDir));
+        s_flashDir.magic          = FLASH_DIR_MAGIC;
+        s_flashDir.count          = 0;
+        s_flashDir.nextDataOffset = FLASH_DATA_OFFSET;
+        esp_partition_write(s_pcmPart, 0, &s_flashDir, sizeof(FlashCacheDir));
+    }
+
+    flashRemmap();
+    Serial.printf("[FLASH] ready: %u entries, %uKB used / %uKB avail\n",
+                  s_flashDir.count,
+                  s_flashDir.nextDataOffset / 1024,
+                  (unsigned)(s_pcmPart->size / 1024));
+}
+
+// Wipe flash sample cache (use when sample files have changed and old entries are stale).
+void flashCacheClear() {
+    if (!s_pcmPart) return;
+    Serial.println("[FLASH] clearing all entries...");
+    esp_partition_erase_range(s_pcmPart, 0, FLASH_DIR_SECTORS * FLASH_SECTOR_SIZE);
+    memset(&s_flashDir, 0, sizeof(s_flashDir));
+    s_flashDir.magic          = FLASH_DIR_MAGIC;
+    s_flashDir.count          = 0;
+    s_flashDir.nextDataOffset = FLASH_DATA_OFFSET;
+    esp_partition_write(s_pcmPart, 0, &s_flashDir, sizeof(FlashCacheDir));
+    flashRemmap();
+    Serial.println("[FLASH] cleared");
+}
+
+// Returns entry index or -1 (not found) or -2 (stale srcSize mismatch).
+static int flashLookup(const char* path, uint32_t srcSize) {
+    for (uint32_t i = 0; i < s_flashDir.count; i++) {
+        if (strncmp(s_flashDir.entries[i].path, path, 79) == 0)
+            return (s_flashDir.entries[i].srcSize == srcSize) ? (int)i : -2;
+    }
+    return -1;
+}
+
+// Register a flash entry as an AMY preset (no PSRAM allocated) and start playback.
+static bool flashCacheLoad(int idx, uint16_t preset, uint8_t osc, float vel, uint32_t tStop) {
+    if (!s_mmapBase || idx < 0 || idx >= (int)s_flashDir.count) return false;
+    const FlashCacheEntry& en = s_flashDir.entries[idx];
+    if (en.dataOffset + en.frameCount > s_pcmPart->size) return false;
+
+    uint32_t el = millis() - tStop;
+    if (el < AMY_STOP_SAFETY_MS) vTaskDelay(pdMS_TO_TICKS(AMY_STOP_SAFETY_MS - el));
+
+    const int8_t* ptr = (const int8_t*)((const uint8_t*)s_mmapBase + en.dataOffset);
+    pcm_register_extern8(preset, ptr, en.frameCount, en.sampleRate / 2, 69, 0, en.frameCount - 1);
+    amyPlayPcm(osc, preset, vel);
+
+    if (osc >= SAMPLE_OSC_BASE && osc < SAMPLE_OSC_BASE + SAMPLE_KEY_COUNT)
+        s_keyLengthMs[osc - SAMPLE_OSC_BASE] = (uint32_t)
+            ((uint64_t)en.frameCount * 1000 / en.sampleRate);
+
+    Serial.printf("[FLASH] hit: %s (%u frames @ %uHz, 0 PSRAM)\n",
+                  en.path, en.frameCount, en.sampleRate);
+    return true;
+}
+
+// Write int16_t PCM (already normalized) to flash as int8_t, update directory.
+static bool flashCacheWrite(const char* path, uint32_t srcSize,
+                             const int16_t* buf16, uint32_t frames, uint32_t sampleRate) {
+    if (!s_pcmPart || !s_mmapBase || frames == 0 || !buf16) return false;
+    if (s_flashDir.count >= FLASH_MAX_ENTRIES) {
+        Serial.println("[FLASH] dir full"); return false;
+    }
+
+    uint32_t offset      = (s_flashDir.nextDataOffset + 3) & ~3u;
+    uint32_t writeAligned = (frames + 3) & ~3u;  // flash write must be 4-byte multiple
+
+    if (offset + writeAligned > s_pcmPart->size) {
+        Serial.printf("[FLASH] out of space (need %uKB)\n", writeAligned / 1024);
+        return false;
+    }
+
+    // Erase all sectors that will be written
+    uint32_t eraseStart = offset & ~(FLASH_SECTOR_SIZE - 1u);
+    uint32_t eraseEnd   = ((offset + writeAligned) + FLASH_SECTOR_SIZE - 1) & ~(FLASH_SECTOR_SIZE - 1u);
+    Serial.printf("[FLASH] erasing %uKB for %u frames...\n", (eraseEnd - eraseStart) / 1024, frames);
+    esp_partition_erase_range(s_pcmPart, eraseStart, eraseEnd - eraseStart);
+    vTaskDelay(2);
+
+    // Convert int16 → int8 and write in 1KB chunks
+    const uint32_t CHUNK = 1024;
+    uint8_t tmp[CHUNK];
+    uint32_t written = 0;
+    while (written < writeAligned && !s_svcAbort) {
+        uint32_t cnt = writeAligned - written; if (cnt > CHUNK) cnt = CHUNK;
+        for (uint32_t i = 0; i < cnt; i++) {
+            uint32_t si = written + i;
+            tmp[i] = (si < frames) ? (uint8_t)(int8_t)(buf16[si] >> 8) : 0;
+        }
+        esp_partition_write(s_pcmPart, offset + written, tmp, cnt);
+        written += cnt;
+        vTaskDelay(1);
+    }
+    if (s_svcAbort) return false;
+
+    // Update RAM directory
+    FlashCacheEntry& en = s_flashDir.entries[s_flashDir.count];
+    strncpy(en.path, path, 79); en.path[79] = '\0';
+    en.srcSize         = srcSize;
+    en.dataOffset      = offset;
+    en.frameCount      = frames;
+    en.sampleRate      = sampleRate;
+    en.reserved        = 0;
+    s_flashDir.count++;
+    s_flashDir.nextDataOffset = offset + writeAligned;
+
+    // Persist directory to flash
+    esp_partition_erase_range(s_pcmPart, 0, FLASH_DIR_SECTORS * FLASH_SECTOR_SIZE);
+    esp_partition_write(s_pcmPart, 0, &s_flashDir, sizeof(FlashCacheDir));
+
+    flashRemmap();  // remap so new data is visible through s_mmapBase
+    Serial.printf("[FLASH] stored %s  %u frames @ 0x%06X  (%u total entries, %uKB used)\n",
+                  path, frames, offset, s_flashDir.count, s_flashDir.nextDataOffset / 1024);
+    return true;
+}
+
+// Try loading a preset from the flash partition. Returns true = hit.
+static bool svcTryFlash(const char* path, uint32_t srcSize, uint16_t preset,
+                         uint8_t osc, float vel, uint32_t tStop) {
+    if (!s_mmapBase) return false;
+    int idx = flashLookup(path, srcSize);
+    if (idx < 0) return false;  // -1 = not found, -2 = stale (fall through to re-decode)
+    return flashCacheLoad(idx, preset, osc, vel, tStop);
+}
+
+// ---- PCM decode cache ----
+// After decoding a WAV/MP3, the raw PCM frames are saved as <path>.pcm on SD.
+// On subsequent loads the cache is read directly instead of re-decoding.
+// Cache format: PcmCacheHdr (20 bytes) + int16_t[frameCount]
+struct PcmCacheHdr {
+    char     magic[4];       // "GPC3"
+    uint32_t frameCount;     // mono int16_t frames stored
+    uint32_t srcSize;        // source file size for invalidation
+    uint32_t pcmSampleRate;  // sample rate of stored frames (WAV=AMY_SAMPLE_RATE, MP3=native)
+    uint32_t reserved;
+};
+
+// Peak-normalize: scale buf to 90% of int16 full scale. Max gain 16× to avoid noise.
+static void normalizeBuffer(int16_t* buf, uint32_t frames) {
+    if (frames == 0) return;
+    int32_t peak = 0;
+    for (uint32_t i = 0; i < frames; i++) {
+        int32_t v = buf[i]; if (v < 0) v = -v;
+        if (v > peak) peak = v;
+    }
+    if (peak < 500) return;  // near-silence, don't amplify noise
+    float scale = 29491.0f / (float)peak;  // target 90% of 32767
+    if (scale <= 1.02f) return;            // already near full scale
+    if (scale > 16.0f) scale = 16.0f;     // cap at 24dB
+    for (uint32_t i = 0; i < frames; i++) {
+        int32_t v = (int32_t)((float)buf[i] * scale);
+        if (v > 32767) v = 32767; else if (v < -32767) v = -32767;
+        buf[i] = (int16_t)v;
+    }
+    Serial.printf("PCM norm: peak=%d scale=%.1fx\n", (int)peak, scale);
+}
+
+// Apply short fade-in / fade-out to remove clicks at sample boundaries.
+static void applyBufferFades(int16_t* buf, uint32_t frames) {
+    if (frames == 0) return;
+    const uint32_t fadeInF  = (uint32_t)(PCM_TARGET_RATE * 0.005f);  // 5ms
+    const uint32_t fadeOutF = (uint32_t)(PCM_TARGET_RATE * 0.040f);  // 40ms
+    uint32_t fi = (fadeInF  < frames / 4) ? fadeInF  : frames / 4;
+    uint32_t fo = (fadeOutF < frames / 4) ? fadeOutF : frames / 4;
+    for (uint32_t i = 0; i < fi; i++)
+        buf[i] = (int16_t)((int32_t)buf[i] * (int32_t)i / (int32_t)fi);
+    for (uint32_t i = 0; i < fo; i++)
+        buf[frames - 1 - i] = (int16_t)((int32_t)buf[frames - 1 - i] * (int32_t)i / (int32_t)fo);
+}
+
+// Try loading AMY preset from .pcm cache. Returns true = cache hit; false = miss (caller must decode).
+static bool svcTryCache(const char* path, uint16_t preset, uint8_t osc, float vel,
+                         uint32_t tStop, uint32_t srcSize) {
+    char cp[264]; snprintf(cp, sizeof(cp), "%s.pcm", path);
+    File f = SD.open(cp, FILE_READ);
+    if (!f) return false;
+
+    PcmCacheHdr h;
+    uint32_t maxLoad = (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 2);
+    if (maxLoad < PCM_MIN_FRAMES) maxLoad = PCM_MIN_FRAMES;
+    bool valid = ((uint32_t)f.read((uint8_t*)&h, sizeof(h)) == sizeof(h))
+              && (memcmp(h.magic, "GPC4", 4) == 0)
+              && (h.srcSize == srcSize)
+              && (h.frameCount > 0)
+              && (h.pcmSampleRate > 0)
+              && ((uint32_t)f.size() == (uint32_t)(sizeof(h) + h.frameCount * 1u));
+    if (valid && h.frameCount > maxLoad) h.frameCount = maxLoad;  // stream only what fits in PSRAM
+    if (!valid) { f.close(); return false; }
+
+    // Cache hit — wait for AMY stop safety before freeing old preset.
+    uint32_t el = millis() - tStop;
+    if (el < AMY_STOP_SAFETY_MS) vTaskDelay(pdMS_TO_TICKS(AMY_STOP_SAFETY_MS - el));
+
+    int8_t* amyBuf = pcm_load8(preset, h.frameCount, h.pcmSampleRate / 2, 1, 69, 0, 0);
+    if (!amyBuf) { f.close(); return false; }
+    memset(amyBuf, 0, h.frameCount * sizeof(int8_t));
+
+    uint32_t pos = 0; bool played = false;
+    while (pos < h.frameCount && !s_svcAbort) {
+        uint32_t batch = h.frameCount - pos;
+        if (batch > STREAM_BATCH_FRAMES) batch = STREAM_BATCH_FRAMES;
+        if ((uint32_t)f.read((uint8_t*)(amyBuf + pos), batch) != batch) break;
+        pos += batch;
+        if (!played && pos >= STREAM_PLAY_FRAMES) { amyPlayPcm(osc, preset, vel); played = true; }
+        vTaskDelay(1);
+    }
+    if (!played) amyPlayPcm(osc, preset, vel);
+    f.close();
+
+    if (osc >= SAMPLE_OSC_BASE && osc < SAMPLE_OSC_BASE + SAMPLE_KEY_COUNT && !s_svcAbort)
+        s_keyLengthMs[osc - SAMPLE_OSC_BASE] = (uint32_t)((uint64_t)pos * 1000 / h.pcmSampleRate);
+
+    Serial.printf("CACHE hit: %s (%u frames @ %uHz)\n", cp, pos, h.pcmSampleRate);
+    return true;
+}
+
+// Save decoded PCM frames to .pcm cache alongside the source file.
+static void svcWriteCache(const char* path, const int16_t* buf, uint32_t frames,
+                           uint32_t srcSize, uint32_t pcmSampleRate) {
+    if (!buf || frames == 0) return;
+    char cp[264]; snprintf(cp, sizeof(cp), "%s.pcm", path);
+    File f = SD.open(cp, FILE_WRITE);
+    if (!f) { Serial.printf("CACHE: write fail %s\n", cp); return; }
+    PcmCacheHdr h; memcpy(h.magic, "GPC4", 4);
+    h.frameCount = frames; h.srcSize = srcSize; h.pcmSampleRate = pcmSampleRate; h.reserved = 0;
+    f.write((uint8_t*)&h, sizeof(h));
+    const uint32_t CHUNK = 1024;
+    int8_t tmp[CHUNK];
+    for (uint32_t p = 0; p < frames && !s_svcAbort; p += CHUNK) {
+        uint32_t cnt = frames - p; if (cnt > CHUNK) cnt = CHUNK;
+        for (uint32_t i = 0; i < cnt; i++)
+            tmp[i] = (int8_t)(buf[p + i] >> 8);  // upper 8 bits of int16
+        f.write((uint8_t*)tmp, cnt);
+        vTaskDelay(1);
+    }
+    f.close();
+    Serial.printf("CACHE: saved %s (%u frames, %lu B)\n", cp, frames, (unsigned long)(sizeof(h) + frames * 1));
+}
+
+// ---- WAV loader (runs inside bgServiceTask) ----
+// Returns true if the preset was successfully filled (even if partial), false on hard error.
+static bool svcLoadWav(const char* path, uint16_t preset, uint8_t osc, float vel, uint32_t tStop) {
+    s_loadError = KEY_ERR_IO;  // default; overridden below for specific failures
+    // Try flash partition first (zero PSRAM), then SD cache, then full decode.
+    uint32_t srcSize = 0;
+    { File tmp = SD.open(path, FILE_READ); if (tmp) { srcSize = tmp.size(); tmp.close(); } }
+    if (svcTryFlash(path, srcSize, preset, osc, vel, tStop)) return !s_svcAbort;
+    if (svcTryCache(path, preset, osc, vel, tStop, srcSize)) return !s_svcAbort;
+
+    File f = SD.open(path, FILE_READ);
+    if (!f) { Serial.printf("WAV: open fail: %s\n", path); return false; }
+
+    // Parse RIFF/WAVE header. SD open+parse (~20ms) naturally covers the AMY stop window.
+    uint8_t riff[12];
+    if (f.read(riff, 12) < 12 || memcmp(riff, "RIFF", 4) || memcmp(riff+8, "WAVE", 4)) {
+        Serial.println("WAV: bad header"); f.close(); return false;
+    }
+    uint16_t numCh = 1; uint32_t fileSR = AMY_SAMPLE_RATE; uint16_t bps = 16; uint16_t audioFmt = 1;
+    uint32_t dataSize = 0; bool foundData = false;
+    int chunkIter = 0;
+    while (f.available() > 8 && !foundData && ++chunkIter <= 32) {
+        uint8_t ch[8]; if (f.read(ch, 8) < 8) break;
+        uint32_t csz = (uint32_t)ch[4]|((uint32_t)ch[5]<<8)|((uint32_t)ch[6]<<16)|((uint32_t)ch[7]<<24);
+        uint32_t cpos = (uint32_t)f.position();  // start of chunk DATA (after 8-byte header)
+        uint32_t fsize = (uint32_t)f.size();
+        // Guard: corrupt csz would overflow seek position → infinite loop
+        if (csz > fsize || cpos > fsize - csz) {
+            if (!memcmp(ch, "data", 4)) { dataSize = fsize - cpos; foundData = true; }
+            else { Serial.printf("WAV: corrupt chunk size %u at pos %u\n", csz, cpos); f.close(); s_loadError = KEY_ERR_FORMAT; return false; }
+            break;
+        }
+        if (!memcmp(ch, "fmt ", 4)) {
+            // Read up to 40 bytes: needed for WAVE_FORMAT_EXTENSIBLE (sub-format at byte 24)
+            uint8_t fmt[40] = {};
+            uint32_t rd = csz < sizeof(fmt) ? csz : (uint32_t)sizeof(fmt);
+            f.read(fmt, rd);
+            f.seek(cpos + csz + (csz & 1));  // seek past entire chunk from its data start
+            audioFmt = (uint16_t)(fmt[0]|(fmt[1]<<8));  // 1=PCM, 3=IEEE Float, 65534=EXTENSIBLE
+            numCh    = (uint16_t)(fmt[2]|(fmt[3]<<8));
+            fileSR   = (uint32_t)fmt[4]|(uint32_t)(fmt[5]<<8)|(uint32_t)(fmt[6]<<16)|(uint32_t)(fmt[7]<<24);
+            bps      = (uint16_t)(fmt[14]|(fmt[15]<<8));
+            if (audioFmt == 65534 && rd >= 26)  // EXTENSIBLE: actual sub-format GUID at byte 24-25
+                audioFmt = (uint16_t)(fmt[24]|(fmt[25]<<8));
+        } else if (!memcmp(ch, "data", 4)) { dataSize = csz; foundData = true; }
+        else { f.seek(cpos + csz + (csz & 1)); }
+    }
+    if (!foundData || dataSize == 0 || fileSR == 0 || numCh == 0 || numCh > 8
+        || (audioFmt != 1 && audioFmt != 3)) {
+        Serial.printf("WAV: parse fail (data=%u SR=%u ch=%u bps=%u fmt=%u)\n",
+                      dataSize, fileSR, numCh, bps, audioFmt);
+        f.close(); s_loadError = KEY_ERR_FORMAT; return false;
+    }
+    bool wavIsFloat = (audioFmt == 3 && bps == 32);
+
+    // Ensure AMY had enough time to process the stop event before freeing old buffer
+    uint32_t el = millis() - tStop;
+    if (el < AMY_STOP_SAFETY_MS) vTaskDelay(pdMS_TO_TICKS(AMY_STOP_SAFETY_MS - el));
+
+    uint32_t bpf      = numCh * (bps / 8);
+    uint32_t totalIn  = bpf ? dataSize / bpf : 0;
+    float    ratio    = (float)fileSR / (float)PCM_TARGET_RATE;
+    uint32_t totalOut = (uint32_t)((float)totalIn / ratio);
+    {
+        uint32_t mf = psramMaxFrames();
+        if (totalOut > mf) { totalOut = mf; totalIn = (uint32_t)(mf * ratio) + 1; }
+    }
+
+    Serial.printf("WAV: %uHz %uch %ubps %u→%u frames @%uHz\n", fileSR, numCh, bps, totalIn, totalOut, PCM_TARGET_RATE);
+
+    int16_t* amyBuf = pcm_load(preset, totalOut, PCM_TARGET_RATE / 2, 1, 69, 0, 0);
+    if (!amyBuf) { Serial.println("WAV: alloc fail"); f.close(); s_loadError = KEY_ERR_ALLOC; return false; }
+
+    // Zero entire buffer: AMY starts playing before decode finishes, uninitialized
+    // frames must be silent (not random PSRAM garbage causing high-pitched artifacts).
+    memset(amyBuf, 0, totalOut * sizeof(int16_t));
+
+    int16_t* raw = (int16_t*)ps_malloc(STREAM_BATCH_FRAMES * numCh * sizeof(int16_t));
+    if (!raw) { f.close(); s_loadError = KEY_ERR_ALLOC; return false; }
+
+    bool played = false;
+    uint32_t inPos = 0, outPos = 0;
+
+    while (inPos < totalIn && outPos < totalOut && !s_svcAbort) {
+        uint32_t batchIn = totalIn - inPos;
+        if (batchIn > STREAM_BATCH_FRAMES) batchIn = STREAM_BATCH_FRAMES;
+        if (!wavReadRaw(f, bps, batchIn, numCh, raw, wavIsFloat)) break;
+
+        uint32_t outEnd = (uint32_t)((float)(inPos + batchIn) / ratio);
+        if (outEnd > totalOut) outEnd = totalOut;
+        uint32_t outCnt = outEnd > outPos ? outEnd - outPos : 0;
+
+        if (outCnt > 0) {
+            if (fileSR == (uint32_t)PCM_TARGET_RATE && numCh == 1) {
+                memcpy(amyBuf + outPos, raw, outCnt * sizeof(int16_t));
+            } else if (fileSR == (uint32_t)PCM_TARGET_RATE && numCh == 2) {
+                // Fast path: average L+R, no resampling
+                for (uint32_t i = 0; i < outCnt; i++)
+                    amyBuf[outPos + i] = (int16_t)(((int32_t)raw[i*2] + raw[i*2+1]) >> 1);
+            } else {
+                // General: linear interpolation + channel mix
+                for (uint32_t oi = 0; oi < outCnt && !s_svcAbort; oi++) {
+                    float sp = (outPos + oi) * ratio - inPos;
+                    if (sp < 0.0f) sp = 0.0f;
+                    uint32_t si0 = (uint32_t)sp; float frac = sp - si0;
+                    uint32_t si1 = si0 + 1; if (si1 >= batchIn) si1 = batchIn - 1;
+                    int32_t s0 = 0, s1 = 0;
+                    for (uint16_t c = 0; c < numCh; c++) { s0 += raw[si0*numCh+c]; s1 += raw[si1*numCh+c]; }
+                    if (numCh > 1) { s0 /= numCh; s1 /= numCh; }
+                    amyBuf[outPos + oi] = (int16_t)(s0 + (int32_t)((s1 - s0) * frac));
+                }
+            }
+        }
+
+        inPos  += batchIn;
+        outPos  = outEnd;
+
+        if (!played && outPos >= STREAM_PLAY_FRAMES) {
+            amyPlayPcm(osc, preset, vel);
+            played = true;
+        }
+        vTaskDelay(1);
+    }
+
+    if (!played) amyPlayPcm(osc, preset, vel);
+    free(raw);
+    f.close();
+    Serial.printf("WAV done: %u/%u frames\n", outPos, totalOut);
+    if (osc >= SAMPLE_OSC_BASE && osc < SAMPLE_OSC_BASE + SAMPLE_KEY_COUNT && !s_svcAbort)
+        s_keyLengthMs[osc - SAMPLE_OSC_BASE] = (uint32_t)((uint64_t)outPos * 1000 / PCM_TARGET_RATE);
+    // Normalize, write SD cache, then write flash cache (first load only; subsequent = flash hit).
+    if (!s_svcAbort && outPos > 0) normalizeBuffer(amyBuf, outPos);
+    if (!s_svcAbort && outPos > 0) applyBufferFades(amyBuf, outPos);
+    if (!s_svcAbort && outPos > 0) svcWriteCache(path, amyBuf, outPos, srcSize, PCM_TARGET_RATE);
+    if (!s_svcAbort && outPos > 0) flashCacheWrite(path, srcSize, amyBuf, outPos, PCM_TARGET_RATE);
+    return !s_svcAbort;
+}
+
+// ---- MP3 loader (runs inside bgServiceTask) ----
+#define MP3_INBUF_SIZE (16 * 1024)
+
+// Returns true if the preset was successfully filled, false on hard error.
+static bool svcLoadMp3(const char* path, uint16_t preset, uint8_t osc, float vel, uint32_t tStop) {
+    s_loadError = KEY_ERR_IO;  // default; overridden below for specific failures
+    // Get source size then try cache — avoids the full MP3 decode on repeated loads.
+    uint32_t srcSize = 0;
+    { File tmp = SD.open(path, FILE_READ); if (!tmp) { Serial.printf("MP3: open fail: %s\n", path); return false; } srcSize = tmp.size(); tmp.close(); }
+    if (svcTryFlash(path, srcSize, preset, osc, vel, tStop)) return !s_svcAbort;
+    if (svcTryCache(path, preset, osc, vel, tStop, srcSize)) return !s_svcAbort;
+
+    File f = SD.open(path, FILE_READ);
+    if (!f) { return false; }
+    uint32_t fileSize = srcSize;
+
+    HMP3Decoder dec = MP3InitDecoder();
+    if (!dec) { f.close(); s_loadError = KEY_ERR_ALLOC; return false; }
+
+    uint8_t* inBuf = (uint8_t*)malloc(MP3_INBUF_SIZE);
+    if (!inBuf) { MP3FreeDecoder(dec); f.close(); s_loadError = KEY_ERR_ALLOC; return false; }
+
+    int16_t* frameBuf = (int16_t*)malloc(MAX_NGRAN * MAX_NCHAN * MAX_NSAMP * sizeof(int16_t));
+    if (!frameBuf) { MP3FreeDecoder(dec); f.close(); s_loadError = KEY_ERR_ALLOC; return false; }
+    uint32_t sampleRate = 44100;
+    uint8_t  numCh = 2;
+    bool     gotInfo = false;
+    uint32_t estimatedTotal = psramMaxFrames();
+
+    uint8_t* ptr = inBuf; int bytesLeft = 0; bool eof = false;
+    auto refill = [&]() {
+        if (ptr != inBuf && bytesLeft > 0) memmove(inBuf, ptr, bytesLeft);
+        ptr = inBuf;
+        if (!eof) {
+            uint32_t space = (uint32_t)(MP3_INBUF_SIZE - bytesLeft);
+            uint32_t rd = f.read(inBuf + bytesLeft, space);
+            bytesLeft += (int)rd;
+            if (rd < space) eof = true;
+        }
+    };
+
+    refill();
+    int sync = MP3FindSyncWord(ptr, bytesLeft);
+    if (sync < 0) { Serial.println("MP3: no sync"); free(frameBuf); free(inBuf); MP3FreeDecoder(dec); f.close(); s_loadError = KEY_ERR_FORMAT; return false; }
+    ptr += sync; bytesLeft -= sync;
+
+    // Decode first frame to get sample rate, channels, and estimate total frames
+    {
+        if (bytesLeft < MAINBUF_SIZE) refill();
+        int preDecode = bytesLeft;
+        int ret = MP3Decode(dec, &ptr, &bytesLeft, frameBuf, 0);
+        if (ret == 0) {
+            MP3FrameInfo info; MP3GetLastFrameInfo(dec, &info);
+            // Validate before use — corrupt files can yield nChans=0 → div-by-zero
+            if (info.nChans >= 1 && info.nChans <= 2 && info.samprate > 0 && info.samprate <= 48000
+                && info.outputSamps >= 1 && info.outputSamps <= (int)(MAX_NGRAN * MAX_NCHAN * MAX_NSAMP)) {
+                sampleRate = (uint32_t)info.samprate;
+                numCh      = (uint8_t)info.nChans;
+                gotInfo    = true;
+                int frameBytes = preDecode - bytesLeft;
+                if (frameBytes > 0) {
+                    uint32_t spf  = (uint32_t)info.outputSamps / (uint32_t)info.nChans;
+                    uint64_t est  = ((uint64_t)fileSize / (uint32_t)frameBytes) * spf;
+                    est = est * PCM_TARGET_RATE / sampleRate;  // convert to target rate frames
+                    if (est < estimatedTotal) estimatedTotal = (uint32_t)est;
+                }
+            } else {
+                Serial.printf("MP3: bad first frame (ch=%d SR=%d samps=%d)\n", info.nChans, info.samprate, info.outputSamps);
+            }
+        }
+    }
+
+    // Ensure AMY stop safety window
+    uint32_t el = millis() - tStop;
+    if (el < AMY_STOP_SAFETY_MS) vTaskDelay(pdMS_TO_TICKS(AMY_STOP_SAFETY_MS - el));
+
+    int16_t* amyBuf = pcm_load(preset, estimatedTotal, PCM_TARGET_RATE / 2, 1, 69, 0, 0);
+    if (!amyBuf) { free(frameBuf); free(inBuf); MP3FreeDecoder(dec); f.close(); s_loadError = KEY_ERR_ALLOC; return false; }
+    // Zero entire buffer so unfinished frames play silence rather than PSRAM garbage.
+    memset(amyBuf, 0, estimatedTotal * sizeof(int16_t));
+
+    uint32_t totalFrames = 0;  // output frame count at PCM_TARGET_RATE
+    uint32_t inPos = 0;        // decoded frame count at native sampleRate
+    bool played = false;
+
+    // Commit first decoded frame (already in frameBuf, numCh already validated above)
+    if (gotInfo && numCh > 0) {
+        MP3FrameInfo info; MP3GetLastFrameInfo(dec, &info);
+        uint32_t spf = (uint32_t)info.outputSamps / (uint32_t)numCh;
+        // Downmix stereo→mono in-place (reads [j*2],[j*2+1], writes [j] — safe since j < j*2)
+        if (numCh > 1)
+            for (uint32_t j = 0; j < spf; j++)
+                frameBuf[j] = (int16_t)(((int32_t)frameBuf[j*2] + frameBuf[j*2+1]) >> 1);
+        // Resample frameBuf[0..spf-1] from sampleRate → PCM_TARGET_RATE
+        float ratio_mp3 = (float)sampleRate / PCM_TARGET_RATE;
+        uint32_t outEnd = (uint32_t)(spf / ratio_mp3);
+        if (outEnd > estimatedTotal) outEnd = estimatedTotal;
+        for (uint32_t oi = 0; oi < outEnd; oi++) {
+            float sp = oi * ratio_mp3;
+            uint32_t si0 = (uint32_t)sp; float frac = sp - si0;
+            if (si0 >= spf) si0 = spf - 1;
+            uint32_t si1 = si0 + 1; if (si1 >= spf) si1 = spf - 1;
+            amyBuf[oi] = (int16_t)((int32_t)frameBuf[si0] + (int32_t)((frameBuf[si1] - frameBuf[si0]) * frac));
+        }
+        inPos = spf;
+        totalFrames = outEnd;
+    }
+
+    // Decode remaining frames
+    int consErr = 0;
+    while ((!eof || bytesLeft > 0) && totalFrames < estimatedTotal && !s_svcAbort) {
+        if (bytesLeft < MAINBUF_SIZE && !eof) refill();
+        int ret = MP3Decode(dec, &ptr, &bytesLeft, frameBuf, 0);
+        if (ret == ERR_MP3_INDATA_UNDERFLOW)   { refill(); continue; }
+        if (ret == ERR_MP3_MAINDATA_UNDERFLOW)  { continue; }
+        if (ret < 0) {
+            if (++consErr > 64) { Serial.println("MP3: too many errors, aborting"); break; }
+            int sk = MP3FindSyncWord(ptr + 1, bytesLeft - 1);
+            if (sk < 0) break; ptr += sk + 1; bytesLeft -= sk + 1; continue;
+        }
+        consErr = 0;
+
+        MP3FrameInfo info; MP3GetLastFrameInfo(dec, &info);
+        // Validate frame — corrupt data can produce nChans=0 (div-by-zero) or huge outputSamps (OOB)
+        if (info.nChans < 1 || info.nChans > 2 || info.outputSamps < 1
+            || info.outputSamps > (int)(MAX_NGRAN * MAX_NCHAN * MAX_NSAMP)) {
+            Serial.printf("MP3: bad frame info ch=%d samps=%d, skipping\n", info.nChans, info.outputSamps);
+            continue;
+        }
+        if (!gotInfo) { sampleRate=(uint32_t)info.samprate; numCh=(uint8_t)info.nChans; gotInfo=true; }
+
+        uint32_t frOut = (uint32_t)info.outputSamps / (uint32_t)info.nChans;
+        if (frOut == 0) break;
+
+        // Downmix stereo→mono in-place
+        if (info.nChans > 1)
+            for (uint32_t j = 0; j < frOut; j++)
+                frameBuf[j] = (int16_t)(((int32_t)frameBuf[j*2] + frameBuf[j*2+1]) >> 1);
+
+        // Resample this frame from sampleRate → PCM_TARGET_RATE with linear interpolation
+        float ratio_mp3 = (float)sampleRate / PCM_TARGET_RATE;
+        uint32_t outEnd = (uint32_t)((inPos + frOut) / ratio_mp3);
+        if (outEnd > estimatedTotal) outEnd = estimatedTotal;
+        uint32_t outCnt = outEnd > totalFrames ? outEnd - totalFrames : 0;
+        for (uint32_t oi = 0; oi < outCnt; oi++) {
+            float sp = (totalFrames + oi) * ratio_mp3 - (float)inPos;
+            if (sp < 0.0f) sp = 0.0f;
+            uint32_t si0 = (uint32_t)sp; float frac = sp - si0;
+            if (si0 >= frOut) si0 = frOut - 1;
+            uint32_t si1 = si0 + 1; if (si1 >= frOut) si1 = frOut - 1;
+            amyBuf[totalFrames + oi] = (int16_t)((int32_t)frameBuf[si0] + (int32_t)((frameBuf[si1] - frameBuf[si0]) * frac));
+        }
+        inPos += frOut;
+        totalFrames = outEnd;
+        if (totalFrames >= estimatedTotal) break;
+
+        if (!played && totalFrames >= STREAM_PLAY_FRAMES) {
+            amyPlayPcm(osc, preset, vel);
+            played = true;
+        }
+        vTaskDelay(1);
+    }
+
+    if (!played) amyPlayPcm(osc, preset, vel);
+    free(frameBuf);
+    free(inBuf);
+    MP3FreeDecoder(dec);
+    f.close();
+    Serial.printf("MP3 done: %u/%u frames\n", totalFrames, estimatedTotal);
+    if (osc >= SAMPLE_OSC_BASE && osc < SAMPLE_OSC_BASE + SAMPLE_KEY_COUNT && !s_svcAbort)
+        s_keyLengthMs[osc - SAMPLE_OSC_BASE] = (uint32_t)((uint64_t)totalFrames * 1000 / PCM_TARGET_RATE);
+    // Normalize, write SD cache, then write flash cache.
+    if (!s_svcAbort && totalFrames > 0) normalizeBuffer(amyBuf, totalFrames);
+    if (!s_svcAbort && totalFrames > 0) applyBufferFades(amyBuf, totalFrames);
+    if (!s_svcAbort && totalFrames > 0) svcWriteCache(path, amyBuf, totalFrames, srcSize, PCM_TARGET_RATE);
+    if (!s_svcAbort && totalFrames > 0) flashCacheWrite(path, srcSize, amyBuf, totalFrames, PCM_TARGET_RATE);
+    return !s_svcAbort;
+}
+
+// ---- Persistent service task: processes load requests from queue one at a time ----
+void bgServiceTask(void* /*param*/) {
+    LoadReq req;
+    for (;;) {
+        xQueueReceive(s_loadQueue, &req, portMAX_DELAY);
+        s_currentOsc = req.osc;
+        s_svcDone    = false;
+        s_svcAbort   = false;
+
+        // Stop whatever was playing on this OSC before we overwrite its preset.
+        amyStopOsc(req.osc);
+        uint32_t tStop = millis();
+
+        // If this is a key-slot load, mark unloaded until complete.
+        uint8_t keyIdx = 0xFF;
+        if (req.osc >= SAMPLE_OSC_BASE && req.osc < SAMPLE_OSC_BASE + SAMPLE_KEY_COUNT) {
+            keyIdx = req.osc - SAMPLE_OSC_BASE;
+            s_keyLoaded[keyIdx]   = false;
+            s_keyLengthMs[keyIdx] = 0;
+            s_keyError[keyIdx]    = KEY_ERR_NONE;  // clear previous error when retrying
+        }
+
+        if (keyIdx != 0xFF)
+            Serial.printf("[KEY %u] loading %s  (psram %ukB / %ukB)\n",
+                          keyIdx, req.path,
+                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024,
+                          (unsigned)heap_caps_get_total_size(MALLOC_CAP_SPIRAM)/1024);
+
+        const char* ext = strrchr(req.path, '.');
+        bool ok = false;
+        try {
+            if (ext && strcasecmp(ext, ".wav") == 0)
+                ok = svcLoadWav(req.path, req.preset, req.osc, req.vel, tStop);
+            else if (ext && strcasecmp(ext, ".mp3") == 0)
+                ok = svcLoadMp3(req.path, req.preset, req.osc, req.vel, tStop);
+            else
+                Serial.printf("SVC: unknown format %s\n", ext ? ext : "(none)");
+        } catch (...) {
+            // Safety net: C++ exception from SD library or heap exhaustion — skip this file.
+            Serial.printf("SVC: exception while loading %s, skipping\n", req.path);
+            ok = false;
+        }
+
+        // Mark key as loaded only if the loader returned success (not aborted, no hard error).
+        if (keyIdx != 0xFF) {
+            if (ok) {
+                s_keyLoaded[keyIdx] = true;
+                s_keyError[keyIdx]  = KEY_ERR_NONE;
+                Serial.printf("[KEY %u] OK  (psram %ukB free)\n",
+                              keyIdx, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);
+            } else if (!s_svcAbort) {
+                s_keyError[keyIdx] = s_loadError;
+                Serial.printf("[KEY %u] FAIL err=%u  (psram %ukB free)\n",
+                              keyIdx, s_loadError, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);
+            }
+        }
+        s_currentOsc = 0xFF;
+        s_svcDone    = true;
+    }
+}
+
+// ---- Public API: non-blocking load + play ----
+
+// Preview: aborts only the currently-running load (for instant response), then inserts the
+// preview at the front of the queue. Pending key loads already in the queue are preserved —
+// they resume automatically after the preview finishes.
+void audioLoadAndPlay(const char* path, uint16_t preset, float vel) {
+    if (!audioReady || !s_loadQueue) return;
+    LoadReq req;
+    strncpy(req.path, path, sizeof(req.path) - 1);
+    req.path[sizeof(req.path) - 1] = '\0';
+    req.preset = preset;
+    req.osc    = PCM_PREVIEW_OSC;
+    req.vel    = vel;
+    // Abort whatever is currently being decoded (bgServiceTask checks s_svcAbort each batch,
+    // so it exits within ~50ms). Queue is NOT cleared so auto-mapped loads continue after preview.
+    s_svcAbort = true;
+    xQueueSendToFront(s_loadQueue, &req, 0);
+}
+
+// Key assignment: queues background load into the key's dedicated RAM preset.
+// Does NOT abort in-progress loads. Silently drops request if queue is full.
+void audioLoadKey(const char* path, uint8_t keyIdx) {
+    if (!audioReady || !s_loadQueue || keyIdx >= SAMPLE_KEY_COUNT) return;
+    LoadReq req;
+    strncpy(req.path, path, sizeof(req.path) - 1);
+    req.path[sizeof(req.path) - 1] = '\0';
+    req.preset = SAMPLE_PRESET_BASE + keyIdx;
+    req.osc    = SAMPLE_OSC_BASE + keyIdx;
+    req.vel    = 0.0f;  // load only; user triggers play with audioPlayKey()
+    s_keyLoaded[keyIdx] = false;
+    if (xQueueSend(s_loadQueue, &req, 0) != pdTRUE)
+        Serial.printf("KEY %u: queue full, load dropped\n", keyIdx);
+}
+
+// Play the RAM-loaded sample for a key.
+void audioPlayKey(uint8_t keyIdx, float vel) {
+    if (!audioReady || keyIdx >= SAMPLE_KEY_COUNT) return;
+    float v = vel * s_sampleVolume;
+    if (v > 2.0f) v = 2.0f;
+    amy_event e = amy_default_event();
+    e.osc       = SAMPLE_OSC_BASE + keyIdx;
+    e.wave      = PCM;
+    e.preset    = SAMPLE_PRESET_BASE + keyIdx;
+    e.midi_note = 69;
+    e.velocity  = v;
+    // 5ms fade-in to suppress click; 40ms release for smooth stop on note-off
+    e.eg0_times[0] = 5;   e.eg0_values[0] = 1.0f;
+    e.eg0_times[1] = 0;   e.eg0_values[1] = 1.0f;
+    e.eg0_times[2] = 40;  e.eg0_values[2] = 0.0f;
+    // feedback=0 prevents PCM loop (AMY uses feedback flag to gate looping in pcm_note_on)
+    e.feedback = 0.0f;
+    if (s_pcmLPFCutoff > 10.0f) {
+        e.filter_type = FILTER_LPF24;
+        e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
+        e.resonance = s_pcmLPFReso;
+    } else {
+        e.filter_type = FILTER_NONE;
+    }
+    amy_add_event(&e);
+}
+
+bool audioKeyLoaded(uint8_t keyIdx) {
+    if (keyIdx >= SAMPLE_KEY_COUNT) return false;
+    return s_keyLoaded[keyIdx];
+}
+
+uint8_t audioKeyError(uint8_t keyIdx) {
+    if (keyIdx >= SAMPLE_KEY_COUNT) return KEY_ERR_NONE;
+    return s_keyError[keyIdx];
+}
+
+void audioClearAllKeys() {
+    // Unload only sample-mode presets (200-231) and the preview slot (100).
+    // pcm_unload_all_presets() would also destroy drum presets (101-132),
+    // causing all drums to fall back to the same ROM preset after this call.
+    pcm_unload_preset(PCM_PREVIEW_PRESET);
+    for (int i = 0; i < SAMPLE_KEY_COUNT; i++)
+        pcm_unload_preset(SAMPLE_PRESET_BASE + i);
+    if (!s_loadQueue) return;
+    s_svcAbort = true;
+    xQueueReset(s_loadQueue);
+    memset((void*)s_keyLoaded,   0, sizeof(s_keyLoaded));
+    memset((void*)s_keyLengthMs, 0, sizeof(s_keyLengthMs));
+    memset((void*)s_keyError,    0, sizeof(s_keyError));
+}
+
+void audioStopKey(uint8_t keyIdx) {
+    if (!audioReady || keyIdx >= SAMPLE_KEY_COUNT) return;
+    amyStopOsc(SAMPLE_OSC_BASE + keyIdx);
+}
+
+uint32_t audioKeyLengthMs(uint8_t keyIdx) {
+    if (keyIdx >= SAMPLE_KEY_COUNT) return 0;
+    return s_keyLengthMs[keyIdx];
+}
+
+// ==================== AUTO-DETECT FORMAT (legacy synchronous wrappers) ====================
+bool audioLoadFromSD(const char* path, uint16_t preset) {
+    audioLoadAndPlay(path, preset, 0.0f);   // vel=0: caller must call audioPlaySamplePreset
+    return true;
+}
+bool audioLoadWavFromSD(const char* path, uint16_t preset) { return audioLoadFromSD(path, preset); }
+bool audioLoadMp3FromSD(const char* path, uint16_t preset) { return audioLoadFromSD(path, preset); }
+
+void audioSetSampleVolume(float v) {
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    s_sampleVolume = v;
+}
+
+// ==================== TB-303 ENGINE ====================
+// Monophonic synth on T303_CH: SAW or SQUARE, resonant 4-pole LPF,
+// amp envelope (EG0) + filter envelope (EG1 via COEF_EG1), portamento via pitch_bend.
+
+// Single EG controls both amp AND filter (COEF_EG0), like the real 303.
+// Decay and sustain applied only at NoteOn — never mid-note (avoids EG restart artifact).
+static float s_t303Decay   = 500.0f;
+static float s_t303Sustain = 0.0f;  // 0.0=pluck (Dec=note length), 1.0=full sustain (Dec affects filter only)
+
+void audioT303Init(float cutoff, float reso, float envMod, float decay, uint8_t amyWave) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth          = T303_CH;
+    e.num_voices     = 1;
+    e.oscs_per_voice = 1;
+    e.wave           = amyWave;
+    e.filter_type    = FILTER_LPF24;  // 4-pole, closer to 303 diode ladder character
+    e.resonance      = reso;
+    e.filter_freq_coefs[COEF_CONST] = cutoff;
+    e.filter_freq_coefs[COEF_EG0]   = envMod;  // filter tied to amp EG — single EG, no conflict
+    // Single EG: amp AND filter decay together
+    e.eg0_times[0] = 2.0f;   e.eg0_values[0] = 1.0f;
+    e.eg0_times[1] = decay;  e.eg0_values[1] = s_t303Sustain;
+    e.eg0_times[2] = 30.0f;  e.eg0_values[2] = 0.0f;
+    amy_add_event(&e);
+    s_t303Decay = decay;
+}
+
+void audioT303NoteOn(uint8_t midiNote, float vel) {
+    if (!audioReady) return;
+    // AMY processes eg0 params and midi_note trigger independently;
+    // send envelope update first so the note trigger picks up the latest decay/sustain.
+    { amy_event e = amy_default_event();
+      e.synth = T303_CH;
+      e.eg0_times[1]  = s_t303Decay;
+      e.eg0_values[1] = s_t303Sustain;
+      amy_add_event(&e); }
+    { amy_event e = amy_default_event();
+      e.synth     = T303_CH;
+      e.midi_note = midiNote;
+      e.velocity  = vel;
+      amy_add_event(&e); }
+}
+
+void audioT303NoteOff(uint8_t midiNote) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth     = T303_CH;
+    e.midi_note = midiNote;
+    e.velocity  = 0.0f;
+    amy_add_event(&e);
+}
+
+void audioT303Params(float cutoff, float reso, float envMod, float decay) {
+    if (!audioReady) return;
+    s_t303Decay = decay;  // stored for next note-on; never sent mid-note (no EG restart)
+    amy_event e = amy_default_event();
+    e.synth     = T303_CH;
+    e.resonance = reso;
+    e.filter_freq_coefs[COEF_CONST] = cutoff;
+    e.filter_freq_coefs[COEF_EG0]   = envMod;  // COEF_EG0, not EG1
+    amy_add_event(&e);
+}
+
+void audioT303SetSustain(float sustain) {
+    s_t303Sustain = sustain;
+}
+
+void audioT303PitchBend(float ratio) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth      = T303_CH;
+    e.pitch_bend = ratio;
+    amy_add_event(&e);
+}
+
+void audioT303SetAmpEnv(float /*atkMs*/, float /*sus*/, float /*relMs*/) {
+    // No-op: 303 uses its own single EG (decay+sustain via audioT303SetSustain + pot).
+}
+
+void audioT303Wave(uint8_t amyWave) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = T303_CH;
+    e.wave  = amyWave;
+    amy_add_event(&e);
+}
+
