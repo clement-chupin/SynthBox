@@ -19,6 +19,10 @@ enum AppMode : uint8_t {
     MODE_SYNTH2,    // Diapasonix full patch browser (258 Juno+DX7 patches)
     MODE_MOD2,      // PolyAnalog-inspired: waveform morph, power-law filter, LFO dest toggle
     MODE_303,       // TB-303 emulation: resonant LPF + filter envelope + slide + accent
+    MODE_GRANULAR,  // granular: play time-stretched slices of a sample (8-slice or 1/16)
+    MODE_GRANULAR2, // granular2: multi-sample (2 or 4), fwd+rev only, per-sample split control
+    MODE_MIDI,      // USB MIDI device: keyboard → NoteOn/Off, host → LED feedback (LaunchPad)
+    MODE_TRACKER,   // 32-step quantized recorder: left 4×4 = instruments, right 4×4 = notes
     MODE_COUNT
 };
 
@@ -29,14 +33,18 @@ enum MenuItem : uint8_t {
     MENU_SAMPLE, MENU_FX, MENU_LIGHT,
     MENU_SEQ, MENU_LIGHTPLAY, MENU_SD,
     MENU_ABOUT, MENU_HYBRID, MENU_MODULAR,
-    MENU_SYNTH2, MENU_MOD2, MENU_303, MENU_ITEM_COUNT
+    MENU_SYNTH2, MENU_MOD2, MENU_303,
+    MENU_GRANULAR, MENU_GRANULAR2, MENU_MIDI,
+    MENU_TRACKER, MENU_ITEM_COUNT
 };
 static const char* menuLabels[] = {
     "SYNTH","OMNI","DRUMS",
     "SAMPL","FX","LIGHT",
     "SEQ","LPLY","SD",
     "BATT","HYBRD","MODUL",
-    "SYN2","MOD2","303"
+    "SYN2","MOD2","303",
+    "GRAN","GR2","MIDI",
+    "TRKR"
 };
 #define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
 
@@ -48,7 +56,6 @@ enum SynthShape : uint8_t {
     SHAPE_JUNO_ORGAN, SHAPE_JUNO_CHOIR,
     SHAPE_DX7_EP, SHAPE_DX7_BELLS, SHAPE_DX7_BASS,
     SHAPE_DX7_BRASS, SHAPE_DX7_STRINGS, SHAPE_DX7_ORGAN, SHAPE_DX7_VOICE,
-    SHAPE_PIANO,
     SHAPE_TECHNO_LEAD,   // detuned supersaw + filter envelope sweep
     SHAPE_RAVE_BASS,     // deep sub + filter pump
     SHAPE_HOOVER,        // classic rave hoover (detuned + pitch/filter rise)
@@ -69,7 +76,6 @@ static const char* shapeNames[] = {
     "SAW","SAWFM","SQR","SIN","SSAW","ACID","BASS","PLCK",
     "J:BRS","J:STR","J:PNO","J:ORG","J:CHR",
     "D:EP","D:BEL","D:BAS","D:BRS","D:STR","D:ORG","D:VOC",
-    "PIANO",
     "T:LED","T:BAS","HOVR","STAB",
     "WOBB","EPLK","INDS",
     "J:OR2","J:FRG","FMDFT","FMBEL","SDFT"
@@ -80,7 +86,6 @@ static const int16_t shapePatch[] = {
     -1,-2,-1,-1,-1,-1,-1,-1,   // custom waves (SAW, SAW_FM, SQR, SIN, SSAW, ACID, BASS, PLCK)
     0,21,7,8,6,                 // Juno patches
     138,153,142,128,131,144,157,// DX7 patches (128+offset)
-    256,                        // Piano
     -1,-1,-1,-1,                // Techno: TECHNO_LEAD, RAVE_BASS, HOOVER, TECHNO_STAB
     -1,-1,-1,                   // Acid/industrial: ACID_WOBBLE, ELECTRO_PLUCK, INDUSTRIAL
     9,42,                       // Juno evolution presets: Organ II (ratio 1.932), Frontier (ratio 5.263)
@@ -141,6 +146,52 @@ static const char* fxNames[] = {"LPF","DRIVE","DELAY","REVERB"};
 #define SAMPLE_PRESET_BASE  200  // AMY presets 200-231 for key-assigned samples
 #define SAMPLE_OSC_BASE     110  // AMY oscillators 110-141 for key sample playback
 #define SAMPLE_KEY_COUNT     32  // 4×8 keys, each can hold one RAM-loaded sample
+
+// ==================== GRANULAR ====================
+// Row layout (8-slice mode): R0=one-shot px, R1=px+px+1, R2=sx→end, R3=px reversed
+// GRANULAR_SOURCE_PRESET: raw decoded sample (waveform display)
+// GRANULAR_PRESET_BASE  : one-shot forward slices 233-248 (16 slots: mode0→8, mode1→16)
+// GRANULAR_REV_PRESET   : reverse slices 249-256 (8 slots, mode0 row3)
+// GRANULAR_DBL_PRESET   : double slices 257-264 (px+px+1, mode0 row1)
+// GRANULAR_TAIL_PRESET  : tail slices 265-272 (sx→end, mode0 row2)
+// OSCs 150-181 (32 total, one per key) play granular slices independently.
+// Base moved from 142 to 150: SYNTH_CH with 8 voices × 6 oscs (Juno/DX7 patches) occupies
+// even voices 125-148, which was corrupting oscs 142-148 as SYNTH_IS_MOD_SOURCE.
+#define GRANULAR_SOURCE_PRESET  232
+#define GRANULAR_PRESET_BASE    233  // forward slices 233-248 (16 slots)
+#define GRANULAR_REV_PRESET     249  // reverse slices 249-256 (8 slots)
+#define GRANULAR_DBL_PRESET     257  // double slices 257-264 (8 slots)
+#define GRANULAR_TAIL_PRESET    265  // tail slices 265-272 (8 slots)
+#define GRANULAR_OSC_BASE       150  // oscs 150-181 (was 142; moved above SYNTH_CH range 125-148)
+#define GRANULAR_MAX_SLICES      16
+
+// ==================== GRANULAR2 ====================
+// Multi-sample granular: forward + reverse only, 4 or 8 slices, 4 or 2 samples.
+// sliceMode 0 = x4 (4 samples in 4 quadrants); sliceMode 1 = x8 (2 samples, top/bottom half).
+// Layout sliceMode 1 (x8, 2 samples):
+//   row 0: sample 0 fwd  |  row 1: sample 0 rev
+//   row 2: sample 1 fwd  |  row 3: sample 1 rev
+// Layout sliceMode 0 (x4, 4 samples):
+//   row 0-1 left (cols 0-3): sample 0 fwd/rev
+//   row 0-1 right (cols 4-7): sample 1 fwd/rev
+//   row 2-3 left (cols 0-3): sample 2 fwd/rev
+//   row 2-3 right (cols 4-7): sample 3 fwd/rev
+#define GRAN2_MAX_SAMPLES    4
+#define GRAN2_MAX_SLICES     8
+#define GRAN2_SOURCE_BASE  273   // AMY presets 273-276 (4 source buffers, 16-bit PSRAM)
+#define GRAN2_FWD_BASE     277   // AMY presets 277-308 (4 samples × 8 slices, fwd)
+#define GRAN2_REV_BASE     309   // AMY presets 309-340 (4 samples × 8 slices, rev)
+#define GRAN2_TAIL_BASE    341   // AMY presets 341-344 (1 per sample): full-reversed buffer for FUL-reverse mode
+// OSCs: reuse GRANULAR_OSC_BASE (150-181), modes are mutually exclusive
+
+// ==================== TRACKER ====================
+#define TRACKER_STEPS    32   // 32 × 16th note steps (2 bars at 4/4)
+#define TRACKER_TRACKS   16   // 7 synth + 1 drum + 8 sample
+#define TRACKER_SYNTHS    7
+#define TRACKER_DRUM_TRK  7   // track index for drums
+#define TRACKER_SAMP_BASE 8   // sample tracks 8-15
+#define TRK_CHORD_SIZE    3   // max simultaneous notes per step (tonic+third+fifth)
+#define TRACKER_SYNTH_CH_BASE 3  // AMY synth channels 3-9, one per tracker synth track
 
 // ==================== BUTTON LABELS ====================
 // SEQ key base: use the last 8 slots of the SAMPLE key space (keyIdx 24-31) for 8 sequencer tracks

@@ -13,11 +13,16 @@ void audioNoteOff(uint8_t note);
 void audioSetEnvelope(const EnvParams &env);
 void audioSetPitchBend(float ratio);
 void audioSetShape(SynthShape shape);
+void audioSetShapeOnSynth(SynthShape shape, uint8_t synthCh);  // like audioSetShape but on a specific AMY synth channel
+void audioTrackerInit();           // initialize one AMY synth channel per tracker synth track
+void audioTrackerNoteOn(uint8_t trackIdx, uint8_t midiNote, float vel);
+void audioTrackerNoteOff(uint8_t trackIdx, uint8_t midiNote);
 void audioRestoreShapeFilter(SynthShape shape); // restore native filter after FX filter off
 void audioSetVolume(float vol);
 void audioSetFilter(float cutoffHz, float resonance);
 void audioSetAllFilters(float cutoffHz, float resonance); // LPF on synth + all sample/seq oscs (0=open)
 void audioSetFilterFreq(float cutoffHz, float resonance); // update cutoff/reso only — no filter_type (no state reset)
+void audioSetGranular2FilterFreq(float cutoffHz, float resonance); // smooth update for currently-playing GR2 oscillators
 void audioSetPCMFilter(float cutoffHz, float resonance);  // future PCM triggers only (0=off)
 void audioSetFmParams(float depth, float cutoffHz, float resonance);
 void audioStopAllSamples();  // velocity=0 on all PCM oscillators (call when leaving sample/seq mode)
@@ -72,6 +77,48 @@ void flashCacheInit();   // called by audioInit — maps pcmcache partition
 void flashCacheClear();  // wipe all cached entries (use when sample files change)
 
 extern bool audioReady;
+
+// ==================== GRANULAR SLICER ====================
+// Flow: audioLoadGranularSource → poll audioIsGranularReady → audioComputeGranularSlices
+//       → audioPlayGranularSlice / audioStopGranularOsc → audioUnloadGranular on exit.
+//
+// Forward slices use pcm_register_extern16 (no copy, points into source buffer).
+// Reverse slices are independently allocated (inverted copy).
+// All slices are unloaded before source is freed to avoid use-after-free in the audio thread.
+void audioLoadGranularSource(const char* path);   // load file into GRANULAR_SOURCE_PRESET
+bool audioIsGranularReady();                       // true once source is loaded and slices computed
+// Set the sample window [0.0-1.0] used by the next audioComputeGranularSlices call.
+// waveform128 always shows the full sample; slices are computed within [startFrac,endFrac].
+void audioSetGranularWindow(float startFrac, float endFrac);
+// Compute slices from the loaded source. mode=0: 8-slice, mode=1: 1/16 energy-ranked.
+// Fills waveform[128] with normalised amplitude (0-255) of FULL source for display.
+// Returns actual slice count (8 or 16) or 0 on failure.
+uint8_t audioComputeGranularSlices(uint8_t mode, uint8_t* waveform128);
+// Re-register all granular presets from (N+1) split points [0.0..1.0] within the window.
+// splits[0]=0.0 and splits[N]=1.0 by convention. Call after audioComputeGranularSlices.
+// Updates GRANULAR_PRESET_BASE (one-shot), GRANULAR_DBL_PRESET (double), GRANULAR_TAIL_PRESET (tail), GRANULAR_REV_PRESET (reverse).
+void audioApplyGranularSplits(float* splits, int N);
+void audioPlayGranularSlice(uint8_t keyOscIdx, uint16_t slicePreset, float vel, bool loop);
+void audioStopGranularOsc(uint8_t keyOscIdx);
+void audioUnloadGranular();  // stop all OSCs, wait for audio thread, free all granular presets
+
+// ==================== GRANULAR2 (multi-sample) ====================
+// Fixed x4 layout: 4 samples (TL=S0, TR=S1, BL=S2, BR=S3), 4 slices each, fwd+rev rows.
+// playMode: 0=NRM one-shot slice, 1=LOP loop-slice while held, 2=FUL loop full sample while held.
+// FUL mode: audioPlayGranular2Ful re-registers GRAN2_TAIL_BASE+sampleIdx at key press as a
+// pointer into the existing buffer starting at the slice position (no PSRAM copy), then loops
+// [slice→end] while held.  Splits update FWD and REV presets live.
+void audioLoadGranular2Source(const char* path, uint8_t sampleIdx);
+bool audioIsGranular2Ready(uint8_t sampleIdx);
+uint8_t audioComputeGranular2Slices(uint8_t sampleIdx, uint8_t nSlices, uint8_t* waveform128);
+void audioApplyGranular2Splits(uint8_t sampleIdx, float* splits, int N, bool lopMode = false);
+void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, bool reverse, float vel, uint8_t playMode = 0, uint16_t attackMs = 5);
+// FUL mode: startFrac = splits[sliceIdx] (fwd) or 1-splits[sliceIdx+1] (rev)
+void audioPlayGranular2Ful(uint8_t oscIdx, uint8_t sampleIdx, bool reverse, float vel, float startFrac);
+void audioStopGranular2(uint8_t oscIdx);
+bool audioGranular2HasReverse(uint8_t sampleIdx);  // false if PSRAM exhausted during load
+void audioUnloadGranular2Slot(uint8_t sampleIdx);  // free one slot's presets and PSRAM
+void audioUnloadGranular2();
 
 // ==================== TB-303 ENGINE (T303_CH) ====================
 // Monophonic synth: SAW/SQR + resonant LPF + filter envelope (EG1) + amp envelope (EG0)

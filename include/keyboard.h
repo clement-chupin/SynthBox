@@ -24,3 +24,9 @@ void pollKeyboard();
 void recoverKeyboard();  // soft re-init after FIFO overflow or I2C lockup
 bool getNextKeyEvent(uint8_t &row, uint8_t &col, bool &pressed);
 uint8_t readTcaGpios();
+void kbdGetStats(uint32_t& pollCount, uint32_t& maxIntervalMs);
+
+// Called from kbdPollTask immediately after a note-row event is detected.
+// Bypasses the main-loop queue to eliminate the 200ms fill-buffer starvation delay.
+typedef void (*NoteKeyCallback)(uint8_t row, uint8_t col, bool pressed);
+void setNoteKeyCallback(NoteKeyCallback cb);

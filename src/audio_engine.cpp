@@ -50,6 +50,10 @@ extern "C" void pcm_unload_preset(uint16_t preset_number);
 extern "C" void pcm_register_extern8(uint16_t preset_number, const int8_t* data,
                                       uint32_t length, uint32_t samplerate,
                                       uint8_t midinote, uint32_t loopstart, uint32_t loopend);
+extern "C" void pcm_register_extern16(uint16_t preset_number, const int16_t* data,
+                                       uint32_t length, uint32_t samplerate,
+                                       uint8_t midinote, uint32_t loopstart, uint32_t loopend);
+extern "C" const int16_t* pcm_get_sample_ram_for_preset(uint16_t preset_number, uint32_t* length);
 
 // ---- Non-blocking sample loader: persistent service task + FreeRTOS queue ----
 // osc: which AMY oscillator to stop before loading and play on after (if vel>0).
@@ -68,6 +72,15 @@ static uint8_t           s_loadError                      = KEY_ERR_NONE; // set
 static float s_sampleVolume  = 1.0f;  // 0.0–2.0; applied to vel on sample playback
 static float s_pcmLPFCutoff  = 0.0f;  // 0 = no filter applied to PCM oscillators
 static float s_pcmLPFReso    = 1.5f;
+static volatile bool s_granularLoaded = false;  // set when GRANULAR_SOURCE_PRESET load completes
+static uint8_t s_granLastSliceCount = 0;  // stored by audioComputeGranularSlices
+
+// Granular2 per-sample state
+static volatile bool s_gran2Loaded[GRAN2_MAX_SAMPLES]   = {};
+static int16_t*      s_gran2FullRevBuf[GRAN2_MAX_SAMPLES] = {};  // full reversed copy, sliced into rev presets
+static uint32_t      s_gran2FullRevLen[GRAN2_MAX_SAMPLES] = {};
+static uint32_t      s_gran2ActiveOscMask = 0;  // bitmask: bit i set → oscIdx i is playing
+// GRAN2_TAIL_BASE+si: full reversed buffer preset for FUL reverse mode (registered at compute time).
 void bgServiceTask(void* param);  // forward declaration
 
 // ==================== INIT ====================
@@ -203,6 +216,21 @@ void audioSetAllFilters(float cutoffHz, float resonance) {
     amy_add_event(&e);
     s_pcmLPFCutoff = bypass ? 0.0f : cutoffHz;
     s_pcmLPFReso   = bypass ? 1.5f : resonance;
+    // GR2 oscillators are individually controlled (not part of SYNTH_CH); apply filter to any active ones.
+    if (s_gran2ActiveOscMask) {
+        amy_event ge = amy_default_event();
+        ge.filter_type = bypass ? FILTER_NONE : FILTER_LPF24;
+        ge.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
+        if (!bypass) { ge.filter_freq_coefs[COEF_EG0] = 0.0f; ge.filter_freq_coefs[COEF_EG1] = 0.0f; }
+        ge.resonance = bypass ? 1.0f : resonance;
+        uint32_t mask = s_gran2ActiveOscMask;
+        while (mask) {
+            int idx = __builtin_ctz(mask);
+            ge.osc = (uint16_t)(GRANULAR_OSC_BASE + idx);
+            amy_add_event(&ge);
+            mask &= mask - 1;
+        }
+    }
 }
 
 // Update only the cutoff/resonance of an already-active LPF — does NOT send filter_type.
@@ -219,6 +247,21 @@ void audioSetFilterFreq(float cutoffHz, float resonance) {
     s_pcmLPFReso   = resonance;
 }
 
+// Smooth-update filter coefficients on all currently-playing GR2 oscillators (no filter_type → no biquad reset).
+void audioSetGranular2FilterFreq(float cutoffHz, float resonance) {
+    if (!audioReady || !s_gran2ActiveOscMask) return;
+    amy_event e = amy_default_event();
+    e.filter_freq_coefs[COEF_CONST] = cutoffHz;
+    e.resonance = resonance;
+    uint32_t mask = s_gran2ActiveOscMask;
+    while (mask) {
+        int idx = __builtin_ctz(mask);
+        e.osc = (uint16_t)(GRANULAR_OSC_BASE + idx);
+        amy_add_event(&e);
+        mask &= mask - 1;
+    }
+}
+
 void audioSetEnvelope(const EnvParams &env) {
     if (!audioReady) return;
     amy_event e = amy_default_event();
@@ -230,7 +273,7 @@ void audioSetEnvelope(const EnvParams &env) {
 }
 
 // Per-shape filter state — used to restore native filter after FX LPF/Overdrive turns off.
-// Indexed by SynthShape. Patches (Juno/DX7/Piano) restore to FILTER_NONE (patch self-manages).
+// Indexed by SynthShape. Patches (Juno/DX7) restore to FILTER_NONE (patch self-manages).
 // Must stay in sync with SynthShape enum order in config.h.
 struct ShapeFilterSave { uint8_t ft; float cc, ce0, ce1, res; };
 static const ShapeFilterSave kShapeFilter[] = {
@@ -255,7 +298,6 @@ static const ShapeFilterSave kShapeFilter[] = {
     { FILTER_NONE,  18000,    0,      0,      1    }, // DX7_STRINGS
     { FILTER_NONE,  18000,    0,      0,      1    }, // DX7_ORGAN
     { FILTER_NONE,  18000,    0,      0,      1    }, // DX7_VOICE
-    { FILTER_NONE,  18000,    0,      0,      1    }, // PIANO
     { FILTER_LPF,   200,      0,      3200,   4    }, // TECHNO_LEAD
     { FILTER_LPF,   80,       1400,   0,      2    }, // RAVE_BASS  (EG0!)
     { FILTER_LPF,   400,      0,      2400,   6    }, // HOOVER
@@ -294,11 +336,11 @@ void audioSetPitchBend(float ratio) {
     amy_add_event(&e);
 }
 
-void audioSetShape(SynthShape shape) {
+void audioSetShapeOnSynth(SynthShape shape, uint8_t synthCh) {
     if (!audioReady) return;
     int16_t patch = shapePatch[shape];
     amy_event e = amy_default_event();
-    e.synth = SYNTH_CH;
+    e.synth = synthCh;
 
     if (patch >= 0) {
         // AMY preset patch (Juno / DX7 / Piano)
@@ -522,11 +564,48 @@ void audioSetShape(SynthShape shape) {
         }
     }
     amy_add_event(&e);
-    // Shape events with num_voices/oscs_per_voice trigger patches_load_patch → reset_osc()
-    // which sets filter_type = FILTER_NONE on all oscillators, silently killing any active FX LPF.
-    // Re-assert the LPF immediately after — AMY processes this event right after the shape reset.
-    if (s_pcmLPFCutoff > 10.0f)
+    // Shape events on SYNTH_CH trigger patches_load_patch → reset_osc() which silently clears any active
+    // LPF set by the FX system. Re-assert immediately. Tracker channels are independent — don't touch them.
+    if (synthCh == SYNTH_CH && s_pcmLPFCutoff > 10.0f)
         audioSetAllFilters(s_pcmLPFCutoff, s_pcmLPFReso);
+}
+
+void audioSetShape(SynthShape shape) { audioSetShapeOnSynth(shape, SYNTH_CH); }
+
+void audioTrackerInit() {
+    if (!audioReady) return;
+    // One AMY synth channel per tracker synth track (channels TRACKER_SYNTH_CH_BASE…+TRACKER_SYNTHS-1).
+    // Each channel gets TRK_CHORD_SIZE voices with 1 oscillator each — enough for full chord playback
+    // while staying isolated from SYNTH_CH (no shape bleed between tracks).
+    for (int t = 0; t < TRACKER_SYNTHS; t++) {
+        amy_event e = amy_default_event();
+        e.synth       = (uint8_t)(TRACKER_SYNTH_CH_BASE + t);
+        e.num_voices  = TRK_CHORD_SIZE;
+        e.oscs_per_voice = 1;
+        e.wave        = SAW_DOWN;
+        e.filter_type = FILTER_NONE;
+        amy_add_event(&e);
+    }
+}
+
+// Silence one specific tracker synth track note (called from main.cpp with the actual playing note).
+void audioTrackerNoteOff(uint8_t trackIdx, uint8_t midiNote) {
+    if (!audioReady || trackIdx >= TRACKER_SYNTHS) return;
+    amy_event e = amy_default_event();
+    e.synth     = (uint8_t)(TRACKER_SYNTH_CH_BASE + trackIdx);
+    e.midi_note = midiNote;
+    e.velocity  = 0;
+    amy_add_event(&e);
+}
+
+// Play one note on a tracker synth track channel (shape already initialized on the channel).
+void audioTrackerNoteOn(uint8_t trackIdx, uint8_t midiNote, float vel) {
+    if (!audioReady || trackIdx >= TRACKER_SYNTHS) return;
+    amy_event e = amy_default_event();
+    e.synth     = (uint8_t)(TRACKER_SYNTH_CH_BASE + trackIdx);
+    e.midi_note = midiNote;
+    e.velocity  = vel;
+    amy_add_event(&e);
 }
 
 // FM-specific real-time param control for SHAPE_SAW_FM.
@@ -1070,7 +1149,7 @@ static bool svcTryCache(const char* path, uint16_t preset, uint8_t osc, float ve
               && (memcmp(h.magic, "GPC4", 4) == 0)
               && (h.srcSize == srcSize)
               && (h.frameCount > 0)
-              && (h.pcmSampleRate > 0)
+              && (h.pcmSampleRate == PCM_TARGET_RATE)  // reject stale caches with wrong rate
               && ((uint32_t)f.size() == (uint32_t)(sizeof(h) + h.frameCount * 1u));
     if (valid && h.frameCount > maxLoad) h.frameCount = maxLoad;  // stream only what fits in PSRAM
     if (!valid) { f.close(); return false; }
@@ -1100,6 +1179,77 @@ static bool svcTryCache(const char* path, uint16_t preset, uint8_t osc, float ve
 
     Serial.printf("CACHE hit: %s (%u frames @ %uHz)\n", cp, pos, h.pcmSampleRate);
     return true;
+}
+
+// ---- 16-bit SD cache (granular source only) ----
+// Same as the 8-bit SD cache but stores raw int16_t frames in a .pcm16 sidecar.
+// Required because granular slicing uses int16_t* pointer arithmetic on the PSRAM buffer;
+// the 8-bit cache (.pcm) would cause 2x speed / one-octave-up artefact.
+
+static bool svcTryCache16(const char* path, uint16_t preset, uint8_t osc, float vel,
+                            uint32_t tStop, uint32_t srcSize) {
+    char cp[264]; snprintf(cp, sizeof(cp), "%s.pcm16", path);
+    File f = SD.open(cp, FILE_READ);
+    if (!f) return false;
+
+    PcmCacheHdr h;
+    // Reserve at most half of free PSRAM (each frame = 2 bytes for int16_t).
+    uint32_t maxLoad = (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 4);
+    if (maxLoad < PCM_MIN_FRAMES) maxLoad = PCM_MIN_FRAMES;
+    bool valid = ((uint32_t)f.read((uint8_t*)&h, sizeof(h)) == sizeof(h))
+              && (memcmp(h.magic, "G16C", 4) == 0)
+              && (h.srcSize == srcSize)
+              && (h.frameCount > 0)
+              && (h.pcmSampleRate == PCM_TARGET_RATE)  // reject stale caches with wrong rate
+              && ((uint32_t)f.size() == (uint32_t)(sizeof(h) + h.frameCount * 2u));
+    if (valid && h.frameCount > maxLoad) h.frameCount = maxLoad;
+    if (!valid) { f.close(); return false; }
+
+    uint32_t el = millis() - tStop;
+    if (el < AMY_STOP_SAFETY_MS) vTaskDelay(pdMS_TO_TICKS(AMY_STOP_SAFETY_MS - el));
+
+    int16_t* amyBuf = pcm_load(preset, h.frameCount, h.pcmSampleRate / 2, 1, 69, 0, 0);
+    if (!amyBuf) {
+        Serial.printf("[GR2] pcm_load failed for preset %d (%lu frames, %lu B PSRAM free)\n",
+                      preset, (unsigned long)h.frameCount,
+                      (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        f.close(); return false;
+    }
+    memset(amyBuf, 0, h.frameCount * sizeof(int16_t));
+
+    uint32_t pos = 0; bool played = false;
+    while (pos < h.frameCount && !s_svcAbort) {
+        uint32_t batch = h.frameCount - pos;
+        if (batch > STREAM_BATCH_FRAMES) batch = STREAM_BATCH_FRAMES;
+        if ((uint32_t)f.read((uint8_t*)(amyBuf + pos), batch * sizeof(int16_t)) != batch * sizeof(int16_t)) break;
+        pos += batch;
+        if (!played && pos >= STREAM_PLAY_FRAMES) { amyPlayPcm(osc, preset, vel); played = true; }
+        vTaskDelay(1);
+    }
+    if (!played) amyPlayPcm(osc, preset, vel);
+    f.close();
+    Serial.printf("[G16] cache hit: %s (%u frames @ %uHz)\n", cp, pos, h.pcmSampleRate);
+    return true;
+}
+
+static void svcWriteCache16(const char* path, const int16_t* buf, uint32_t frames,
+                              uint32_t srcSize, uint32_t pcmSampleRate) {
+    if (!buf || frames == 0) return;
+    char cp[264]; snprintf(cp, sizeof(cp), "%s.pcm16", path);
+    File f = SD.open(cp, FILE_WRITE);
+    if (!f) { Serial.printf("[G16] write fail: %s\n", cp); return; }
+    PcmCacheHdr h; memcpy(h.magic, "G16C", 4);
+    h.frameCount = frames; h.srcSize = srcSize; h.pcmSampleRate = pcmSampleRate; h.reserved = 0;
+    f.write((uint8_t*)&h, sizeof(h));
+    const uint32_t CHUNK = 1024;  // 1024 int16_t = 2KB per write
+    for (uint32_t p = 0; p < frames && !s_svcAbort; p += CHUNK) {
+        uint32_t cnt = frames - p; if (cnt > CHUNK) cnt = CHUNK;
+        f.write((uint8_t*)(buf + p), cnt * sizeof(int16_t));
+        vTaskDelay(1);
+    }
+    f.close();
+    Serial.printf("[G16] cache saved: %s (%u frames, %lu B)\n", cp, frames,
+                  (unsigned long)(sizeof(h) + frames * 2u));
 }
 
 // Save decoded PCM frames to .pcm cache alongside the source file.
@@ -1132,8 +1282,15 @@ static bool svcLoadWav(const char* path, uint16_t preset, uint8_t osc, float vel
     // Try flash partition first (zero PSRAM), then SD cache, then full decode.
     uint32_t srcSize = 0;
     { File tmp = SD.open(path, FILE_READ); if (tmp) { srcSize = tmp.size(); tmp.close(); } }
-    if (svcTryFlash(path, srcSize, preset, osc, vel, tStop)) return !s_svcAbort;
-    if (svcTryCache(path, preset, osc, vel, tStop, srcSize)) return !s_svcAbort;
+    // Granular source presets need 16-bit PSRAM for int16_t* slice arithmetic.
+    bool isGran16 = (preset == GRANULAR_SOURCE_PRESET)
+                 || (preset >= GRAN2_SOURCE_BASE && preset < GRAN2_SOURCE_BASE + GRAN2_MAX_SAMPLES);
+    if (isGran16) {
+        if (svcTryCache16(path, preset, osc, vel, tStop, srcSize)) return !s_svcAbort;
+    } else {
+        if (svcTryFlash(path, srcSize, preset, osc, vel, tStop)) return !s_svcAbort;
+        if (svcTryCache(path, preset, osc, vel, tStop, srcSize)) return !s_svcAbort;
+    }
 
     File f = SD.open(path, FILE_READ);
     if (!f) { Serial.printf("WAV: open fail: %s\n", path); return false; }
@@ -1255,11 +1412,14 @@ static bool svcLoadWav(const char* path, uint16_t preset, uint8_t osc, float vel
     Serial.printf("WAV done: %u/%u frames\n", outPos, totalOut);
     if (osc >= SAMPLE_OSC_BASE && osc < SAMPLE_OSC_BASE + SAMPLE_KEY_COUNT && !s_svcAbort)
         s_keyLengthMs[osc - SAMPLE_OSC_BASE] = (uint32_t)((uint64_t)outPos * 1000 / PCM_TARGET_RATE);
-    // Normalize, write SD cache, then write flash cache (first load only; subsequent = flash hit).
     if (!s_svcAbort && outPos > 0) normalizeBuffer(amyBuf, outPos);
     if (!s_svcAbort && outPos > 0) applyBufferFades(amyBuf, outPos);
-    if (!s_svcAbort && outPos > 0) svcWriteCache(path, amyBuf, outPos, srcSize, PCM_TARGET_RATE);
-    if (!s_svcAbort && outPos > 0) flashCacheWrite(path, srcSize, amyBuf, outPos, PCM_TARGET_RATE);
+    if (isGran16) {
+        if (!s_svcAbort && outPos > 0) svcWriteCache16(path, amyBuf, outPos, srcSize, PCM_TARGET_RATE);
+    } else {
+        if (!s_svcAbort && outPos > 0) svcWriteCache(path, amyBuf, outPos, srcSize, PCM_TARGET_RATE);
+        if (!s_svcAbort && outPos > 0) flashCacheWrite(path, srcSize, amyBuf, outPos, PCM_TARGET_RATE);
+    }
     return !s_svcAbort;
 }
 
@@ -1272,8 +1432,14 @@ static bool svcLoadMp3(const char* path, uint16_t preset, uint8_t osc, float vel
     // Get source size then try cache — avoids the full MP3 decode on repeated loads.
     uint32_t srcSize = 0;
     { File tmp = SD.open(path, FILE_READ); if (!tmp) { Serial.printf("MP3: open fail: %s\n", path); return false; } srcSize = tmp.size(); tmp.close(); }
-    if (svcTryFlash(path, srcSize, preset, osc, vel, tStop)) return !s_svcAbort;
-    if (svcTryCache(path, preset, osc, vel, tStop, srcSize)) return !s_svcAbort;
+    bool isGran16 = (preset == GRANULAR_SOURCE_PRESET)
+                 || (preset >= GRAN2_SOURCE_BASE && preset < GRAN2_SOURCE_BASE + GRAN2_MAX_SAMPLES);
+    if (isGran16) {
+        if (svcTryCache16(path, preset, osc, vel, tStop, srcSize)) return !s_svcAbort;
+    } else {
+        if (svcTryFlash(path, srcSize, preset, osc, vel, tStop)) return !s_svcAbort;
+        if (svcTryCache(path, preset, osc, vel, tStop, srcSize)) return !s_svcAbort;
+    }
 
     File f = SD.open(path, FILE_READ);
     if (!f) { return false; }
@@ -1434,11 +1600,14 @@ static bool svcLoadMp3(const char* path, uint16_t preset, uint8_t osc, float vel
     Serial.printf("MP3 done: %u/%u frames\n", totalFrames, estimatedTotal);
     if (osc >= SAMPLE_OSC_BASE && osc < SAMPLE_OSC_BASE + SAMPLE_KEY_COUNT && !s_svcAbort)
         s_keyLengthMs[osc - SAMPLE_OSC_BASE] = (uint32_t)((uint64_t)totalFrames * 1000 / PCM_TARGET_RATE);
-    // Normalize, write SD cache, then write flash cache.
     if (!s_svcAbort && totalFrames > 0) normalizeBuffer(amyBuf, totalFrames);
     if (!s_svcAbort && totalFrames > 0) applyBufferFades(amyBuf, totalFrames);
-    if (!s_svcAbort && totalFrames > 0) svcWriteCache(path, amyBuf, totalFrames, srcSize, PCM_TARGET_RATE);
-    if (!s_svcAbort && totalFrames > 0) flashCacheWrite(path, srcSize, amyBuf, totalFrames, PCM_TARGET_RATE);
+    if (isGran16) {
+        if (!s_svcAbort && totalFrames > 0) svcWriteCache16(path, amyBuf, totalFrames, srcSize, PCM_TARGET_RATE);
+    } else {
+        if (!s_svcAbort && totalFrames > 0) svcWriteCache(path, amyBuf, totalFrames, srcSize, PCM_TARGET_RATE);
+        if (!s_svcAbort && totalFrames > 0) flashCacheWrite(path, srcSize, amyBuf, totalFrames, PCM_TARGET_RATE);
+    }
     return !s_svcAbort;
 }
 
@@ -1497,6 +1666,13 @@ void bgServiceTask(void* /*param*/) {
                 Serial.printf("[KEY %u] FAIL err=%u  (psram %ukB free)\n",
                               keyIdx, s_loadError, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);
             }
+        }
+        // Signal granular source loaded (preset match, success, not aborted).
+        if (ok && !s_svcAbort && req.preset == GRANULAR_SOURCE_PRESET)
+            s_granularLoaded = true;
+        for (uint8_t _s = 0; _s < GRAN2_MAX_SAMPLES; _s++) {
+            if (ok && !s_svcAbort && req.preset == (uint16_t)(GRAN2_SOURCE_BASE + _s))
+                s_gran2Loaded[_s] = true;
         }
         s_currentOsc = 0xFF;
         s_svcDone    = true;
@@ -1699,5 +1875,508 @@ void audioT303Wave(uint8_t amyWave) {
     e.synth = T303_CH;
     e.wave  = amyWave;
     amy_add_event(&e);
+}
+
+// ==================== GRANULAR SLICER ====================
+static volatile bool s_granularReady  = false;
+// s_granularLoaded declared near top (used by bgServiceTask)
+static float s_granWinStart = 0.0f;
+static float s_granWinEnd   = 1.0f;
+
+void audioLoadGranularSource(const char* path) {
+    s_granularReady  = false;
+    s_granularLoaded = false;
+    s_granWinStart   = 0.0f;
+    s_granWinEnd     = 1.0f;
+    // Stop all granular OSCs before freeing old slice presets.
+    for (int i = 0; i < 32; i++) {
+        amy_event e = amy_default_event();
+        e.osc = (uint16_t)(GRANULAR_OSC_BASE + i); e.velocity = 0;
+        amy_add_event(&e);
+    }
+    // Free slice presets (they point into the old source buffer via pcm_register_extern16).
+    for (int i = 0; i < GRANULAR_MAX_SLICES; i++) pcm_unload_preset(GRANULAR_PRESET_BASE + i);
+    for (int i = 0; i < 8; i++)                   pcm_unload_preset(GRANULAR_REV_PRESET  + i);
+    for (int i = 0; i < 8; i++)                   pcm_unload_preset(GRANULAR_DBL_PRESET  + i);
+    for (int i = 0; i < 8; i++)                   pcm_unload_preset(GRANULAR_TAIL_PRESET + i);
+    // Queue source load; vel=0 so bgServiceTask doesn't auto-play.
+    audioLoadAndPlay(path, GRANULAR_SOURCE_PRESET, 0.0f);
+}
+
+bool audioIsGranularReady() { return s_granularReady; }
+
+void audioSetGranularWindow(float startFrac, float endFrac) {
+    if (startFrac < 0.0f) startFrac = 0.0f;
+    if (endFrac   > 1.0f) endFrac   = 1.0f;
+    if (endFrac - startFrac < 0.05f) endFrac = startFrac + 0.05f;
+    s_granWinStart = startFrac;
+    s_granWinEnd   = endFrac;
+}
+
+uint8_t audioComputeGranularSlices(uint8_t mode, uint8_t* waveform128) {
+    uint32_t totalLen = 0;
+    const int16_t* src = pcm_get_sample_ram_for_preset(GRANULAR_SOURCE_PRESET, &totalLen);
+    if (!src || totalLen < 16) return 0;
+
+    // Waveform: always the full source (128px), so the user sees context around the window.
+    if (waveform128) {
+        uint32_t blk = totalLen / 128;
+        if (blk < 1) blk = 1;
+        for (int i = 0; i < 128; i++) {
+            uint32_t s = (uint32_t)i * blk, e2 = s + blk;
+            if (e2 > totalLen) e2 = totalLen;
+            int32_t peak = 0;
+            for (uint32_t j = s; j < e2; j++) {
+                int32_t v = src[j]; if (v < 0) v = -v;
+                if (v > peak) peak = v;
+            }
+            waveform128[i] = (uint8_t)((int32_t)peak * 255 / 32768);
+        }
+    }
+
+    // Windowed slice range.
+    uint32_t winStart = (uint32_t)(s_granWinStart * (float)totalLen);
+    uint32_t winEnd   = (uint32_t)(s_granWinEnd   * (float)totalLen);
+    if (winEnd > totalLen) winEnd = totalLen;
+    if (winEnd <= winStart + 16) winEnd = winStart + 16;
+    const int16_t* wsrc  = src + winStart;
+    uint32_t       wlen  = winEnd - winStart;
+
+    const uint32_t rate = PCM_TARGET_RATE / 2;  // AMY 2× hardware compensation
+
+    if (mode == 0) {
+        // 8-slice: R0=one-shot px, R1=double px+px+1, R2=tail sx→end, R3=px reversed
+        uint32_t s8 = wlen / 8;
+        for (int i = 0; i < 8; i++) {
+            uint32_t start = (uint32_t)i * s8;
+            uint32_t len1  = (start + s8     <= wlen) ? s8     : wlen - start;  // one-shot
+            uint32_t len2  = (start + s8 * 2 <= wlen) ? s8 * 2 : wlen - start;  // double
+            uint32_t lenT  = wlen - start;                                        // tail to end
+
+            // loopend = len-1 ensures AMY loops the full slice (loopend=0 → 1-sample loop → buzz)
+            pcm_register_extern16(GRANULAR_PRESET_BASE  + i, wsrc + start, len1, rate, 69, 0, len1 > 0 ? len1 - 1 : 0);
+            pcm_register_extern16(GRANULAR_DBL_PRESET   + i, wsrc + start, len2, rate, 69, 0, len2 > 0 ? len2 - 1 : 0);
+            pcm_register_extern16(GRANULAR_TAIL_PRESET  + i, wsrc + start, lenT, rate, 69, 0, lenT > 0 ? lenT - 1 : 0);
+            int16_t* rbuf = pcm_load(GRANULAR_REV_PRESET + i, len1, rate, 1, 69, 0, 0);
+            if (rbuf) for (uint32_t j = 0; j < len1; j++) rbuf[j] = wsrc[start + len1 - 1 - j];
+        }
+        s_granLastSliceCount = 8;
+        s_granularReady = true;
+        return 8;
+    } else {
+        // 1/16 energy-ranked within window
+        uint32_t s16 = wlen / 16;
+        float energy[16] = {};
+        for (int i = 0; i < 16; i++) {
+            uint32_t s = (uint32_t)i * s16, e2 = s + s16;
+            if (e2 > wlen) e2 = wlen;
+            double sum = 0;
+            for (uint32_t j = s; j < e2; j++) { float v = wsrc[j] / 32768.f; sum += v * v; }
+            energy[i] = (float)(sum / (e2 - s));
+        }
+        uint8_t ord[16]; for (int i = 0; i < 16; i++) ord[i] = i;
+        for (int i = 0; i < 15; i++)
+            for (int j = 0; j < 15 - i; j++)
+                if (energy[ord[j]] < energy[ord[j+1]]) { uint8_t t = ord[j]; ord[j] = ord[j+1]; ord[j+1] = t; }
+        for (int i = 0; i < 16; i++) {
+            uint32_t start = (uint32_t)ord[i] * s16;
+            uint32_t len   = (start + s16 <= wlen) ? s16 : wlen - start;
+            pcm_register_extern16(GRANULAR_PRESET_BASE + i, wsrc + start, len, rate, 69, 0, len > 0 ? len - 1 : 0);
+        }
+        s_granLastSliceCount = 16;
+        s_granularReady = true;
+        return 16;
+    }
+}
+
+void audioApplyGranularSplits(float* splits, int N) {
+    if (!splits || N < 1 || s_granLastSliceCount == 0) return;
+    uint32_t totalLen = 0;
+    const int16_t* src = pcm_get_sample_ram_for_preset(GRANULAR_SOURCE_PRESET, &totalLen);
+    if (!src || totalLen < 16) return;
+
+    uint32_t winS = (uint32_t)(s_granWinStart * (float)totalLen);
+    uint32_t winE = (uint32_t)(s_granWinEnd   * (float)totalLen);
+    if (winE > totalLen) winE = totalLen;
+    if (winE <= winS + 16) return;
+    uint32_t wlen = winE - winS;
+    const int16_t* wsrc = src + winS;
+    const uint32_t rate = PCM_TARGET_RATE / 2;
+
+    for (int i = 0; i < N; i++) {
+        float fS  = splits[i];
+        float fE  = splits[i + 1];
+        float fE2 = (i + 2 <= N) ? splits[i + 2] : 1.0f;
+
+        // splits[] is guaranteed non-decreasing by the caller, but clamp defensively.
+        // Minimum 2 frames so that loopend = len-1 >= 1 (avoids % 0 in AMY loop path).
+        uint32_t s0 = (uint32_t)(constrain(fS,  0.0f, 1.0f) * (float)wlen);
+        uint32_t e0 = (uint32_t)(constrain(fE,  0.0f, 1.0f) * (float)wlen);
+        uint32_t e1 = (uint32_t)(constrain(fE2, 0.0f, 1.0f) * (float)wlen);
+        if (s0 >= wlen) s0 = wlen - 2;
+        if (e0 < s0 + 2) e0 = s0 + 2;   // at least 2 frames so loopend >= 1
+        if (e0 > wlen)   e0 = wlen;
+        if (e1 < s0 + 2) e1 = s0 + 2;
+        if (e1 > wlen)   e1 = wlen;
+
+        uint32_t len0 = e0 - s0;    // one-shot px
+        uint32_t len1 = e1 - s0;    // double px+px+1
+        uint32_t lenT = wlen - s0;  // tail sx→end
+
+        // Only pcm_register_extern16 here — safe to call from main loop concurrently with audio
+        // thread because it only updates a pointer (no memory allocation/deallocation).
+        // Reverse presets (pcm_load = PSRAM alloc) are NOT updated here to avoid use-after-free
+        // crash: audio thread may be reading the old buffer while main loop frees it.
+        pcm_register_extern16(GRANULAR_PRESET_BASE + i, wsrc + s0, len0, rate, 69, 0, len0 - 1);
+        pcm_register_extern16(GRANULAR_DBL_PRESET  + i, wsrc + s0, len1, rate, 69, 0, len1 - 1);
+        pcm_register_extern16(GRANULAR_TAIL_PRESET + i, wsrc + s0, lenT, rate, 69, 0, lenT - 1);
+        // Note: GRANULAR_REV_PRESET stays at initial boundaries from audioComputeGranularSlices.
+    }
+}
+
+void audioPlayGranularSlice(uint8_t keyOscIdx, uint16_t slicePreset, float vel, bool loop) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.osc       = (uint16_t)(GRANULAR_OSC_BASE + keyOscIdx);
+    e.wave      = PCM;
+    e.preset    = slicePreset;
+    e.midi_note = 69;
+    e.velocity  = vel;
+    e.feedback  = loop ? 1.0f : 0.0f;
+    // EG0: 5ms attack (anti-click ramp-in), sustain at 1.0, 10ms release (anti-click ramp-out).
+    // amp_coefs left at AMY defaults (CONST=1, VEL=1, EG0=1) — setting COEF_CONST=0 maps to
+    // map_60dB(0)=-10 which pushes amp to ~0 regardless of EG0 level (complete silence).
+    e.eg0_times[0] = 5;    e.eg0_values[0] = 1.0f;
+    e.eg0_times[1] = 1;    e.eg0_values[1] = 1.0f;
+    e.eg0_times[2] = 10;   e.eg0_values[2] = 0.0f;
+    amy_add_event(&e);
+}
+
+void audioStopGranularOsc(uint8_t keyOscIdx) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.osc = (uint16_t)(GRANULAR_OSC_BASE + keyOscIdx); e.velocity = 0;
+    amy_add_event(&e);
+}
+
+void audioUnloadGranular() {
+    // 1. Silence all granular OSCs.
+    for (int i = 0; i < 32; i++) {
+        amy_event e = amy_default_event();
+        e.osc = (uint16_t)(GRANULAR_OSC_BASE + i); e.velocity = 0;
+        amy_add_event(&e);
+    }
+    // 2. Let the audio thread finish the current render block before freeing.
+    vTaskDelay(pdMS_TO_TICKS(20));
+    // 3. Free slice presets first (they alias into source buffer via pcm_register_extern16).
+    for (int i = 0; i < GRANULAR_MAX_SLICES; i++) pcm_unload_preset(GRANULAR_PRESET_BASE + i);
+    for (int i = 0; i < 8; i++)                   pcm_unload_preset(GRANULAR_REV_PRESET  + i);
+    for (int i = 0; i < 8; i++)                   pcm_unload_preset(GRANULAR_DBL_PRESET  + i);
+    for (int i = 0; i < 8; i++)                   pcm_unload_preset(GRANULAR_TAIL_PRESET + i);
+    // 4. Now safe to free the source buffer.
+    pcm_unload_preset(GRANULAR_SOURCE_PRESET);
+    s_granularReady  = false;
+    s_granularLoaded = false;
+}
+
+// ==================== GRANULAR2 ====================
+
+void audioLoadGranular2Source(const char* path, uint8_t sampleIdx) {
+    if (!audioReady || !s_loadQueue || sampleIdx >= GRAN2_MAX_SAMPLES) return;
+    s_gran2Loaded[sampleIdx] = false;
+    LoadReq req;
+    strncpy(req.path, path, sizeof(req.path) - 1);
+    req.path[sizeof(req.path) - 1] = '\0';
+    req.preset = (uint16_t)(GRAN2_SOURCE_BASE + sampleIdx);
+    req.osc    = PCM_PREVIEW_OSC;
+    req.vel    = 0.0f;
+    xQueueSendToBack(s_loadQueue, &req, 0);  // queue without aborting other loads
+}
+
+bool audioIsGranular2Ready(uint8_t sampleIdx) {
+    return (sampleIdx < GRAN2_MAX_SAMPLES) && s_gran2Loaded[sampleIdx];
+}
+
+uint8_t audioComputeGranular2Slices(uint8_t sampleIdx, uint8_t nSlices, uint8_t* waveform128) {
+    if (sampleIdx >= GRAN2_MAX_SAMPLES || !s_gran2Loaded[sampleIdx]) return 0;
+    if (nSlices != 4 && nSlices != 8) nSlices = 8;
+    Serial.printf("[GR2 COMPUTE] s%d nSlices=%d sram_free=%lu psram_free=%lu\n",
+                  sampleIdx, nSlices,
+                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    uint32_t totalLen = 0;
+    const int16_t* src = pcm_get_sample_ram_for_preset(GRAN2_SOURCE_BASE + sampleIdx, &totalLen);
+    if (!src || totalLen < 16) return 0;
+
+    // Waveform: full sample for display context.
+    if (waveform128) {
+        uint32_t blk = totalLen / 128; if (blk < 1) blk = 1;
+        for (int i = 0; i < 128; i++) {
+            uint32_t s0 = (uint32_t)i * blk, e0 = s0 + blk;
+            if (e0 > totalLen) e0 = totalLen;
+            int32_t peak = 0;
+            for (uint32_t j = s0; j < e0; j++) { int32_t v = src[j]; if (v < 0) v = -v; if (v > peak) peak = v; }
+            waveform128[i] = (uint8_t)((int32_t)peak * 255 / 32768);
+        }
+    }
+
+    uint32_t wlen = totalLen;
+    const int16_t* wsrc = src;
+    const uint32_t rate = PCM_TARGET_RATE / 2;
+
+    // Allocate one full reversed copy so split changes can update rev presets live.
+    if (s_gran2FullRevBuf[sampleIdx]) { free(s_gran2FullRevBuf[sampleIdx]); s_gran2FullRevBuf[sampleIdx] = nullptr; s_gran2FullRevLen[sampleIdx] = 0; }
+    int16_t* fullRev = (int16_t*)ps_malloc(wlen * sizeof(int16_t));
+    if (!fullRev) {
+        // PSRAM exhausted: evict the most-recently-computed other sample's revBuf first
+        // (highest index), so that older samples (lower index) keep their reverse buffers.
+        for (int v = (int)GRAN2_MAX_SAMPLES - 1; v >= 0 && !fullRev; v--) {
+            if (v == (int)sampleIdx || !s_gran2FullRevBuf[v]) continue;
+            Serial.printf("[GR2] evicting rev buf s%d (%lu B) for s%d\n",
+                          v, (unsigned long)(s_gran2FullRevLen[v] * sizeof(int16_t)), sampleIdx);
+            for (uint8_t i = 0; i < GRAN2_MAX_SLICES; i++)
+                pcm_unload_preset(GRAN2_REV_BASE + v * GRAN2_MAX_SLICES + i);
+            pcm_unload_preset(GRAN2_TAIL_BASE + v);
+            free(s_gran2FullRevBuf[v]);
+            s_gran2FullRevBuf[v] = nullptr;
+            s_gran2FullRevLen[v] = 0;
+            fullRev = (int16_t*)ps_malloc(wlen * sizeof(int16_t));
+        }
+    }
+    if (fullRev) {
+        for (uint32_t j = 0; j < wlen; j++) fullRev[j] = wsrc[wlen - 1 - j];
+        s_gran2FullRevBuf[sampleIdx] = fullRev;
+        s_gran2FullRevLen[sampleIdx] = wlen;
+        // Register as GRAN2_TAIL_BASE preset so FUL reverse can use trigger_phase without a copy.
+        pcm_register_extern16((uint16_t)(GRAN2_TAIL_BASE + sampleIdx), fullRev, wlen, rate, 69, 0, (int32_t)(wlen - 1));
+    } else {
+        Serial.printf("[GR2] PSRAM full: full rev buf s%d (%lu B needed, %lu B free)\n",
+                      sampleIdx, (unsigned long)(wlen * sizeof(int16_t)),
+                      (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    }
+
+    uint32_t sliceLen = wlen / nSlices;
+    if (sliceLen < 2) sliceLen = 2;
+
+    for (uint8_t i = 0; i < nSlices; i++) {
+        uint32_t s0 = (uint32_t)i * sliceLen;
+        uint32_t e0 = (i + 1 < nSlices) ? s0 + sliceLen : wlen;
+        if (e0 > wlen) e0 = wlen;
+        uint32_t len = e0 - s0; if (len < 2) len = 2;
+
+        // FWD slice: [s0, e0) in source buffer
+        uint16_t fwdPreset = (uint16_t)(GRAN2_FWD_BASE + sampleIdx * GRAN2_MAX_SLICES + i);
+        pcm_register_extern16(fwdPreset, wsrc + s0, len, rate, 69, 0, len - 1);
+        // Verify registration immediately so we know if the preset landed in the LL
+        {
+            uint32_t chkLen = 0;
+            const int16_t* chkPtr = pcm_get_sample_ram_for_preset(fwdPreset, &chkLen);
+            Serial.printf("[GR2 COMPUTE] s%d sl%d fwd p%u ptr=%p len=%lu -> chk ptr=%p len=%lu\n",
+                          sampleIdx, i, fwdPreset, (void*)(wsrc + s0), (unsigned long)len,
+                          (void*)chkPtr, (unsigned long)chkLen);
+        }
+
+        // REV slice: corresponding region in full reversed buffer. wsrc[s0..e0) → fullRev[wlen-e0..wlen-s0)
+        if (fullRev) {
+            uint32_t revStart = wlen - e0;
+            uint16_t revPreset = (uint16_t)(GRAN2_REV_BASE + sampleIdx * GRAN2_MAX_SLICES + i);
+            pcm_register_extern16(revPreset, fullRev + revStart, len, rate, 69, 0, len - 1);
+            uint32_t chkLen = 0;
+            const int16_t* chkPtr = pcm_get_sample_ram_for_preset(revPreset, &chkLen);
+            Serial.printf("[GR2 COMPUTE] s%d sl%d rev p%u ptr=%p len=%lu -> chk ptr=%p len=%lu\n",
+                          sampleIdx, i, revPreset, (void*)(fullRev + revStart), (unsigned long)len,
+                          (void*)chkPtr, (unsigned long)chkLen);
+        }
+
+    }
+
+    return nSlices;
+}
+
+void audioApplyGranular2Splits(uint8_t sampleIdx, float* splits, int N, bool lopMode) {
+    if (!splits || N < 1 || sampleIdx >= GRAN2_MAX_SAMPLES || !s_gran2Loaded[sampleIdx]) return;
+    uint32_t totalLen = 0;
+    const int16_t* src = pcm_get_sample_ram_for_preset(GRAN2_SOURCE_BASE + sampleIdx, &totalLen);
+    if (!src || totalLen < 16) return;
+
+    const uint32_t wlen = totalLen;
+    const int16_t* wsrc = src;
+    const uint32_t rate = PCM_TARGET_RATE / 2;
+
+    int16_t* fullRev = s_gran2FullRevBuf[sampleIdx];
+
+    for (int i = 0; i < N; i++) {
+        uint32_t s0 = (uint32_t)(constrain(splits[i],   0.0f, 1.0f) * (float)wlen);
+        uint32_t e0 = (uint32_t)(constrain(splits[i+1], 0.0f, 1.0f) * (float)wlen);
+        if (s0 >= wlen) s0 = wlen - 2;
+        if (e0 < s0 + 2) e0 = s0 + 2;
+        if (e0 > wlen)   e0 = wlen;
+        uint32_t len = e0 - s0;
+
+        // LOP only: extend sample_length past loopend so a loop active when splits shrink doesn't
+        // see base_index >= sample_length and fire a spurious SYNTH_OFF.
+        // NRM uses exact slice length — the one-shot ends naturally at loopend (= len-1).
+        uint32_t fwdSampleLen = lopMode ? (wlen - s0) : len;
+        pcm_register_extern16(GRAN2_FWD_BASE + sampleIdx * GRAN2_MAX_SLICES + i, wsrc + s0, fwdSampleLen, rate, 69, 0, (int32_t)(len - 1));
+
+        // REV slice: tracks the same portion as fwd using the pre-allocated full reversed buffer
+        if (fullRev && s_gran2FullRevLen[sampleIdx] == wlen) {
+            uint32_t revStart = wlen - e0;
+            uint32_t revSampleLen = lopMode ? (wlen - revStart) : len;
+            pcm_register_extern16(GRAN2_REV_BASE + sampleIdx * GRAN2_MAX_SLICES + i, fullRev + revStart, revSampleLen, rate, 69, 0, (int32_t)(len - 1));
+        }
+
+    }
+}
+
+void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, bool reverse, float vel, uint8_t playMode, uint16_t attackMs) {
+    if (!audioReady || sampleIdx >= GRAN2_MAX_SAMPLES) return;
+    if (reverse && !s_gran2FullRevBuf[sampleIdx]) return;
+
+    uint16_t preset;
+    bool loop;
+    if (playMode == 2) {
+        // FUL: play the entire sample so the key drains the full source.
+        // Reverse uses the pre-registered full-reversed preset (GRAN2_TAIL_BASE+sampleIdx).
+        preset = reverse ? (uint16_t)(GRAN2_TAIL_BASE + sampleIdx)
+                         : (uint16_t)(GRAN2_SOURCE_BASE + sampleIdx);
+        loop = true;
+    } else {
+        // NRM / LOP: play the slice (fwd or rev).
+        preset = reverse ? (uint16_t)(GRAN2_REV_BASE  + sampleIdx * GRAN2_MAX_SLICES + sliceIdx)
+                         : (uint16_t)(GRAN2_FWD_BASE  + sampleIdx * GRAN2_MAX_SLICES + sliceIdx);
+        loop = (playMode == 1);  // NRM=one-shot, LOP=loop
+    }
+
+    // Verify the preset is in the linked list before triggering
+    {
+        uint32_t chkLen = 0;
+        const int16_t* chkPtr = pcm_get_sample_ram_for_preset(preset, &chkLen);
+        Serial.printf("[GR2 PLAY] s%d sl%d rev=%d preset=%u -> ll_ptr=%p ll_len=%lu\n",
+                      sampleIdx, sliceIdx, (int)reverse, preset,
+                      (void*)chkPtr, (unsigned long)chkLen);
+    }
+
+    amy_event e = amy_default_event();
+    e.osc       = (uint16_t)(GRANULAR_OSC_BASE + oscIdx);
+    e.wave      = PCM;
+    e.preset    = preset;
+    e.midi_note = 69;
+    e.velocity  = vel;
+    e.feedback  = loop ? 1.0f : 0.0f;
+    e.eg0_times[0] = attackMs; e.eg0_values[0] = 1.0f;
+    // For looping, use a very long decay so the EG never completes during a held key.
+    // This prevents AMY from retriggering the EG at each PCM loop boundary (which causes blipping).
+    e.eg0_times[1] = 30000u;  // long sustain for both NRM and LOP: amplitude holds while key is held,
+                               // so the LPF is audible regardless of play mode
+    e.eg0_values[1] = 1.0f;
+    e.eg0_times[2] = 10;    e.eg0_values[2] = 0.0f;  // 10ms release on note-off
+    if (s_pcmLPFCutoff > 10.0f) {
+        e.filter_type = FILTER_LPF24;
+        e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
+        e.resonance = s_pcmLPFReso;
+    }
+    s_gran2ActiveOscMask |= (1u << oscIdx);
+    amy_add_event(&e);
+}
+
+void audioPlayGranular2Ful(uint8_t oscIdx, uint8_t sampleIdx, bool reverse, float vel, float startFrac) {
+    if (!audioReady || sampleIdx >= GRAN2_MAX_SAMPLES || !s_gran2Loaded[sampleIdx]) return;
+
+    uint32_t wlen = 0;
+    const int16_t* buf = nullptr;
+    if (reverse) {
+        if (!s_gran2FullRevBuf[sampleIdx]) return;
+        buf  = s_gran2FullRevBuf[sampleIdx];
+        wlen = s_gran2FullRevLen[sampleIdx];
+    } else {
+        buf = pcm_get_sample_ram_for_preset(GRAN2_SOURCE_BASE + sampleIdx, &wlen);
+        if (!buf || !wlen) return;
+    }
+
+    uint32_t s0 = (uint32_t)(constrain(startFrac, 0.0f, 1.0f) * (float)wlen);
+    if (s0 >= wlen) s0 = 0;
+    uint32_t tailLen = wlen - s0;
+    if (tailLen < 2) { s0 = 0; tailLen = wlen; }
+
+    // Register a tail preset pointing directly into the existing buffer at s0 (no PSRAM copy).
+    // The preset loops [s0→wlen] while held, starting naturally at position 0 of the tail
+    // (= s0 of the original) — no trigger_phase needed, no phase ordering ambiguity.
+    const uint32_t rate = PCM_TARGET_RATE / 2;
+    pcm_register_extern16((uint16_t)(GRAN2_TAIL_BASE + sampleIdx),
+                          buf + s0, tailLen, rate, 69, 0, (int32_t)(tailLen - 1));
+
+    amy_event e = amy_default_event();
+    e.osc          = (uint16_t)(GRANULAR_OSC_BASE + oscIdx);
+    e.wave         = PCM;
+    e.preset       = (uint16_t)(GRAN2_TAIL_BASE + sampleIdx);
+    e.midi_note    = 69;
+    e.velocity     = vel;
+    e.feedback     = 1.0f;
+    e.eg0_times[0] = 5;     e.eg0_values[0] = 1.0f;
+    e.eg0_times[1] = 30000; e.eg0_values[1] = 1.0f;
+    e.eg0_times[2] = 10;    e.eg0_values[2] = 0.0f;
+    if (s_pcmLPFCutoff > 10.0f) {
+        e.filter_type = FILTER_LPF24;
+        e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
+        e.resonance = s_pcmLPFReso;
+    }
+    s_gran2ActiveOscMask |= (1u << oscIdx);
+    amy_add_event(&e);
+}
+
+void audioStopGranular2(uint8_t oscIdx) {
+    if (!audioReady) return;
+    s_gran2ActiveOscMask &= ~(1u << oscIdx);
+    amy_event e = amy_default_event();
+    e.osc      = (uint16_t)(GRANULAR_OSC_BASE + oscIdx);
+    // SILENT wave produces zero audio output immediately — no waveform is rendered regardless
+    // of PCM loop state. This cuts LOP/FUL without waiting for a loop boundary check.
+    e.wave     = SILENT;
+    e.velocity = 0;
+    amy_add_event(&e);
+}
+
+bool audioGranular2HasReverse(uint8_t sampleIdx) {
+    if (sampleIdx >= GRAN2_MAX_SAMPLES) return false;
+    return s_gran2FullRevBuf[sampleIdx] != nullptr;
+}
+
+void audioUnloadGranular2Slot(uint8_t sampleIdx) {
+    if (sampleIdx >= GRAN2_MAX_SAMPLES) return;
+    for (uint8_t i = 0; i < GRAN2_MAX_SLICES; i++) {
+        pcm_unload_preset(GRAN2_FWD_BASE + sampleIdx * GRAN2_MAX_SLICES + i);
+        pcm_unload_preset(GRAN2_REV_BASE + sampleIdx * GRAN2_MAX_SLICES + i);
+    }
+    // GRAN2_TAIL_BASE+sampleIdx: full-rev preset (registered at compute time, memory owned by FullRevBuf)
+    pcm_unload_preset(GRAN2_TAIL_BASE + sampleIdx);
+    if (s_gran2FullRevBuf[sampleIdx]) {
+        free(s_gran2FullRevBuf[sampleIdx]);
+        s_gran2FullRevBuf[sampleIdx] = nullptr;
+        s_gran2FullRevLen[sampleIdx] = 0;
+    }
+    pcm_unload_preset(GRAN2_SOURCE_BASE + sampleIdx);
+    s_gran2Loaded[sampleIdx] = false;
+}
+
+void audioUnloadGranular2() {
+    s_gran2ActiveOscMask = 0;
+    for (int i = 0; i < 32; i++) {
+        amy_event e = amy_default_event();
+        e.osc = (uint16_t)(GRANULAR_OSC_BASE + i); e.velocity = 0;
+        amy_add_event(&e);
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+    for (uint8_t s = 0; s < GRAN2_MAX_SAMPLES; s++) {
+        for (uint8_t i = 0; i < GRAN2_MAX_SLICES; i++) {
+            pcm_unload_preset(GRAN2_FWD_BASE + s * GRAN2_MAX_SLICES + i);
+            pcm_unload_preset(GRAN2_REV_BASE + s * GRAN2_MAX_SLICES + i);
+        }
+        pcm_unload_preset(GRAN2_TAIL_BASE + s);  // full-rev preset, memory freed with FullRevBuf below
+        if (s_gran2FullRevBuf[s]) { free(s_gran2FullRevBuf[s]); s_gran2FullRevBuf[s] = nullptr; s_gran2FullRevLen[s] = 0; }
+        pcm_unload_preset(GRAN2_SOURCE_BASE + s);
+        s_gran2Loaded[s] = false;
+    }
 }
 

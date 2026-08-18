@@ -12,6 +12,11 @@
 #include "NoteMap.h"
 #include "config.h"
 #include "audio_engine.h"
+#if CONFIG_TINYUSB_MIDI_ENABLED
+#include "USB.h"
+#include "USBMIDI.h"
+static USBMIDI usbMIDI("GrvEP");
+#endif
 // Patch names from Diapasonix (258 Juno+DX7 presets) — wrapped to avoid ODR conflict
 namespace { // anonymous namespace: translation-unit local
 #include "../other_projects/Diapasonix/display/patch_names.h"
@@ -30,7 +35,7 @@ NoteMap noteMap;
 uint8_t activeNotes[KBD_NOTE_ROWS][KBD_COLS] = {};
 
 // Synth / Omni
-SynthShape currentShape = SHAPE_SAW;
+SynthShape currentShape = SHAPE_JUNO_PIANO;
 EnvPreset  currentEnv   = ENV_NORMAL;
 uint8_t    arpMode      = 0;
 float      volume       = 0.7f;
@@ -168,6 +173,143 @@ struct Ripple { int8_t ledIdx; float radius; uint8_t hue; uint8_t bright; };
 static Ripple ripples[8];
 static uint8_t rippleBrightMap[NUM_LEDS] = {};
 
+// ==================== GRANULAR STATE ====================
+static uint8_t  granSubMode   = 0;        // 0 = 8-slice, 1 = 1/16 energy-ranked
+static uint8_t  granSliceCount = 0;       // computed after source load
+static uint8_t  granWaveform[128]  = {};  // 0-255 amplitude bars for display
+static bool     granComputed   = false;   // slices computed and ready to play
+static String   granFilePath   = "";      // path of current granular source
+
+// granSubMode: 0=8-slice  1=1/16-energy  2=8-slice-loop  3=1/16-loop
+// 8-slice row layout: R0=one-shot px, R1=double px+px+1, R2=tail sx→end (looped), R3=px reversed
+// 16-slice row layout: R0=slices 0-7, R1=slices 8-15, R2=0-7 looped, R3=8-15 looped
+static inline uint16_t granPresetForKey(uint8_t row, uint8_t col) {
+    uint8_t c = 7u - col;  // physical left key = slice 0 (start of sample)
+    if ((granSubMode & 1u) == 0) {
+        // 8-slice mode
+        if (row == 0) return GRANULAR_PRESET_BASE + c;   // one-shot px
+        if (row == 1) return GRANULAR_DBL_PRESET  + c;   // double px+px+1
+        if (row == 2) return GRANULAR_TAIL_PRESET + c;   // tail sx→end (looped)
+        return              GRANULAR_REV_PRESET   + c;   // px reversed
+    } else {
+        // 16-slice mode: rows 0-1 = slices 0-15, rows 2-3 = same slices but looped
+        if (row == 0) return GRANULAR_PRESET_BASE     + c;       // slices 0-7
+        if (row == 1) return GRANULAR_PRESET_BASE + 8 + c;       // slices 8-15
+        if (row == 2) return GRANULAR_PRESET_BASE     + c;       // slices 0-7 looped
+        return              GRANULAR_PRESET_BASE + 8 + c;        // slices 8-15 looped
+    }
+}
+static inline bool granIsLoop(uint8_t row) {
+    if (granSubMode >= 2) return true;                    // modes 2&3: always loop
+    if ((granSubMode & 1u) == 0) return (row == 2);      // 8-slice: row2 (tail) loops
+    return (row >= 2);                                    // 16-slice: rows 2-3 loop
+}
+static float granWinStart = 0.0f, granWinEnd = 1.0f;
+static int8_t granPlayingSlice = -1;  // 0-N-1: last selected slice index (persists after release); -1 = none
+static bool   granKeyHeld = false;   // true while a granular key is physically held
+// Split points: N+1 boundaries within window [0.0..1.0]. Pot A = splits[x], Pot B = splits[x+1].
+static float granSplits[GRANULAR_MAX_SLICES + 1] = {};  // initialized to even spacing on file load
+// Signals the pot handler to re-sync its delta baseline to current pot positions
+// (set true on file load and mode entry to prevent stale deltas from other modes)
+static bool granPotNeedsSync = true;
+
+// ==================== GRANULAR2 STATE ====================
+struct Gran2State {
+    String  path;
+    bool    loaded;    // audioIsGranular2Ready returned true
+    bool    computed;  // slices computed and presets registered
+    uint8_t sliceCount;
+    float   splits[GRAN2_MAX_SLICES + 1];
+    uint8_t waveform[128];
+};
+static Gran2State   gran2[GRAN2_MAX_SAMPLES];
+// gran2PlayMode: 0=once (one-shot), 1=loop (loop slice), 2=full (loop full sample from slice start)
+// Fixed x4: 4 samples (TL=S0, TR=S1, BL=S2, BR=S3), 4 slices each, fwd+rev rows per half.
+static uint8_t      gran2PlayMode     = 0;
+static int8_t       gran2ActiveSample = -1;   // last-played sample index (for display + pot control)
+static int8_t       gran2ActiveSlice  = -1;   // last-played slice within that sample
+static uint8_t      gran2LoadTarget   = 0;    // which slot the SD browser loads into
+static bool         gran2PotNeedsSync = true;
+
+static uint8_t gran2NumSamples() { return 4u; }
+static uint8_t gran2NumSlices()  { return 4u; }
+
+// Map (row, col) → (sampleIdx, sliceIdx, isReverse).
+// Physical layout (code row 0 = physical bottom; gc = 7-c so code col 7 = physical left):
+//   S0=physical TL (rows2-3, cols4-7), S1=physical TR (rows2-3, cols0-3)
+//   S2=physical BL (rows0-1, cols4-7), S3=physical BR (rows0-1, cols0-3)
+//   Within each half: outer row = fwd, inner row = rev. Slices 0-3 go left to right.
+static void gran2KeyInfo(uint8_t row, uint8_t col, uint8_t& sampleIdx, uint8_t& sliceIdx, bool& reverse) {
+    sampleIdx = (uint8_t)((row >= 2 ? 0u : 2u) + (col >= 4 ? 0u : 1u));
+    reverse   = (row == 1 || row == 3);
+    sliceIdx  = (uint8_t)(col >= 4 ? (7u - col) : (3u - col));
+}
+
+// ==================== TRACKER STATE ====================
+// Left 4×4 (cols 0-3): instrument selector. Right 4×4 (cols 4-7): note grid.
+// TRACKER_TRACKS = 16: 0-6 synth, 7 drum, 8-15 sample slots 0-7.
+// trkNotes[track][step][chord_slot]: up to TRK_CHORD_SIZE simultaneous notes per step. -1 = unused slot.
+static int8_t   trkNotes[TRACKER_TRACKS][TRACKER_STEPS][TRK_CHORD_SIZE];
+static uint8_t  trkVel  [TRACKER_TRACKS][TRACKER_STEPS];
+static uint8_t  trkStep       = 0;
+static bool     trkPlaying    = false;
+static bool     trkRec        = false;
+static uint8_t  trkInstr      = 0;   // selected track (0-15)
+static uint32_t trkLastStepMs = 0;
+// Shape per synth track — diverse defaults so each track sounds distinctly different
+static uint8_t  trkSynthShape[TRACKER_SYNTHS] = {
+    SHAPE_SAW, SHAPE_SQUARE, SHAPE_SINE, SHAPE_BASS, SHAPE_PLUCK, SHAPE_ACID, SHAPE_SUPERSAW
+};
+static uint8_t  trkDrumPad = 0;  // which drum pad the drum track uses
+static int8_t   trkOctave  = 0;  // octave offset: -4..+4, applied to note grid
+// C-major diatonic note grid: right 4×4 (rows top→bottom, cols left→right)
+// Indexed as kTrkNoteGrid[3-row] so physical row 0 (bottom) = low notes.
+static const uint8_t kTrkNoteGrid[4][4] = {
+    {60, 62, 64, 65},   // [0] physical bottom row: C4  D4  E4  F4
+    {65, 67, 69, 71},   // [1]                      F4  G4  A4  B4
+    {72, 74, 76, 77},   // [2]                      C5  D5  E5  F5
+    {79, 81, 83, 84},   // [3] physical top row:    G5  A5  B5  C6
+};
+static const char* kTrkInstrNames[TRACKER_TRACKS] = {
+    "SYN1","SYN2","SYN3","SYN4","SYN5","SYN6","SYN7",
+    "DRUM","SMP1","SMP2","SMP3","SMP4","SMP5","SMP6","SMP7","SMP8"
+};
+// Per-track last-played notes (for note-off on step change); [track][chord_slot]
+static int8_t trkPlayingNote[TRACKER_TRACKS][TRK_CHORD_SIZE];
+
+// ==================== MIDI STATE ====================
+static uint8_t midiLedVel[KBD_ROWS][KBD_COLS] = {};  // velocity 0=off, >0=on color
+static uint8_t midiOctave   = 4;    // base octave for MIDI note output (C4=60 at oct=4)
+static uint8_t midiChannel  = 1;    // MIDI output channel 1-16 (btn0 short-press cycles)
+static bool    midiActive   = true;
+static float   midiLpPots[7]= {-1,-1,-1,-1,-1,-1,-1}; // last-sent CC values (by pot index)
+static uint8_t midiLastMod  = 255;  // last sent CC#1 (joystick X)
+static float   midiLastPB   = -999.f; // last sent pitch bend (joystick Y)
+// Per-pot CC assignment: 0-127 = CC number, 0xFF = disabled. Freely editable in config mode.
+static uint8_t midiPotCC[7] = {7, 1, 11, 74, 71, 91, 93};
+//                              P0  P1  P2  P3   P4  P5  P6
+//                             Vol Mod Exp Brt  Res Rev Cho
+static int8_t  midiPotSel   = -1; // -1 = normal play; 0-7 = config mode (0-6=pot, 7=layout)
+
+// ==================== KEYBOARD LAYOUT ====================
+enum KbdLayout : uint8_t { KBD_LAYOUT_GRID=0, KBD_LAYOUT_PIANO };
+static KbdLayout kbdLayout = KBD_LAYOUT_GRID;
+// Semitone offset from base note for piano layout, indexed [row][col], -1 = silent key
+// row=0 (bottom): white keys C..C'  |  row=1: black keys  |  row=2: white D'..D''  |  row=3: black
+static const int8_t pianoPad[KBD_NOTE_ROWS][KBD_COLS] = {
+    { 12,  11,   9,   7,   5,   4,   2,   0 }, // r=0 C  D  E  F  G  A  B  C'
+    { 13,  -1,  10,   8,   6,  -1,   3,   1 }, // r=1 C#' --  A# G# F# -- D# C#
+    { 26,  24,  23,  21,  19,  17,  16,  14 }, // r=2 D'' C'' B' A' G' F' E' D'
+    { 27,  25,  -1,  22,  20,  18,  -1,  15 }, // r=3 D#'' C#'' -- A#' G#' F#' -- D#'
+};
+// Returns MIDI note for piano layout, or 0xFF if the key is silent
+static inline uint8_t pianoNote(uint8_t row, uint8_t col, uint8_t baseNote) {
+    if (row >= KBD_NOTE_ROWS || col >= KBD_COLS) return 0xFF;
+    int8_t off = pianoPad[row][col];
+    if (off < 0) return 0xFF;
+    return (uint8_t)constrain((int)baseNote + off, 0, 127);
+}
+
 // Menu
 bool    menuOpen       = false;
 uint8_t menuRow        = 0, menuCol = 0;
@@ -231,8 +373,15 @@ FxEffect fxList[] = {
      {"Low","Mid","Hi",""},
      {0.0f, 0.0f, 0.0f, 0.0f},
      {4.0f, 4.0f, 4.0f, 0.0f}},
+    // ResEcho: BPM-synced echo (1/8 note) with resonant tone filter in feedback path
+    // Tone: filter_coef — negative=bright metallic echo, positive=warm dark echo
+    // Shares the AMY echo bus with DELAY; use one or the other, not both simultaneously.
+    {"RESECHO",  false, {0.7f, 0.65f, 0.6f, 2.0f},
+     {"Lvl","FB","Tone",""},
+     {0.0f, 0.3f, -0.5f, 0.0f},
+     {1.5f, 0.85f, 0.9f, 6.0f}},
 };
-static const uint8_t FX_COUNT = 8;
+static const uint8_t FX_COUNT = 9;
 
 // Delay subdivisions — param[1] is an index 0..6 into these tables
 static const float kDelaySubdiv[]     = { 0.25f, 0.333f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f };
@@ -272,6 +421,9 @@ void applyFxEffect(uint8_t fx) {
             Serial.printf("FX0 LPF %s cut=%.0f res=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f, on?e.params[1]:1.5f);
             audioSetAllFilters(on ? e.params[0] : 0.0f, on ? e.params[1] : 1.5f);
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
+            // Restore T303_CH native filter when FX LPF is disabled in 303 mode.
+            // (Smooth tick applies FX LPF to T303_CH while active; it stops on deactivation.)
+            if (!on && currentMode == MODE_303) audioT303Params(t303Cutoff, t303Reso, t303EnvMod, t303Decay);
             break;
         case 1:  // Overdrive
             Serial.printf("FX1 OVD %s drv=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
@@ -307,6 +459,16 @@ void applyFxEffect(uint8_t fx) {
                        on ? e.params[1] : 1.0f,
                        on ? e.params[2] : 1.0f);
             break;
+        case 8: {  // ResEcho — BPM-synced echo with tonal filter_coef
+            uint8_t si = (uint8_t)constrain((int)roundf(e.params[3]), 0, DELAY_SUBDIV_COUNT-1);
+            float dms  = 60000.0f / (float)bpm * kDelaySubdiv[si];
+            dms = constrain(dms, 30.0f, 700.0f);
+            Serial.printf("FX8 RES %s lvl=%.2f fb=%.2f tone=%.2f %s=%.0fms\n",
+                          on?"ON":"off", on?e.params[0]:0.0f, e.params[1], e.params[2],
+                          kDelaySubdivName[si], dms);
+            audioSetDelay(on ? e.params[0] : 0.0f, dms, e.params[1], e.params[2]);
+            break;
+        }
     }
 }
 
@@ -381,6 +543,25 @@ void switchMode(AppMode newMode) {
         t303CurrentNote=0; t303SlideActive=false; t303PressedRow=-1; t303PressedCol=-1;
         applyFxEffect(2);  // restore global reverb to FX state on 303 exit
     }
+    if (currentMode==MODE_GRANULAR)  audioUnloadGranular();
+    if (currentMode==MODE_GRANULAR2) audioUnloadGranular2();
+    if (currentMode==MODE_TRACKER && trkPlaying) {
+        trkPlaying=false;
+        for (int t=0;t<TRACKER_TRACKS;t++) {
+            if (t<TRACKER_SYNTHS) {
+                for (int ci=0;ci<TRK_CHORD_SIZE;ci++) {
+                    if (trkPlayingNote[t][ci]>=0) {
+                        audioTrackerNoteOff((uint8_t)t,(uint8_t)trkPlayingNote[t][ci]);
+                        trkPlayingNote[t][ci]=-1;
+                    }
+                }
+            } else if (t==TRACKER_DRUM_TRK) { /* percussive — let decay */
+            } else {
+                audioStopKey((uint8_t)(t-TRACKER_SAMP_BASE));
+                trkPlayingNote[t][0]=-1;
+            }
+        }
+    }
     audioAllNotesOff();
     omniRoot=0xFF; omniStrumPos=-1; omniLastJoyY=0.0f;
     memset(activeNotes,0,sizeof(activeNotes));
@@ -406,6 +587,34 @@ void switchMode(AppMode newMode) {
         audioT303Init(t303Cutoff, t303Reso, t303EnvMod, t303Decay, t303Wave);
         audioSetReverb(t303Reverb * 0.8f, 0.85f, 0.5f, 3000.0f);
     }
+    if (newMode==MODE_GRANULAR && sdReady) { sdListDir("/"); granWinStart=0.0f; granWinEnd=1.0f; granPlayingSlice=-1; granKeyHeld=false; granPotNeedsSync=true; }
+    if (newMode==MODE_GRANULAR2 && sdReady) {
+        sdListDir("/");
+        memset(gran2, 0, sizeof(gran2));
+        gran2ActiveSample = -1; gran2ActiveSlice = -1; gran2LoadTarget = 0; gran2PotNeedsSync = true;
+        pots[3].value = 0.5f; pots[4].value = 0.5f;  // mid-range so splits can move in either direction
+    }
+    if (newMode==MODE_TRACKER) {
+        memset(trkPlayingNote, -1, sizeof(trkPlayingNote));
+        trkStep=0; trkLastStepMs=millis();
+        audioTrackerInit();  // initialize per-track AMY synth channels with current shapes
+        // Apply current shapes to each channel so they're immediately distinct
+        for (int t = 0; t < TRACKER_SYNTHS; t++)
+            audioSetShapeOnSynth((SynthShape)trkSynthShape[t], (uint8_t)(TRACKER_SYNTH_CH_BASE + t));
+    }
+#if CONFIG_TINYUSB_MIDI_ENABLED
+    if (newMode==MODE_MIDI) {
+        memset(midiLedVel, 0, sizeof(midiLedVel));
+        midiActive = true;
+        midiPotSel = -1;
+        midiLastMod = 255; midiLastPB = -999.f;
+        for (int p = 0; p < 7; p++) midiLpPots[p] = -1.f;
+        // Send All Notes Off + reset controllers on entry
+        for (int n = 0; n < 128; n++) usbMIDI.noteOff((uint8_t)n, 0, midiChannel);
+        usbMIDI.controlChange(121, 0, midiChannel);  // Reset All Controllers
+        usbMIDI.pitchBend((double)0.0, midiChannel);
+    }
+#endif
 }
 
 // ==================== DRUM SYNTH ====================
@@ -455,6 +664,10 @@ void selectMenuItem() {
         case MENU_SYNTH2:    switchMode(MODE_SYNTH2);    break;
         case MENU_MOD2:      switchMode(MODE_MOD2);      break;
         case MENU_303:       switchMode(MODE_303);        break;
+        case MENU_GRANULAR:  switchMode(MODE_GRANULAR);   break;
+        case MENU_GRANULAR2: switchMode(MODE_GRANULAR2);  break;
+        case MENU_MIDI:      switchMode(MODE_MIDI);       break;
+        case MENU_TRACKER:   switchMode(MODE_TRACKER);    break;
         default: break;
     }
 }
@@ -485,7 +698,9 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
     }
 
     bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET);
-    if (col < (is4col ? 4u : 6u)) { s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0; return; }
+    // FX overlay needs 3 columns (col5-7) when FX_COUNT > 8; others use 2 (col6-7) or 4 (col4-7)
+    uint8_t colMin = is4col ? 4u : (s_overlay == OVERLAY_FX && FX_COUNT > 8 ? 5u : 6u);
+    if (col < colMin) { s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0; return; }
 
     // colRank: col7→0, col6→1, col5→2, col4→3
     uint8_t opt = (uint8_t)((3 - row) + (uint8_t)(7 - col) * 4);
@@ -518,7 +733,10 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
             // col5 (opts 8-11): arp Up/Dn/UD/Rnd (modes 1-4, toggle: re-click → off)
             // col4 (opts 12-15): octave -2/-1/0/+1
             if (opt < 4) { if (opt < (uint8_t)SCALE_COUNT) noteMap.setScale((Scale)opt); }
-            else if (opt < 8) { uint8_t si=opt-4; if (si+4 < (uint8_t)SCALE_COUNT) noteMap.setScale((Scale)(si+4)); }
+            else if (opt < 8) {
+                if (opt == 6) { kbdLayout = (kbdLayout==KBD_LAYOUT_PIANO)?KBD_LAYOUT_GRID:KBD_LAYOUT_PIANO; }
+                else { uint8_t si=opt-4; if (si+4 < (uint8_t)SCALE_COUNT) noteMap.setScale((Scale)(si+4)); }
+            }
             else if (opt < 12) { uint8_t am=opt-7; arpMode=(arpMode==am)?0:am; }
             else if (opt < 16) noteMap.setOctave(kOctOpts[opt-12]);
             break;
@@ -608,6 +826,17 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                         if (old != OVERLAY_FX) s_overlay = OVERLAY_FX;
                         break;
                     }
+                    case MODE_MIDI:
+#if CONFIG_TINYUSB_MIDI_ENABLED
+                        if (midiPotSel >= 0) {
+                            midiPotSel = -1;  // exit pot config mode
+                        } else {
+                            for (int n=0;n<128;n++) usbMIDI.noteOff((uint8_t)n, 0, midiChannel);
+                            midiChannel = (midiChannel % 16) + 1;  // 1→2→...→16→1
+                            midiLastPB = -999.f; usbMIDI.pitchBend((double)0.0, midiChannel);
+                        }
+#endif
+                        break;
                     case MODE_DRUMS:  drumPlaying=!drumPlaying; drumStep=0; break;
                     case MODE_SEQ:   seqPlaying=!seqPlaying; if(!seqPlaying) seqStep=0; break;
                     case MODE_FX:
@@ -637,6 +866,47 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                         if (sdPath == "/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; }
                         else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1)); }
                         break;
+                    case MODE_TRACKER:
+                        trkPlaying = !trkPlaying;
+                        if (trkPlaying) {
+                            trkStep=0; trkLastStepMs=millis();
+                            // Play step 0 immediately so the first beat lands on the downbeat.
+                            // (The advance loop increments before playing, so without this step 0
+                            // would only play after a full 32-step cycle.)
+                            for(int t=0;t<TRACKER_TRACKS;t++){
+                                float vel=(trkNotes[t][0][0]>=0)?trkVel[t][0]/127.0f:0.7f;
+                                if(vel<0.05f) vel=0.7f;
+                                if(t<TRACKER_SYNTHS){
+                                    for(int ci=0;ci<TRK_CHORD_SIZE;ci++){
+                                        if(trkNotes[t][0][ci]<0) break;
+                                        audioTrackerNoteOn((uint8_t)t,(uint8_t)trkNotes[t][0][ci],vel);
+                                        trkPlayingNote[t][ci]=trkNotes[t][0][ci];
+                                    }
+                                } else if(t==TRACKER_DRUM_TRK){
+                                    if(trkNotes[t][0][0]>=0) audioPlayDrumPad((uint8_t)trkNotes[t][0][0],vel);
+                                } else {
+                                    if(trkNotes[t][0][0]>=0){ uint8_t k=(uint8_t)(t-TRACKER_SAMP_BASE); audioPlayKey(k,vel); }
+                                }
+                            }
+                        } else {
+                            // Stop: send note-off for every tracked note
+                            for(int t=0;t<TRACKER_TRACKS;t++){
+                                if(t<TRACKER_SYNTHS){
+                                    for(int ci=0;ci<TRK_CHORD_SIZE;ci++){
+                                        if(trkPlayingNote[t][ci]>=0){
+                                            audioTrackerNoteOff((uint8_t)t,(uint8_t)trkPlayingNote[t][ci]);
+                                            trkPlayingNote[t][ci]=-1;
+                                        }
+                                    }
+                                } else { trkPlayingNote[t][0]=-1; }
+                            }
+                        }
+                        break;
+                    case MODE_GRANULAR2: {
+                        OverlayType old = s_overlay; s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
+                        if (old != OVERLAY_FX) s_overlay = OVERLAY_FX;
+                        break;
+                    }
                     default: break;
                 }
             }
@@ -644,7 +914,7 @@ void handleButton(uint8_t rawBtn, bool pressed) {
         }
         return;
     }
-    if (!pressed && !(currentMode==MODE_SAMPLE&&(samplePlayMode==1||samplePlayMode==2))) return;
+    if (!pressed && !(currentMode==MODE_SAMPLE&&(samplePlayMode==1||samplePlayMode==2)) && currentMode!=MODE_MIDI) return;
 
     switch(currentMode) {
         case MODE_SYNTH:
@@ -730,6 +1000,91 @@ void handleButton(uint8_t rawBtn, bool pressed) {
         case MODE_HYBRID:
             if (btn==3) noteMap.nextOctave();
             break;
+        case MODE_GRANULAR:
+            // Btn1: cycle sub-mode 0→1→2→3→0 (8sl / 1/16 / 8sl-loop / 1/16-loop)
+            if (btn==1 && granComputed) {
+                granSubMode = (granSubMode + 1) & 3u;
+                audioSetGranularWindow(granWinStart, granWinEnd);
+                granSliceCount = audioComputeGranularSlices(granSubMode & 1u, granWaveform);
+                granComputed = (granSliceCount > 0);
+                if (granComputed) {
+                    for (int i = 0; i <= granSliceCount; i++) granSplits[i] = i / (float)granSliceCount;
+                    granPlayingSlice = -1;
+                    granPotNeedsSync = true;
+                }
+            }
+            // Btn2: FX overlay
+            if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_FX) s_overlay=OVERLAY_FX; }
+            break;
+        case MODE_GRANULAR2:
+            // Btn2: cycle play mode once→loop→full→once
+            if (btn==1) {
+                gran2PlayMode = (gran2PlayMode + 1) % 3;
+                gran2ActiveSample = -1; gran2ActiveSlice = -1; gran2PotNeedsSync = true;
+                // Re-register presets with correct sample_length for the new play mode:
+                // LOP needs extended length (SYNTH_OFF prevention); NRM needs exact slice length.
+                for (uint8_t s = 0; s < GRAN2_MAX_SAMPLES; s++) {
+                    if (gran2[s].computed)
+                        audioApplyGranular2Splits(s, gran2[s].splits, gran2[s].sliceCount, gran2PlayMode == 1);
+                }
+            }
+            // Btn3: cycle load target slot
+            if (btn==2) gran2LoadTarget = (gran2LoadTarget + 1) % gran2NumSamples();
+            // Btn4: clear all loaded GR2 samples to allow remapping
+            if (btn==3) {
+                for (uint8_t r = 0; r < KBD_NOTE_ROWS; r++) for (uint8_t c = 0; c < KBD_COLS; c++)
+                    audioStopGranular2((uint8_t)(r * KBD_COLS + c));
+                for (uint8_t s = 0; s < GRAN2_MAX_SAMPLES; s++) {
+                    if (gran2[s].loaded) audioUnloadGranular2Slot(s);
+                    gran2[s] = Gran2State{};
+                }
+                gran2ActiveSample = -1; gran2ActiveSlice = -1;
+                gran2LoadTarget = 0; gran2PotNeedsSync = true;
+            }
+            break;
+        case MODE_TRACKER:
+            // B1 (btn==0 short press) = Play/Pause — handled in the btn==0 block above
+            // B2: Rec toggle
+            if (btn==1) trkRec = !trkRec;
+            // B3: Cycle octave -2→-1→0→+1→+2→-2
+            if (btn==2) trkOctave = (trkOctave >= 2) ? -2 : trkOctave + 1;
+            // B4: Clear current track
+            if (btn==3) {
+                memset(trkNotes[trkInstr], -1, sizeof(trkNotes[trkInstr]));
+                memset(trkVel  [trkInstr],  0, sizeof(trkVel  [trkInstr]));
+                memset(trkPlayingNote[trkInstr], -1, sizeof(trkPlayingNote[trkInstr]));
+            }
+            break;
+        case MODE_MIDI:
+#if CONFIG_TINYUSB_MIDI_ENABLED
+            if (midiPotSel >= 0) {
+                // Config mode: 8 rows (0-6=pot CC, 7=layout)
+                if (btn==2 && !pressed) midiPotSel = (int8_t)((midiPotSel + 7) % 8);  // prev
+                if (btn==3 && !pressed) midiPotSel = (int8_t)((midiPotSel + 1) % 8);  // next
+                if (midiPotSel < 7) {
+                    if (btn==1 && !pressed) {
+                        uint8_t cc = midiPotCC[midiPotSel];
+                        midiPotCC[midiPotSel] = (cc == 0) ? 127 : cc - 1;
+                        midiLpPots[midiPotSel] = -1.f;
+                    }
+                    if (btn==4 && !pressed) {
+                        midiPotCC[midiPotSel] = (midiPotCC[midiPotSel] >= 127) ? 0 : midiPotCC[midiPotSel] + 1;
+                        midiLpPots[midiPotSel] = -1.f;
+                    }
+                } else {
+                    // Row 7 = Layout toggle
+                    if ((btn==1 || btn==4) && !pressed)
+                        kbdLayout = (kbdLayout==KBD_LAYOUT_PIANO)?KBD_LAYOUT_GRID:KBD_LAYOUT_PIANO;
+                }
+            } else {
+                // Normal MIDI play mode
+                if (btn==1) usbMIDI.controlChange(64, pressed ? 127 : 0, midiChannel);
+                if (btn==2 && !pressed && midiOctave>0) { midiOctave--; for(int n=0;n<128;n++) usbMIDI.noteOff((uint8_t)n,0,midiChannel); }
+                if (btn==3 && !pressed && midiOctave<9) { midiOctave++; for(int n=0;n<128;n++) usbMIDI.noteOff((uint8_t)n,0,midiChannel); }
+                if (btn==4 && pressed) { for (int n=0;n<128;n++) usbMIDI.noteOff((uint8_t)n,0,midiChannel); }
+            }
+#endif
+            break;
         default: break;
     }
 }
@@ -766,7 +1121,6 @@ static void fmtFloat(char* dst, size_t sz, float v) {
 }
 
 void drawScreen() {
-    pollKeyboard();   // drain TCA8418 FIFO before the ~47ms I2C block
     oled.clearBuffer();
 
     // ---- FULL-SCREEN OVERLAY ----
@@ -804,14 +1158,22 @@ void drawScreen() {
                     // Collect indices of visible params (non-empty name)
                     int vp[4]; int vpc = 0;
                     for (int p = 0; p < 4; p++) if (fx.paramNames[p][0]) vp[vpc++] = p;
-                    if (vpc == 0) break;
+                    if (vpc == 0) continue;
                     // Special case: Delay shows level + BPM-synced time hint
                     if (i == 5) {
                         char v[8]; fmtFloat(v, sizeof(v), fx.params[vp[0]]);
                         snprintf(b.l2, sizeof(b.l2), "%s:%s", fx.paramNames[vp[0]], v);
                         int dms = (int)(60000.0f / (float)bpm * kDelaySubdiv[4]);
                         snprintf(b.l3, sizeof(b.l3), "1/4=%dms", dms);
-                        break;
+                        continue;
+                    }
+                    // Special case: ResEcho — compact 2-line layout for narrow 3rd column
+                    if (i == 8) {
+                        char v[8]; fmtFloat(v, sizeof(v), fx.params[0]);
+                        snprintf(b.l2, sizeof(b.l2), "Lv:%s", v);
+                        fmtFloat(v, sizeof(v), fx.params[1]);
+                        snprintf(b.l3, sizeof(b.l3), "FB:%s", v);
+                        continue;
                     }
                     if (vpc <= 2) {
                         // 1-2 params: one per line (standard format)
@@ -850,6 +1212,8 @@ void drawScreen() {
                     bx[i].avail = true; strncpy(bx[i].l1, sn[i], sizeof(bx[i].l1)-1);
                     bx[i].sel = (cs == (Scale)i);
                 }
+                bx[6].avail = true; strncpy(bx[6].l1, "Pno", sizeof(bx[6].l1)-1);
+                bx[6].sel = (kbdLayout == KBD_LAYOUT_PIANO);
                 for (int i = 0; i < 4; i++) {
                     bx[8+i].avail = true; strncpy(bx[8+i].l1, an[i], sizeof(bx[8+i].l1)-1);
                     bx[8+i].sel = (arpMode == i + 1);
@@ -933,12 +1297,14 @@ void drawScreen() {
             default: break;
         }
 
-        // Render: 4-col → 32×32px cells; 2-col → 64×32px cells
-        int ncols = is4col ? 4 : 2;
+        // Render: 4-col → 32px, 3-col → 42px, 2-col → 64px cells
+        int ncols = is4col ? 4 : (s_overlay == OVERLAY_FX && FX_COUNT > 8 ? 3 : 2);
         int cw    = 128 / ncols;
         for (int i = 0; i < ncols * 4; i++) {
             int gc = i / 4, gr = i % 4;
             int x = gc * cw, y = gr * 32;
+            // Clip each cell so text never bleeds into adjacent cells
+            oled.setClipWindow(x, y, x + cw - 1, y + 31);
             if (bx[i].sel) {
                 oled.drawBox(x, y, cw, 32);
                 oled.setDrawColor(0);
@@ -960,6 +1326,7 @@ void drawScreen() {
                 }
                 oled.setDrawColor(1);
             }
+            oled.setMaxClipWindow();
         }
         oled.sendBuffer();
         return;
@@ -1334,15 +1701,14 @@ void drawScreen() {
                     char pb[40]; int ppos = 0;
                     for (int p = 0; p < 4; p++) {
                         if (!fxList[fxSelected].paramNames[p][0]) continue;
-                        if (fxSelected == 5 && p == 1) {
-                            // Delay subdivision: show musical name + computed ms
-                            uint8_t si = (uint8_t)constrain((int)roundf(fxList[5].params[1]), 0, DELAY_SUBDIV_COUNT-1);
-                            float dms  = constrain(60000.0f/(float)bpm*kDelaySubdiv[si], 30.0f, 700.0f);
-                            ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "Div:%s(%.0f) ", kDelaySubdivName[si], dms);
-                        } else {
-                            ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "%s:%.1f ",
-                                             fxList[fxSelected].paramNames[p], fxList[fxSelected].params[p]);
-                        }
+                        ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "%s:%.1f ",
+                                         fxList[fxSelected].paramNames[p], fxList[fxSelected].params[p]);
+                    }
+                    // ResEcho: append BPM-synced subdivision info (params[3] is internal, not named)
+                    if (fxSelected == 8) {
+                        uint8_t si = (uint8_t)constrain((int)roundf(fxList[8].params[3]), 0, DELAY_SUBDIV_COUNT-1);
+                        float dms  = constrain(60000.0f/(float)bpm*kDelaySubdiv[si], 30.0f, 700.0f);
+                        ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "%s(%.0fms)", kDelaySubdivName[si], dms);
                     }
                     pb[39] = '\0';
                     oled.drawStr(0, LY + VIS*EH + 4, pb);
@@ -1599,6 +1965,411 @@ void drawScreen() {
                 oled.drawStr(0,118,buf);
                 break;
             }
+            // ---- GRANULAR ----
+            case MODE_GRANULAR: {
+                static const char* kGranModeStr[4] = {"8-SL","1/16","8-LP","16LP"};
+                oled.setFont(u8g2_font_4x6_tf);
+
+                // Trigger slice computation when source finishes loading
+                if (!granComputed && audioIsStreamingDone() && !audioIsGranularReady()) {
+                    audioSetGranularWindow(granWinStart, granWinEnd);
+                    granSliceCount = audioComputeGranularSlices(granSubMode & 1u, granWaveform);
+                    granComputed = (granSliceCount > 0);
+                    if (granComputed) {
+                        for (int i = 0; i <= granSliceCount; i++) granSplits[i] = i / (float)granSliceCount;
+                        granPotNeedsSync = true;
+                    }
+                }
+
+                if (!audioIsStreamingDone()) {
+                    // ---- LOADING PHASE ----
+                    oled.drawStr(0,7,"GRAN  Loading...");
+                    oled.drawHLine(0,9,128);
+                    oled.drawStr(0,118,"Clk=load B1=mode B2=FX");
+                    break;
+                }
+
+                if (!granComputed) {
+                    // ---- BROWSE PHASE: no sample loaded yet ----
+                    snprintf(buf,sizeof(buf),"GRAN [%s]", kGranModeStr[granSubMode]);
+                    oled.drawStr(0,7,buf); oled.drawHLine(0,9,128);
+                    // Show up to 13 files (7px line spacing, y=17 to y=101, then 118 for hint)
+                    for (int i=0; i<13 && (sdScroll+i)<sdFileCount; i++) {
+                        int fi = sdScroll+i;
+                        bool sel = (fi==sdCursor);
+                        snprintf(buf,sizeof(buf),"%c%.26s", sel?'>':(sdFileIsDir[fi]?'[':' '), sdFiles[fi].c_str());
+                        oled.drawStr(0, 17+i*7, buf);
+                        if (sel) oled.drawHLine(0, 18+i*7, 128);
+                    }
+                    oled.drawStr(0,118,"Joy=nav Clk=load B1=mode");
+                    break;
+                }
+
+                // ---- PLAY PHASE: sample loaded ----
+                snprintf(buf,sizeof(buf),"GRAN [%s] W:%.0f-%.0f%%",
+                         kGranModeStr[granSubMode], granWinStart*100.f, granWinEnd*100.f);
+                oled.drawStr(0,7,buf); oled.drawHLine(0,9,128);
+
+                // Waveform (y 10-32, height 23px)
+                for (int x=0;x<128;x++) {
+                    uint8_t h = (uint8_t)(granWaveform[x] * 21 / 255);
+                    if (h < 1) h=1;
+                    oled.drawVLine(x, 32 - h, h);
+                }
+                // Window boundaries
+                int wx0 = (int)(granWinStart * 128);
+                int wx1 = (int)(granWinEnd   * 128) - 1;
+                if (wx1 >= 128) wx1 = 127;
+                int gww = wx1 - wx0;
+                oled.drawVLine(wx0, 10, 23);
+                oled.drawVLine(wx1, 10, 23);
+
+                // Slice highlight using granSplits positions: XOR when key held, frame when selected
+                if (granPlayingSlice >= 0 && granPlayingSlice < granSliceCount) {
+                    int sx0 = wx0 + (int)(granSplits[granPlayingSlice]   * gww);
+                    int sx1 = wx0 + (int)(granSplits[granPlayingSlice+1] * gww);
+                    if (granKeyHeld) {
+                        oled.setDrawColor(2);
+                        oled.drawBox(sx0, 10, sx1 - sx0, 23);
+                        oled.setDrawColor(1);
+                    } else {
+                        oled.drawFrame(sx0, 10, sx1 - sx0, 23);
+                    }
+                }
+
+                // Split dividers + mini arrows below waveform (y=33-39)
+                if (granSliceCount > 0) {
+                    for (int i = 0; i <= granSliceCount; i++) {
+                        int x = wx0 + (int)(granSplits[i] * gww);
+                        oled.drawVLine(x, 10, 23);  // divider line through waveform
+                        oled.drawVLine(x, 33, 4);   // tick mark below waveform
+                    }
+                    if (granPlayingSlice >= 0 && granPlayingSlice < granSliceCount) {
+                        int sx0 = wx0 + (int)(granSplits[granPlayingSlice]   * gww);
+                        int sx1 = wx0 + (int)(granSplits[granPlayingSlice+1] * gww);
+                        oled.drawHLine(sx0+1, 37, sx1 - sx0 - 1);
+                        int mx = (sx0 + sx1) / 2;
+                        oled.drawPixel(mx, 38);
+                        oled.drawHLine(mx-1, 39, 3);
+                    }
+                }
+
+                // Info line (y=42): split positions when slice selected, row hint otherwise
+                static const char* kGranRowHint[4] = {
+                    "R0:px R1:px+px+1 R2:tail R3:rev",
+                    "R0-1:1/16  R2-3:1/16Lp",
+                    "All: 1/8 loop",
+                    "All: 1/16 loop"
+                };
+                if (granPlayingSlice >= 0 && granPlayingSlice < granSliceCount) {
+                    int x = granPlayingSlice;
+                    snprintf(buf,sizeof(buf),"Sl%d S%d:%.0f%% S%d:%.0f%% P3/P4",
+                             x, x, granSplits[x]*100.f, x+1, granSplits[x+1]*100.f);
+                    oled.drawStr(0, 42, buf);
+                } else {
+                    oled.drawStr(0, 42, kGranRowHint[granSubMode]);
+                }
+
+                // File browser in play phase (8 entries at 7px spacing, y=51..105)
+                for (int i=0; i<8 && (sdScroll+i)<sdFileCount; i++) {
+                    int fi = sdScroll+i;
+                    snprintf(buf,sizeof(buf),"%c%.26s", (fi==sdCursor)?'>':(sdFileIsDir[fi]?'[':' '), sdFiles[fi].c_str());
+                    oled.drawStr(0, 51+i*7, buf);
+                }
+                oled.drawStr(0,118,"Joy=nav Clk=load B1=mode B2=FX");
+                break;
+            }
+            // ---- GRANULAR2 ----
+            case MODE_GRANULAR2: {
+                oled.setFont(u8g2_font_4x6_tf);
+                uint8_t numSamp = gran2NumSamples();
+                uint8_t nSlices = gran2NumSlices();
+
+                // Poll audio engine: mark loaded once streaming completes, then compute slices
+                for (uint8_t s = 0; s < numSamp; s++) {
+                    if (!gran2[s].path.isEmpty() && !gran2[s].loaded && audioIsGranular2Ready(s)) {
+                        gran2[s].loaded = true;
+                    }
+                    if (gran2[s].loaded && !gran2[s].computed) {
+                        gran2[s].sliceCount = audioComputeGranular2Slices(s, nSlices, gran2[s].waveform);
+                        gran2[s].computed = (gran2[s].sliceCount > 0);
+                        if (gran2[s].computed) {
+                            for (int i = 0; i <= gran2[s].sliceCount; i++)
+                                gran2[s].splits[i] = i / (float)gran2[s].sliceCount;
+                            // Sync preset lengths to the current play mode right away,
+                            // so LOP extended-length presets are ready without requiring a pot move.
+                            audioApplyGranular2Splits(s, gran2[s].splits, gran2[s].sliceCount, gran2PlayMode == 1);
+                            gran2PotNeedsSync = true;
+                        }
+                    }
+                }
+
+                // Header — include per-sample load status as compact chars after mode tag
+                static const char* kGran2ModeStr[3] = {"NRM","LOP","FUL"};
+                {
+                    char st[5] = "----";
+                    for (uint8_t s = 0; s < numSamp && s < 4; s++) {
+                        if      (gran2[s].computed)                           st[s] = 'C';
+                        else if (gran2[s].loaded)                             st[s] = 'R';
+                        else if (!gran2[s].path.isEmpty())                    st[s] = 'L';
+                        else                                                  st[s] = '-';
+                    }
+                    st[numSamp] = '\0';
+                    snprintf(buf, sizeof(buf), "GR2[%s] T%d %s", kGran2ModeStr[gran2PlayMode], gran2LoadTarget, st);
+                }
+                oled.drawStr(0, 7, buf); oled.drawHLine(0, 9, 128);
+
+                // Pick display sample: last played, else first computed, else none
+                int8_t dispSamp = gran2ActiveSample;
+                if (dispSamp < 0 || dispSamp >= (int8_t)numSamp || !gran2[dispSamp].computed) {
+                    dispSamp = -1;
+                    for (uint8_t s = 0; s < numSamp; s++) { if (gran2[s].computed) { dispSamp = (int8_t)s; break; } }
+                }
+
+                if (dispSamp < 0) {
+                    // ---- BROWSE PHASE: no sample computed yet ----
+                    // 13 entries from y=17, matching granular browse layout exactly
+                    for (int i = 0; i < 13 && (sdScroll + i) < sdFileCount; i++) {
+                        int fi = sdScroll + i;
+                        bool sel = (fi == sdCursor);
+                        snprintf(buf, sizeof(buf), "%c%.26s", sel ? '>' : (sdFileIsDir[fi] ? '[' : ' '), sdFiles[fi].c_str());
+                        oled.drawStr(0, 17 + i * 7, buf);
+                        if (sel) oled.drawHLine(0, 18 + i * 7, 128);
+                    }
+                } else {
+                    // ---- PLAY PHASE: waveform + sample indicators + file browser ----
+                    Gran2State& ds = gran2[dispSamp];
+                    // Waveform (y=10..32, height 23px)
+                    for (int x = 0; x < 128; x++) {
+                        uint8_t h = (uint8_t)(ds.waveform[x] * 21 / 255);
+                        if (h < 1) h = 1;
+                        oled.drawVLine(x, 32 - h, h);
+                    }
+                    // Split dividers + tick marks
+                    if (ds.sliceCount > 0) {
+                        for (int i = 0; i <= ds.sliceCount; i++) {
+                            int x = (int)(ds.splits[i] * 127.f);
+                            oled.drawVLine(x, 10, 23);
+                            oled.drawVLine(x, 33, 4);
+                        }
+                        // Highlight active slice
+                        if (gran2ActiveSample == dispSamp && gran2ActiveSlice >= 0 && gran2ActiveSlice < ds.sliceCount) {
+                            int sx0 = (int)(ds.splits[gran2ActiveSlice]   * 127.f);
+                            int sx1 = (int)(ds.splits[gran2ActiveSlice+1] * 127.f);
+                            oled.drawFrame(sx0, 10, sx1 - sx0, 23);
+                        }
+                    }
+                    // Sample indicators (y=36..44): S0..S3 with status
+                    oled.drawStr(0, 43, "S:");
+                    for (uint8_t s = 0; s < numSamp; s++) {
+                        int x = 12 + (int)s * 14;
+                        snprintf(buf, sizeof(buf), "S%d", s);
+                        if (s == (uint8_t)dispSamp) {
+                            oled.drawBox(x - 1, 36, 11, 8); oled.setDrawColor(0);
+                            oled.drawStr(x, 43, buf); oled.setDrawColor(1);
+                        } else {
+                            oled.drawStr(x, 43, buf);
+                        }
+                        if (gran2[s].computed)              oled.drawPixel(x + 4, 45);
+                        else if (gran2[s].loaded)           oled.drawCircle(x + 4, 44, 2, U8G2_DRAW_ALL);
+                        else if (!gran2[s].path.isEmpty())  oled.drawPixel(x + 3, 44); // loading dot
+                    }
+                    // Slice info (y=51)
+                    if (gran2ActiveSample == dispSamp && gran2ActiveSlice >= 0 && gran2ActiveSlice < ds.sliceCount) {
+                        snprintf(buf, sizeof(buf), "Sl%d S%d:%.0f%% S%d:%.0f%% P3/P4",
+                                 gran2ActiveSlice,
+                                 gran2ActiveSlice,   ds.splits[gran2ActiveSlice]   * 100.f,
+                                 gran2ActiveSlice+1, ds.splits[gran2ActiveSlice+1] * 100.f);
+                        oled.drawStr(0, 51, buf);
+                    }
+                    // File browser (7 entries from y=58, matching granular play-phase cadence)
+                    for (int i = 0; i < 7 && (sdScroll + i) < sdFileCount; i++) {
+                        int fi = sdScroll + i;
+                        bool sel = (fi == sdCursor);
+                        snprintf(buf, sizeof(buf), "%c%.26s", sel ? '>' : (sdFileIsDir[fi] ? '[' : ' '), sdFiles[fi].c_str());
+                        oled.drawStr(0, 58 + i * 7, buf);
+                        if (sel) oled.drawHLine(0, 59 + i * 7, 128);
+                    }
+                }
+                // Bottom 2 lines: FX params when any FX is active, else button hints
+                {
+                    bool anyFxDisp = false;
+                    for (uint8_t fi = 0; fi < FX_COUNT; fi++) if (fxList[fi].active) { anyFxDisp = true; break; }
+                    if (anyFxDisp) {
+                        const FxEffect& fx = fxList[fxSelected];
+                        // Collect non-empty params and format values
+                        struct { const char* name; char val[8]; } pp[4]; int np = 0;
+                        for (int p = 0; p < 4; p++) {
+                            if (!fx.paramNames[p][0]) continue;
+                            float v = fx.params[p];
+                            if      (v >= 1000.f) snprintf(pp[np].val, 8, "%.0fk", v / 1000.f);
+                            else if (v >= 10.f)   snprintf(pp[np].val, 8, "%.0f",  v);
+                            else                  snprintf(pp[np].val, 8, "%.2f",  v);
+                            pp[np].name = fx.paramNames[p]; np++;
+                        }
+                        // Line 1 (y=111): FX name + first 2 params
+                        char l1[32] = {}, l2[32] = {};
+                        int o1 = snprintf(l1, sizeof(l1), "%s%s:", fx.active ? "*" : "-", fx.name);
+                        for (int i = 0; i < np && i < 2; i++)
+                            o1 += snprintf(l1 + o1, sizeof(l1) - o1, " %.3s=%s", pp[i].name, pp[i].val);
+                        oled.drawStr(0, 111, l1);
+                        // Line 2 (y=118): remaining params (3rd and 4th), or button hints if ≤2 params
+                        if (np > 2) {
+                            int o2 = 0;
+                            for (int i = 2; i < np; i++)
+                                o2 += snprintf(l2 + o2, sizeof(l2) - o2, " %.3s=%s", pp[i].name, pp[i].val);
+                            oled.drawStr(0, 118, l2 + 1); // skip leading space
+                        } else {
+                            oled.drawStr(0, 118, "B1=FX B2=mode B3=Tgt B4=Clr");
+                        }
+                    } else {
+                        oled.drawStr(0, 118, "B1=FX B2=mode B3=Tgt B4=Clr");
+                    }
+                }
+                break;
+            }
+            // ---- TRACKER ----
+            case MODE_TRACKER: {
+                oled.setFont(u8g2_font_4x6_tf);
+                const char* shapeLabel = (trkInstr < TRACKER_SYNTHS) ? shapeNames[trkSynthShape[trkInstr]] : "---";
+                snprintf(buf,sizeof(buf),"TRK %dBPM %s T:%s[%s]",
+                         bpm, trkPlaying?"[PLAY]":"[STOP]", kTrkInstrNames[trkInstr], shapeLabel);
+                oled.drawStr(0,7,buf); oled.drawHLine(0,9,128);
+                // REC indicator: inverted box when active
+                if (trkRec) {
+                    oled.setDrawColor(1);
+                    oled.drawBox(96,0,32,8);
+                    oled.setDrawColor(0);
+                    oled.drawStr(98,7,"[REC]");
+                    oled.setDrawColor(1);
+                } else {
+                    oled.drawStr(98,7,"[   ]");
+                }
+                // Step grid: 32 steps × 4px each = 128px, for selected track
+                for (int s=0; s<TRACKER_STEPS; s++) {
+                    int x = s * 4;
+                    int noteCount = 0;
+                    for (int ci=0;ci<TRK_CHORD_SIZE;ci++) if(trkNotes[trkInstr][s][ci]>=0) noteCount++;
+                    bool cur = trkPlaying && (s == trkStep);
+                    if (cur)              oled.drawBox(x, 10, 3, 10);
+                    else if (noteCount>1) { oled.drawBox(x, 11, 3, 8); }  // chord: filled+extra dot
+                    else if (noteCount>0) oled.drawFrame(x, 11, 3, 8);
+                    else                  oled.drawPixel(x+1, 15);
+                }
+                // All tracks overview (tiny: 1 row per track, 32px wide = 1px/step)
+                for (int t=0; t<TRACKER_TRACKS; t++) {
+                    int y = 83 - t * 4;
+                    for (int s=0; s<TRACKER_STEPS; s++) {
+                        if (trkNotes[t][s][0] >= 0) oled.drawPixel(s * 4 + s/8, y);
+                    }
+                    if (t == trkInstr) oled.drawStr(100, y+3, kTrkInstrNames[t]);
+                }
+                snprintf(buf,sizeof(buf),"Ply Rec Oct%+d Clr  [2x=shape]", trkOctave);
+                oled.drawStr(0,118,buf);
+                snprintf(buf, sizeof(buf), "L4=instr(2x=snd)  R4=note", trkOctave);
+                oled.drawStr(0,109,buf);
+                break;
+            }
+            // ---- MIDI ----
+            case MODE_MIDI: {
+                // CC name helper (common names, fall back to number)
+                auto ccLabel = [](uint8_t cc, char* out, int sz) {
+                    static const struct { uint8_t n; const char* s; } tab[] = {
+                        {0,"BankSel"},{1,"Mod"},{2,"Breath"},{4,"Foot"},{5,"Porta"},
+                        {6,"DatEnt"},{7,"Vol"},{8,"Bal"},{10,"Pan"},{11,"Expr"},
+                        {12,"FxC1"},{13,"FxC2"},{64,"Sust"},{65,"PortaOn"},
+                        {71,"Reso"},{72,"Rel"},{73,"Atk"},{74,"Bright"},
+                        {91,"Rev"},{93,"Cho"},{94,"Detune"},{95,"Phaser"}
+                    };
+                    for (auto& e : tab) if (e.n == cc) { snprintf(out,sz,"%s",e.s); return; }
+                    snprintf(out, sz, "%d", cc);
+                };
+                oled.setFont(u8g2_font_5x7_tf);
+                if (midiPotSel >= 0) {
+                    // Config mode (pots + layout)
+                    snprintf(buf,sizeof(buf),"MIDI CONFIG  ch%d", (int)midiChannel);
+                    oled.drawStr(0,0,buf); oled.drawHLine(0,9,128);
+                    oled.setFont(u8g2_font_4x6_tf);
+                    char lbl[10];
+                    for (int p = 0; p < 7; p++) {
+                        int y = 18 + p * 10;
+                        if (p == midiPotSel) oled.drawBox(0, y-7, 128, 9);
+                        if (midiPotCC[p] > 127) {
+                            snprintf(buf, sizeof(buf), "P%d  OFF", p);
+                        } else {
+                            ccLabel(midiPotCC[p], lbl, sizeof(lbl));
+                            snprintf(buf, sizeof(buf), "P%d  CC%3d  %s", p, (int)midiPotCC[p], lbl);
+                        }
+                        if (p == midiPotSel) oled.setDrawColor(0);
+                        oled.drawStr(2, y, buf);
+                        if (p == midiPotSel) oled.setDrawColor(1);
+                    }
+                    // Row 7: layout
+                    { int y = 18 + 7 * 10;
+                      if (7 == midiPotSel) oled.drawBox(0, y-7, 128, 9);
+                      snprintf(buf, sizeof(buf), "Layout  [%s]", kbdLayout==KBD_LAYOUT_PIANO?"Piano":"Grid");
+                      if (7 == midiPotSel) oled.setDrawColor(0);
+                      oled.drawStr(2, y, buf);
+                      if (7 == midiPotSel) oled.setDrawColor(1); }
+                    oled.drawStr(0,118,"B0=OK  B2=^ B3=v  B1/B4=Change");
+                } else {
+                    // Normal MIDI play mode
+                    // ── Header: channel, octave, note range ──
+                    uint8_t lo=(uint8_t)constrain((int)(midiOctave*12),   0,127);
+                    uint8_t hi=(uint8_t)constrain((int)(midiOctave*12)+31,0,127);
+                    static const char* nms[]={"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+                    snprintf(buf,sizeof(buf),"MIDI ch%d Oct%d%s %s%d-%s%d",
+                        (int)midiChannel,(int)midiOctave,
+                        kbdLayout==KBD_LAYOUT_PIANO?" [P]":"",
+                        nms[lo%12],lo/12-1, nms[hi%12],hi/12-1);
+                    oled.setFont(u8g2_font_5x7_tf);
+                    oled.drawStr(0,8,buf);
+                    oled.drawHLine(0,9,128);
+                    oled.setFont(u8g2_font_4x6_tf);
+
+                    // ── 7 vertical sliders ──
+                    // Layout: slot=18px, bar=12px wide, frame height=65px, TOP=20 for CC label clearance
+                    const int SLOT=18, BW=12, SH=65, TOP=20;
+                    for (int p=0; p<7; p++) {
+                        int sx = p * SLOT;
+                        int bx = sx + (SLOT - BW) / 2;  // center bar in slot
+
+                        // CC number above slider (centered)
+                        if (midiPotCC[p] > 127)
+                            snprintf(buf,sizeof(buf),"--");
+                        else
+                            snprintf(buf,sizeof(buf),"%d",(int)midiPotCC[p]);
+                        int tw = (int)oled.getStrWidth(buf);
+                        oled.drawStr(sx + (SLOT - tw) / 2, TOP - 3, buf);
+
+                        // Slider frame
+                        oled.drawFrame(bx, TOP, BW, SH);
+
+                        if (midiPotCC[p] > 127) {
+                            // Disabled: X inside frame
+                            oled.drawLine(bx+2, TOP+2,    bx+BW-3, TOP+SH-3);
+                            oled.drawLine(bx+2, TOP+SH-3, bx+BW-3, TOP+2);
+                        } else {
+                            // Fill bar from bottom up (clamped so P0/volume ≤200% can't overflow)
+                            int fh = min((int)(pots[p].value * (float)(SH - 2)), SH - 2);
+                            if (fh > 0)
+                                oled.drawBox(bx+1, TOP+1+(SH-2-fh), BW-2, fh);
+                        }
+
+                        // Pot label below slider (centered)
+                        snprintf(buf,sizeof(buf),"P%d",p);
+                        tw = (int)oled.getStrWidth(buf);
+                        oled.drawStr(sx + (SLOT - tw) / 2, TOP + SH + 8, buf);
+                    }
+
+                    // ── Footer ──
+                    oled.drawStr(0, 101, "JY=PitchBend  JX=Mod");
+                    oled.drawHLine(0, 105, 128);
+                    oled.drawStr(0, 114, "B0=Ch B1=Sus B2/3=Oct B4=Off");
+                    oled.drawStr(0, 123, "[HoldB0=PotConfig]");
+                }
+                break;
+            }
             default:
                 oled.drawStr(0,0,menuLabels[currentMode]);
                 oled.drawStr(20,60,"Coming soon...");
@@ -1607,6 +2378,768 @@ void drawScreen() {
     }
 
     oled.sendBuffer();
+}
+
+// ==================== LED UPDATE TASK ====================
+// Binary semaphore: given by handleNoteKeyAudio() on each key event so LEDs respond
+// immediately, even when the main loop is starved by AMY fill-buffer (Core 1).
+static SemaphoreHandle_t s_ledSem = nullptr;
+
+static void updateLedsAndShow()
+{
+    for(int i=0;i<NUM_LEDS;i++) leds[i]=CRGB::Black;
+    if(!menuOpen){
+        switch(currentMode){
+            case MODE_FX:
+                // Active effects as colored LEDs, ordered by activation sequence
+                for(uint8_t k=0;k<fxOrderCount;k++){
+                    uint8_t i=fxOrderList[k];
+                    int li=crdToIdx(i*2,0); if(li>=0&&li<NUM_LEDS) leds[li]=CHSV(i*60,255,255);
+                }
+                break;
+            case MODE_SEQ: {
+                // Same coordinate transform as all other modes:
+                // track t = physical row t → gr = KBD_ROWS-1-t = 4-t
+                // step  s = physical col 7-s → gc = KBD_COLS-1-(7-s) = s
+                static const uint8_t trackHues[4]={0,85,170,42};
+                for(int t=0;t<4;t++) for(int s=0;s<8;s++){
+                    uint8_t track=seqPage*4+t;
+                    int idx=(4-t)*KBD_COLS + s;
+                    int li=crdToIdx(idx,0);
+                    if(li<0||li>=NUM_LEDS) continue;
+                    if(seqPattern[track][s]){
+                        bool cur=(seqPlaying&&s==(int)seqStep);
+                        leds[li]=CHSV(trackHues[t],255,cur?255:80);
+                    } else if(seqPlaying&&s==(int)seqStep){
+                        leds[li]=CHSV(trackHues[t],120,40);
+                    }
+                }
+                break;
+            }
+            case MODE_LIGHTPLAY: {
+                // Decay all LEDs
+                for(int i=0;i<NUM_LEDS;i++) if(rippleBrightMap[i]>12) rippleBrightMap[i]-=12;
+                else rippleBrightMap[i]=0;
+                // Update ripples
+                for(uint8_t r=0;r<8;r++){
+                    if(ripples[r].bright<10) continue;
+                    ripples[r].radius+=0.6f;
+                    ripples[r].bright=(uint8_t)(ripples[r].bright>8?ripples[r].bright-8:0);
+                    // Light LEDs near ripple ring
+                    for(int i=0;i<NUM_LEDS;i++){
+                        // Approximate distance using LED index distance
+                        float dist=fabsf((float)i-(float)ripples[r].ledIdx);
+                        if(dist>NUM_LEDS/2) dist=NUM_LEDS-dist;
+                        float diff=fabsf(dist-ripples[r].radius);
+                        if(diff<1.8f){
+                            uint8_t b=(uint8_t)(ripples[r].bright*(1.0f-diff/1.8f));
+                            if(b>rippleBrightMap[i]) rippleBrightMap[i]=b;
+                        }
+                    }
+                }
+                for(int i=0;i<NUM_LEDS;i++)
+                    if(rippleBrightMap[i]>0)
+                        leds[i]=CHSV((uint8_t)(i*17+80),200,rippleBrightMap[i]);
+                break;
+            }
+            case MODE_LIGHT: {
+                // Scroll N consecutive LEDs along the strip
+                static float lightPos = 0.0f;
+                static unsigned long lastLightMs = 0;
+                unsigned long now = millis();
+                float dt = (now - lastLightMs) / 1000.0f;
+                lastLightMs = now;
+                // Speed: pot4=0 → 0.1 LED/s; pot4=1 → 36 LED/s (quadratic)
+                float speed = 0.1f + pots[4].value * pots[4].value * 35.9f;
+                lightPos = fmodf(lightPos + speed * dt, (float)NUM_LEDS);
+
+                uint8_t n   = max((uint8_t)1, (uint8_t)(pots[3].value * NUM_LEDS + 0.5f));
+                uint8_t hue = (uint8_t)(pots[5].value * 255.0f);
+                uint8_t bri = (uint8_t)(pots[6].value * 255.0f);
+                for (uint8_t i = 0; i < n; i++) {
+                    uint8_t idx = ((uint8_t)lightPos + i) % NUM_LEDS;
+                    leds[idx] = CHSV(hue, 255, bri);
+                }
+                break;
+            }
+            case MODE_303: {
+                for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
+                    int li=(idx>=0&&idx<NUM_LEDS+4)?crdToIdx(idx,0):-1;
+                    if(li<0||li>=NUM_LEDS) continue;
+                    if (kbdLayout == KBD_LAYOUT_PIANO) {
+                        int8_t off = pianoPad[r][c];
+                        if (off < 0) { leds[li]=CRGB::Black; continue; }
+                        bool white = (0xAB5 >> (off % 12)) & 1;
+                        bool pr = keyState[r][c];
+                        uint8_t thisNote = (uint8_t)constrain(
+                            (int)(48 + noteMap.getOctave()*12) + off + (int)t303Oct*12, 0, 127);
+                        bool playing = (thisNote == t303CurrentNote && t303CurrentNote != 0);
+                        if (playing)     leds[li] = t303AccentOn ? CHSV(40,255,255) : CHSV(0,255,255);
+                        else if (pr)     leds[li] = CHSV(15, 220, 180);
+                        else             leds[li] = white ? CHSV(40,100,40) : CHSV(160,255,30);
+                    } else {
+                        uint8_t base = noteMap.getMidiNote(r, c);
+                        uint8_t note = (uint8_t)constrain((int)base + (int)t303Oct*12, 0, 127);
+                        bool playing = (note == t303CurrentNote && t303CurrentNote != 0);
+                        bool pressed = keyState[r][c];
+                        if(playing)      leds[li] = t303AccentOn ? CHSV(40,255,255) : CHSV(0,255,255);
+                        else if(pressed) leds[li] = CHSV(15, 220, 180);
+                        else             leds[li] = CHSV(10, 180, 15);
+                    }
+                }
+                break;
+            }
+            case MODE_MIDI: {
+                // LEDs: host NoteOn/Off (LaunchPad) > physical press > piano layout background
+                for(int r=0;r<KBD_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c;
+                    int idx=gr*KBD_COLS+gc;
+                    if(idx<0||idx>=NUM_LEDS+4) continue;
+                    int li=crdToIdx(idx,0);
+                    if(li<0||li>=NUM_LEDS) continue;
+                    if(midiLedVel[r][c] > 0){
+                        uint8_t h = (uint8_t)((uint32_t)midiLedVel[r][c] * 170 / 127);
+                        leds[li] = CHSV(h, 255, 255);
+                    } else if(keyState[r][c]){
+                        bool silent = (kbdLayout==KBD_LAYOUT_PIANO && r<KBD_NOTE_ROWS && pianoPad[r][c]<0);
+                        if (!silent) leds[li] = CHSV(midiOctave * 20, 200, 200);
+                    } else if (kbdLayout == KBD_LAYOUT_PIANO && r < KBD_NOTE_ROWS) {
+                        int8_t off = pianoPad[r][c];
+                        if (off < 0) continue;
+                        bool white = (0xAB5 >> (off % 12)) & 1;
+                        leds[li] = white ? CHSV(40,100,40) : CHSV(160,255,30);
+                    }
+                }
+                break;
+            }
+            case MODE_GRANULAR: {
+                if(!granComputed){
+                    // Browser phase: show nothing (file list on OLED)
+                    break;
+                }
+                // Highlight active slice regions per row based on sub-mode
+                for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c;
+                    int idx=gr*KBD_COLS+gc;
+                    if(idx<0||idx>=NUM_LEDS+4) continue;
+                    int li=crdToIdx(idx,0);
+                    if(li<0||li>=NUM_LEDS) continue;
+                    // dim base colour: row 0=green, 1=cyan, 2=blue, 3=magenta (reverse)
+                    static const uint8_t granHues[4]={85,128,170,213};
+                    uint8_t bri = keyState[r][c] ? 255 : 30;
+                    leds[li] = CHSV(granHues[r], 200, bri);
+                }
+                break;
+            }
+            case MODE_GRANULAR2: {
+                // Per-sample hue: S0=green, S1=cyan, S2=blue, S3=magenta; fwd=brighter, rev=dimmer
+                static const uint8_t g2Hues[4] = {85, 128, 170, 213};
+                uint8_t g2NumSamp = gran2NumSamples();
+                // NRM: dim idle glow shows loaded samples. LOOP/FULL: dark unless pressed.
+                bool g2IdleOn = (gran2PlayMode == 0);
+                for (int r = 0; r < KBD_NOTE_ROWS; r++) for (int c = 0; c < KBD_COLS; c++) {
+                    uint8_t si, sl; bool rev;
+                    gran2KeyInfo((uint8_t)r, (uint8_t)c, si, sl, rev);
+                    int gr = KBD_ROWS - 1 - r, gc = KBD_COLS - 1 - c;
+                    int idx = gr * KBD_COLS + gc;
+                    int li = (idx >= 0 && idx < NUM_LEDS + 4) ? crdToIdx(idx, 0) : -1;
+                    if (li < 0 || li >= NUM_LEDS) continue;
+                    if (si >= g2NumSamp || !gran2[si].computed) { leds[li] = CHSV(0, 0, 5); continue; }
+                    // If reverse buffer failed to allocate (PSRAM exhausted), show faint gray.
+                    if (rev && !audioGranular2HasReverse(si)) { leds[li] = CHSV(0, 220, keyState[r][c] ? 80u : 15u); continue; }
+                    uint8_t hue = g2Hues[si];
+                    uint8_t sat = rev ? 180u : 220u;
+                    uint8_t bri = keyState[r][c] ? 255u : (g2IdleOn ? (rev ? 20u : 40u) : 0u);
+                    leds[li] = CHSV(hue, sat, bri);
+                }
+                // Highlight load target sample rows with a dim amber outline
+                for (int r = 0; r < KBD_NOTE_ROWS; r++) for (int c = 0; c < KBD_COLS; c++) {
+                    uint8_t si, sl; bool rev;
+                    gran2KeyInfo((uint8_t)r, (uint8_t)c, si, sl, rev);
+                    if (si != gran2LoadTarget) continue;
+                    int gr = KBD_ROWS - 1 - r, gc = KBD_COLS - 1 - c;
+                    int idx = gr * KBD_COLS + gc;
+                    int li = (idx >= 0 && idx < NUM_LEDS + 4) ? crdToIdx(idx, 0) : -1;
+                    if (li < 0 || li >= NUM_LEDS) continue;
+                    if (!gran2[si].computed && !keyState[r][c]) leds[li] = CHSV(35, 200, 15);
+                }
+                break;
+            }
+            case MODE_TRACKER: {
+                // Left 4×4 (cols 0-3): instrument selector
+                for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<4;c++){
+                    uint8_t instrIdx = (uint8_t)(r*4 + c);  // matches key handler: trkInstr=row*4+col
+                    if(instrIdx >= TRACKER_TRACKS) continue;
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c;
+                    int idx=gr*KBD_COLS+gc, li=crdToIdx(idx,0);
+                    if(li<0||li>=NUM_LEDS) continue;
+                    bool sel = (instrIdx == trkInstr);
+                    uint8_t hue = (instrIdx < TRACKER_SYNTHS) ? (uint8_t)(instrIdx*18)
+                                : (instrIdx == TRACKER_DRUM_TRK) ? 0
+                                : (uint8_t)(140 + (instrIdx-TRACKER_SAMP_BASE)*14);
+                    leds[li] = sel ? CHSV(35,255,255) : CHSV(hue,200,60);
+                }
+                // Right 4×4 (cols 4-7): note grid, flash current step
+                for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=4;c<KBD_COLS;c++){
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c;
+                    int idx=gr*KBD_COLS+gc, li=crdToIdx(idx,0);
+                    if(li<0||li>=NUM_LEDS) continue;
+                    leds[li] = keyState[r][c] ? CHSV(85,255,255) : CHSV(85,200,15);
+                }
+                break;
+            }
+            default:
+                for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
+                    if(idx<0||idx>=NUM_LEDS+4) continue;
+                    int li=crdToIdx(idx,0);
+                    if(li<0||li>=NUM_LEDS) continue;
+                    if (kbdLayout == KBD_LAYOUT_PIANO) {
+                        int8_t off = pianoPad[r][c];
+                        if (off < 0) { leds[li]=CRGB::Black; continue; }
+                        bool white = (0xAB5 >> (off % 12)) & 1;
+                        bool pr = keyState[r][c];
+                        leds[li] = white ? (pr ? CHSV(40,100,255) : CHSV(40,100,40))
+                                         : (pr ? CHSV(160,255,255) : CHSV(160,255,30));
+                    } else if(keyState[r][c]) {
+                        leds[li]=CHSV((r*8+c)*37+80,255,255);
+                    }
+                }
+                break;
+        }
+    }
+
+    // ---- OVERLAY LEDs ----
+    // INSTR: toutes les 32 touches de notes, hue unique par shape, amber pour le sélectionné
+    // Autres overlays: cols 4-7 (4-col) ou 6-7 (2-col); même règle de couleur
+    if (s_overlay == OVERLAY_INSTR) {
+        for (uint8_t r2 = 0; r2 < KBD_NOTE_ROWS; r2++) {
+            for (uint8_t c2 = 0; c2 < KBD_COLS; c2++) {
+                uint8_t opt = (uint8_t)((3u - r2) * 8u + (7u - c2));
+                if (opt >= (uint8_t)SHAPE_COUNT) continue;
+                int gr = KBD_ROWS - 1 - (int)r2;
+                int gc = KBD_COLS - 1 - (int)c2;
+                int idx = gr * KBD_COLS + gc;
+                int ledIdx = (idx >= 0 && idx < NUM_LEDS + 4) ? crdToIdx(idx, 0) : -1;
+                if (ledIdx < 0 || ledIdx >= NUM_LEDS) continue;
+                bool sel = (currentShape == (SynthShape)opt);
+                leds[ledIdx] = sel ? CHSV(35, 255, 255) : CHSV((uint8_t)(opt * 8), 255, 255);
+            }
+        }
+    } else if (s_overlay != OVERLAY_NONE) {
+        bool ovl4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET);
+        uint8_t nOpts = ovl4col ? 16 : 8;
+        for (uint8_t opt = 0; opt < nOpts; opt++) {
+            uint8_t r = (uint8_t)(3 - (opt & 3));
+            uint8_t colRank = opt >> 2;  // 0→col7, 1→col6, 2→col5, 3→col4
+            uint8_t c = (uint8_t)(7 - colRank);
+            int gr = KBD_ROWS - 1 - (int)r;
+            int gc = KBD_COLS - 1 - (int)c;
+            int idx = gr * KBD_COLS + gc;
+            int ledIdx = (idx >= 0 && idx < NUM_LEDS + 4) ? crdToIdx(idx, 0) : -1;
+            if (ledIdx < 0 || ledIdx >= NUM_LEDS) continue;
+            bool show = false, sel = false; uint8_t hue = 0;
+            switch (s_overlay) {
+                case OVERLAY_FX:
+                    if (opt < FX_COUNT) { show=true; sel=fxList[opt].active; hue=(uint8_t)(opt*32); }
+                    break;
+                case OVERLAY_SCALE_ARP:
+                    if (opt < 4 && opt < (uint8_t)SCALE_COUNT)  { show=true; sel=(noteMap.getScale()==(Scale)opt);         hue=100; }
+                    else if (opt >= 4 && opt < 8) {
+                        if (opt == 6)                             { show=true; sel=(kbdLayout==KBD_LAYOUT_PIANO);            hue=40;  }
+                        else if ((opt-4+4) < (uint8_t)SCALE_COUNT){ show=true; sel=(noteMap.getScale()==(Scale)(opt-4+4)); hue=100; }
+                    }
+                    else if (opt >= 8 && opt < 12)  { show=true; sel=(arpMode==opt-7);                  hue=20;  }
+                    else if (opt >= 12 && opt < 16) { show=true; sel=(noteMap.getOctave()==kOctOpts[opt-12]); hue=200; }
+                    break;
+                case OVERLAY_ENV:
+                    if (opt < ENV_PRESET_COUNT) { show=true; sel=(currentEnv==(EnvPreset)opt); hue=170; }
+                    break;
+                case OVERLAY_SEQ_OPT:
+                    if (opt < 3)          { show=true; sel=((uint8_t)seqPlayMode==opt); hue=150; }
+                    else if (opt==3||opt==4) { show=true; sel=false; hue=60; }
+                    break;
+                case OVERLAY_SAMP_OPT:
+                    if (opt < 4)  { show=true; sel=((uint8_t)samplePlayMode==opt); hue=60; }
+                    else if (opt==4) { show=true; sel=false; hue=0; }
+                    break;
+                case OVERLAY_303:
+                    if      (opt==0)             { show=true; sel=(t303Wave==SAW_DOWN);                hue=0;   }
+                    else if (opt==1)             { show=true; sel=(t303Wave==PULSE);                   hue=0;   }
+                    else if (opt==2)             { show=true; sel=t303SlideOn;                         hue=150; }
+                    else if (opt==3)             { show=true; sel=t303AccentOn;                        hue=40;  }
+                    else if (opt>=4 && opt<=7)   { show=true; sel=(t303Oct==(int8_t)((int)opt-6));    hue=200; }
+                    else if (opt>=8 && opt<=11)  { show=true; sel=(arpMode==(int)(opt-8));             hue=20;  }
+                    break;
+                case OVERLAY_303_PRESET:
+                    if (opt < T303_TONE_COUNT) { show=true; sel=(t303ToneIdx==opt); hue=(uint8_t)(opt*20+60); }
+                    break;
+                default: break;
+            }
+            // 100% brightness; amber pour sélectionné, hue catégorie pour disponible
+            if (show) leds[ledIdx] = sel ? CHSV(35, 255, 255) : CHSV(hue, 255, 255);
+        }
+    }
+
+    FastLED.show();
+}
+
+static void ledUpdateTask(void*)
+{
+    for (;;) {
+        // Wake immediately on key press or after 20ms (50Hz for animations).
+        xSemaphoreTake(s_ledSem, pdMS_TO_TICKS(20));
+        updateLedsAndShow();
+    }
+}
+
+// ==================== STATS TASK ====================
+static volatile uint32_t s_mainLoopCount = 0;  // incremented each loop() iteration
+
+// Prints system health to Serial every second: temperature, heap, keyboard and main-loop stats.
+// Runs at priority 1 on Core 0 — only executes when everything else is idle.
+static void statsTask(void*)
+{
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        float    temp  = temperatureRead();
+        uint32_t freeH = esp_get_free_heap_size();
+        uint32_t minH  = esp_get_minimum_free_heap_size();
+
+        uint32_t kbdPolls = 0, kbdMaxIv = 0;
+        kbdGetStats(kbdPolls, kbdMaxIv);
+
+        uint32_t loopHz = s_mainLoopCount;
+        s_mainLoopCount = 0;
+
+        Serial.printf("[SYS] %.0f°C  heap=%lu(min=%lu)  kbd=%lu/s maxIv=%lums  loop=%lu/s\n",
+                      temp, freeH, minH, kbdPolls, kbdMaxIv, loopHz);
+    }
+}
+
+// ==================== AUDIO EVENT BRIDGE ====================
+// kbdEventBridge runs on Core 0 (kbdPollTask, priority 8).
+// It only enqueues the event and wakes the LED task — no AMY calls here.
+// AMY calls happen in audioHandlerTask (Core 1, priority 22) to avoid racing with
+// AMY render (Core 0, priority 23) which preempts Core-0 tasks mid-write.
+static QueueHandle_t s_audioEventQueue = nullptr;
+
+static void kbdEventBridge(uint8_t row, uint8_t col, bool pressed)
+{
+    if (s_audioEventQueue) {
+        KeyEvent evt = {row, col, pressed};
+        xQueueSend(s_audioEventQueue, &evt, 0);  // non-blocking
+    }
+    if (s_ledSem) xSemaphoreGive(s_ledSem);
+}
+
+// ==================== NOTE KEY AUDIO HANDLER ====================
+// Called from audioHandlerTask (Core 1, priority 22).
+// Running on Core 1 keeps AMY state writes on the same core as before,
+// avoiding races with AMY render (Core 0). Priority 22 beats the main loop (1)
+// so events are processed as soon as AMY fill buffer (23) yields.
+static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
+{
+    if (menuOpen || !audioReady || s_overlay != OVERLAY_NONE) return;
+    switch(currentMode){
+        case MODE_SYNTH:{
+            uint8_t note;
+            if (kbdLayout == KBD_LAYOUT_PIANO) {
+                note = pianoNote(row, col, (uint8_t)(48 + noteMap.getOctave()*12));
+                if (note == 0xFF) return;
+            } else {
+                note = noteMap.getMidiNote(row, col);
+            }
+            activeNotes[row][col]=pressed?note:0;
+            if(arpMode==0){
+                if(pressed){
+                    float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                    audioNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f));
+                } else audioNoteOff(note);
+            } else {
+                // Arp: add/remove from held notes list
+                if(pressed){
+                    bool found=false;
+                    for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){found=true;break;}
+                    if(!found&&arpNoteCount<32) arpNotes[arpNoteCount++]=note;
+                } else {
+                    for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){
+                        memmove(&arpNotes[i],&arpNotes[i+1],(arpNoteCount-i-1));
+                        arpNoteCount--;
+                        break;
+                    }
+                    if(arpNoteCount==0&&arpCurrent!=0){audioNoteOff(arpCurrent);arpCurrent=0;}
+                }
+            }
+            break;
+        }
+        case MODE_OMNI:{
+            if(pressed){
+                // Release previous chord
+                if(omniRoot!=0xFF) for(int i=0;i<3;i++) audioNoteOff(omniChordNotes[i]);
+                uint8_t ni, ct; bool valid=true;
+                if(row>=1&&row<=3){
+                    ni=(uint8_t)(7-col);   // col0(right)=E(7)..col7(left)=Eb(0)
+                    ct=(uint8_t)(3-row);   // row3(top)=Maj(0), row2=min(1), row1=7th(2)
+                } else {                   // row==0: B chords at cols 0-2
+                    ni=8;
+                    if(col<3) ct=(uint8_t)col;
+                    else valid=false;
+                }
+                if(valid){
+                    omniRoot=ni; omniType=ct;
+                    uint8_t base=(uint8_t)(48+omniNoteOff[ni]+noteMap.getOctave()*12);
+                    for(int i=0;i<3;i++){
+                        omniChordNotes[i]=base+omniChordInt[ct][i];
+                        audioNoteOn(omniChordNotes[i],0.5f);
+                    }
+                }
+            }
+            break;
+        }
+        case MODE_DRUMS:{
+            if(pressed) audioPlayDrumPad((uint8_t)(row*8+col), volume);
+            break;
+        }
+        case MODE_SAMPLE:{
+            uint8_t kidx=(uint8_t)(row*8+col);
+            if(pressed){
+                if(sampleMap[row][col].length()>0){
+                    if(audioKeyLoaded(kidx)){
+                        if(samplePlayMode==3){  // Solo: stop all before playing
+                            for(uint8_t k=0;k<SAMPLE_KEY_COUNT;k++) audioStopKey(k);
+                        }
+                        audioPlayKey(kidx, volume);
+                        if(samplePlayMode==2){  // Loop: schedule first retrigger
+                            uint32_t len=audioKeyLengthMs(kidx);
+                            sampleLoopNext[kidx]=millis()+(len>50?len:500);
+                        }
+                    } else {
+                        // Assigned but not loaded: re-queue the load; key will play on next press once ready.
+                        audioLoadKey(sampleMap[row][col].c_str(), kidx);
+                    }
+                } else if(sdReady&&sdCursor<sdFileCount&&!sdFileIsDir[sdCursor]){
+                    String fp=buildSdFilePath();
+                    sampleMap[row][col]=fp;
+                    audioLoadKey(fp.c_str(), kidx);
+                    Serial.printf("ASSIGN R%dC%d -> %s\n",row,col,fp.c_str());
+                }
+            } else {  // released
+                if(samplePlayMode==1||samplePlayMode==2) audioStopKey(kidx);
+            }
+            break;
+        }
+        case MODE_SEQ:{
+            // Each row = one track on current page, each column = one step
+            if(pressed){
+                uint8_t step=(uint8_t)(KBD_COLS-1-col); // col7=step0..col0=step7
+                uint8_t track=seqPage*4+row;
+                seqTrackSel = row;  // highlight pressed track on OLED
+                bool wasSet=seqPattern[track][step];
+                seqPattern[track][step]=!wasSet;
+                // Preview sample when activating a step
+                if(!wasSet && audioKeyLoaded(SEQ_KEY_BASE+track))
+                    audioPlayKey(SEQ_KEY_BASE+track, volume);
+            }
+            break;
+        }
+        case MODE_MODULAR:{
+            uint8_t note=noteMap.getMidiNote(row,col);
+            activeNotes[row][col]=pressed?note:0;
+            if(pressed){
+                // Joystick X → velocity: center=0.8, full tilt = ±0.6
+                float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                float vel=constrain(0.8f+jx*0.6f, 0.05f, 1.5f);
+                audioNoteOn(note, vel);
+            } else {
+                audioNoteOff(note);
+            }
+            break;
+        }
+        case MODE_HYBRID:{
+            uint8_t note=noteMap.getMidiNote(row,col);
+            uint8_t kidx=(uint8_t)(row*8+col);
+            activeNotes[row][col]=pressed?note:0;
+            if(pressed){
+                float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                audioNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f));
+                if(sampleMap[row][col].length()>0 && audioKeyLoaded(kidx))
+                    audioPlayKey(kidx, volume);
+            } else {
+                audioNoteOff(note);
+                audioStopKey(kidx);
+            }
+            break;
+        }
+        case MODE_LIGHTPLAY:{
+            if(pressed){
+                // Find the first free (dim) ripple slot
+                uint8_t slot=0;
+                for(uint8_t i=0;i<8;i++) if(ripples[i].bright<10){slot=i;break;}
+                int gr=KBD_ROWS-1-row, gc=KBD_COLS-1-col;
+                int li=crdToIdx(gr*KBD_COLS+gc,0);
+                if(li>=0&&li<NUM_LEDS){
+                    ripples[slot]={(int8_t)li,0.0f,(uint8_t)((row*8+col)*37+80),220};
+                }
+                // Also play the note for sound feedback
+                audioNoteOn(noteMap.getMidiNote(row,col),0.6f);
+            } else {
+                audioNoteOff(noteMap.getMidiNote(row,col));
+            }
+            break;
+        }
+        case MODE_SYNTH2:{
+            uint8_t note=noteMap.getMidiNote(row,col);
+            activeNotes[row][col]=pressed?note:0;
+            if(pressed){
+                float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                audioNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f));
+            } else audioNoteOff(note);
+            break;
+        }
+        case MODE_303: {
+            uint8_t base;
+            if (kbdLayout == KBD_LAYOUT_PIANO) {
+                base = pianoNote(row, col, (uint8_t)(48 + noteMap.getOctave()*12));
+                if (base == 0xFF) return;
+            } else {
+                base = noteMap.getMidiNote(row, col);
+            }
+            uint8_t note = (uint8_t)constrain((int)base + (int)t303Oct * 12, 0, 127);
+            if (arpMode != 0) {
+                // Arp mode: manage arpNotes[] like SYNTH does; arp loop calls audioT303NoteOn
+                if (pressed) {
+                    bool found=false;
+                    for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){found=true;break;}
+                    if(!found&&arpNoteCount<32) arpNotes[arpNoteCount++]=note;
+                } else {
+                    for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){
+                        memmove(&arpNotes[i],&arpNotes[i+1],(arpNoteCount-i-1));
+                        arpNoteCount--;
+                        break;
+                    }
+                    if(arpNoteCount==0&&arpCurrent!=0){audioT303NoteOff(arpCurrent);arpCurrent=0;}
+                }
+                break;
+            }
+            // Direct play (no arp)
+            if (pressed) {
+                if (t303SlideOn && t303CurrentNote != 0) {
+                    float initSemis = (float)(int8_t)((int)t303CurrentNote - (int)note);
+                    audioT303PitchBend(powf(2.0f, initSemis / 12.0f));
+                    t303SlideFrom = t303CurrentNote;
+                    t303SlideTo   = note;
+                    t303SlideMs   = millis();
+                    t303SlideActive = true;
+                } else {
+                    t303SlideActive = false;
+                    audioT303PitchBend(1.0f);
+                }
+                { float jx303=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                  float vel303=constrain((t303AccentOn?1.2f:0.7f)+jx303*0.4f,0.1f,1.5f);
+                  audioT303NoteOn(note, vel303); }
+                t303CurrentNote  = note;
+                t303PressedRow   = (int8_t)row;
+                t303PressedCol   = (int8_t)col;
+            } else {
+                if ((int8_t)row == t303PressedRow && (int8_t)col == t303PressedCol) {
+                    audioT303NoteOff(note);
+                    t303CurrentNote = 0;
+                    t303PressedRow  = -1;
+                    t303PressedCol  = -1;
+                }
+            }
+            break;
+        }
+        case MODE_MOD2:{
+            uint8_t note=noteMap.getMidiNote(row,col);
+            activeNotes[row][col]=pressed?note:0;
+            if(pressed){
+                float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                float vel=constrain(0.8f+jx*0.6f, 0.05f, 1.5f);
+                if(mod2PlayMode==MOD2_MONO){
+                    if(mod2LastNote!=0) audioNoteOff(mod2LastNote);
+                    audioNoteOn(note, vel);
+                    mod2LastNote=note;
+                } else if(mod2PlayMode==MOD2_SLIDE){
+                    if(mod2LastNote!=0 && mod2LastNote!=note){
+                        // Start glide: keep old note playing, bend toward new note
+                        slideFromNote=mod2LastNote; slideToNote=note;
+                        slideStartMs=millis(); slideActive=true;
+                    } else {
+                        // No previous note: play directly
+                        audioNoteOn(note, vel);
+                        mod2LastNote=note;
+                    }
+                } else {
+                    // Poly
+                    audioNoteOn(note, vel);
+                    mod2LastNote=note;
+                }
+            } else {
+                // Cancel slide if releasing the source note
+                if(slideActive && note==slideFromNote){
+                    slideActive=false;
+                    audioNoteOff(slideFromNote);
+                    mod2LastNote=0;
+                    audioSetPitchBend(1.0f);
+                } else {
+                    audioNoteOff(note);
+                    if(note==mod2LastNote) mod2LastNote=0;
+                }
+            }
+            break;
+        }
+        case MODE_GRANULAR: {
+            if (!granComputed) break;
+            uint8_t oscIdx = (uint8_t)(row * 8 + col);
+            if (pressed) {
+                uint16_t preset = granPresetForKey(row, col);
+                bool   loop    = granIsLoop(row);
+                audioPlayGranularSlice(oscIdx, preset, volume, loop);
+                granKeyHeld = true;
+                // Slice index = col position (0=left/start of sample, 7=right)
+                if ((granSubMode & 1u) == 0) {
+                    granPlayingSlice = (int8_t)(7u - col);  // 8-slice: all rows share same 0-7 index
+                } else {
+                    // 16-slice: rows 0/2 → 0-7, rows 1/3 → 8-15
+                    granPlayingSlice = (row == 1 || row == 3) ? (int8_t)(15u - col) : (int8_t)(7u - col);
+                }
+                // Re-sync pot baselines so the pot's current physical position becomes the new
+                // delta reference — both directions are accessible regardless of where the pot sits.
+                granPotNeedsSync = true;
+            } else {
+                audioStopGranularOsc(oscIdx);
+                granKeyHeld = false;
+                // granPlayingSlice intentionally kept: pots still control last played slice
+            }
+            break;
+        }
+        case MODE_GRANULAR2: {
+            uint8_t sampleIdx, sliceIdx; bool reverse;
+            gran2KeyInfo(row, col, sampleIdx, sliceIdx, reverse);
+            if (sampleIdx >= gran2NumSamples()) break;
+            if (!gran2[sampleIdx].computed) break;
+            uint8_t keyOsc = (uint8_t)(row * 8 + col);
+            if (pressed) {
+                if (gran2PlayMode == 2) {
+                    // FUL: build [tail_from_slice, full_sample] buffer → "N 0 1 2 N 0 1 2…"
+                    float sf = reverse
+                        ? (1.0f - gran2[sampleIdx].splits[sliceIdx + 1])
+                        :          gran2[sampleIdx].splits[sliceIdx];
+                    audioPlayGranular2Ful(keyOsc, sampleIdx, reverse, volume, sf);
+                } else {
+                    audioPlayGranular2(keyOsc, sampleIdx, sliceIdx, reverse, volume, gran2PlayMode);
+                }
+                gran2ActiveSample = (int8_t)sampleIdx;
+                gran2ActiveSlice  = (int8_t)sliceIdx;
+                gran2PotNeedsSync = true;
+            } else {
+                audioStopGranular2(keyOsc);
+                // keep gran2ActiveSample/Slice for pot control after release
+            }
+            break;
+        }
+        case MODE_TRACKER: {
+            if (col < 4) {
+                // Left 4×4: instrument selector; press again on selected synth track → cycle shape
+                if (pressed) {
+                    uint8_t instrIdx = (uint8_t)(row * 4 + col);
+                    if (instrIdx == trkInstr && instrIdx < TRACKER_SYNTHS) {
+                        trkSynthShape[instrIdx] = (trkSynthShape[instrIdx] + 1) % SHAPE_COUNT;
+                        // Apply new shape to the track's dedicated channel immediately
+                        audioSetShapeOnSynth((SynthShape)trkSynthShape[instrIdx],
+                                             (uint8_t)(TRACKER_SYNTH_CH_BASE + instrIdx));
+                    } else {
+                        trkInstr = instrIdx;
+                    }
+                }
+            } else {
+                // Right 4×4: note grid or drum pad
+                uint8_t midiNote = (uint8_t)constrain((int)kTrkNoteGrid[row][col - 4] + trkOctave * 12, 0, 127);
+                uint8_t drumPad  = (uint8_t)(row * 4 + (col - 4));  // pad 0-15 for drum track
+                if (pressed) {
+                    int8_t recVal = -1;
+                    if (trkInstr < TRACKER_SYNTHS) {
+                        // Audition on the track's own channel (not SYNTH_CH) to hear the track's shape
+                        audioTrackerNoteOn(trkInstr, midiNote, volume);
+                        recVal = (int8_t)midiNote;
+                    } else if (trkInstr == TRACKER_DRUM_TRK) {
+                        audioPlayDrumPad(drumPad, volume);
+                        recVal = (int8_t)drumPad;
+                    } else {
+                        uint8_t kidx = (uint8_t)(trkInstr - TRACKER_SAMP_BASE);
+                        if (audioKeyLoaded(kidx)) audioPlayKey(kidx, volume);
+                        recVal = 1;
+                    }
+                    if (trkRec) {
+                        uint8_t step = trkStep;
+                        if (trkPlaying) {
+                            uint32_t stepMs = 60000u / bpm / 4u;
+                            uint32_t dt = millis() - trkLastStepMs;
+                            step = (dt * 2 > stepMs) ? (uint8_t)((trkStep + 1) % TRACKER_STEPS) : trkStep;
+                        }
+                        // Chord recording: count other note-grid keys currently held.
+                        // First key of a gesture clears the step; additional simultaneous keys add to chord.
+                        int heldOthers = 0;
+                        for (int nr = 0; nr < KBD_ROWS; nr++)
+                            for (int nc = 4; nc < KBD_COLS; nc++)
+                                if ((nr != row || nc != col) && keyState[nr][nc]) heldOthers++;
+
+                        if (heldOthers == 0) {
+                            // Start fresh chord for this step
+                            for (int ci = 0; ci < TRK_CHORD_SIZE; ci++) trkNotes[trkInstr][step][ci] = -1;
+                            trkNotes[trkInstr][step][0] = recVal;
+                        } else {
+                            // Add to existing chord
+                            for (int ci = 0; ci < TRK_CHORD_SIZE; ci++) {
+                                if (trkNotes[trkInstr][step][ci] < 0) {
+                                    trkNotes[trkInstr][step][ci] = recVal;
+                                    break;
+                                }
+                            }
+                        }
+                        trkVel[trkInstr][step] = (uint8_t)(volume * 100);
+                    }
+                } else {
+                    if (trkInstr < TRACKER_SYNTHS) audioTrackerNoteOff(trkInstr, midiNote);
+                    else if (trkInstr >= TRACKER_SAMP_BASE) audioStopKey((uint8_t)(trkInstr - TRACKER_SAMP_BASE));
+                }
+            }
+            break;
+        }
+        case MODE_MIDI: {
+#if CONFIG_TINYUSB_MIDI_ENABLED
+            if (midiActive) {
+                uint8_t midiNote;
+                if (kbdLayout == KBD_LAYOUT_PIANO) {
+                    midiNote = pianoNote(row, col, (uint8_t)(midiOctave * 12));
+                    if (midiNote == 0xFF) return;
+                } else {
+                    // Grid layout matching SYNTH direction: bottom-left=low, top-right=high
+                    midiNote = (uint8_t)constrain(
+                        (int)(midiOctave*12) + (KBD_COLS-1-(int)col)*KBD_NOTE_ROWS + (int)row, 0, 127);
+                }
+                uint8_t vel = pressed ? (uint8_t)constrain((int)(volume * 127), 1, 127) : 0;
+                if (pressed) usbMIDI.noteOn(midiNote, vel, midiChannel);
+                else         usbMIDI.noteOff(midiNote, 0, midiChannel);
+            }
+#endif
+            break;
+        }
+        default: break;
+    }
+}
+
+static void audioHandlerTask(void*)
+{
+    for (;;) {
+        KeyEvent evt;
+        if (xQueueReceive(s_audioEventQueue, &evt, portMAX_DELAY))
+            handleNoteKeyAudio(evt.row, evt.col, evt.pressed);
+    }
 }
 
 // ==================== SETUP ====================
@@ -1628,7 +3161,18 @@ void setup() {
     if(SD.begin(SD_CS,SPI,20000000)){sdReady=true; Serial.println("SD OK");}
 
     audioInit();
+    s_audioEventQueue = xQueueCreate(16, sizeof(KeyEvent));
+    setNoteKeyCallback(kbdEventBridge);
+    s_ledSem = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(audioHandlerTask, "audioHdlr", 4096, nullptr, 22, nullptr, 1);
+    xTaskCreatePinnedToCore(ledUpdateTask,    "led",       3072, nullptr,  4, nullptr, 0);
+    xTaskCreatePinnedToCore(statsTask,        "stats",     4096, nullptr,  1, nullptr, 0);
 
+#if CONFIG_TINYUSB_MIDI_ENABLED
+    USB.productName("GrvEP");
+    USB.manufacturerName("GrvEP");
+    USB.begin();  // tinyusb_init() — MIDI interface already registered by global USBMIDI ctor
+#endif
     noteMap.setScale(SCALE_CHROMATIC);
     noteMap.setOctave(-1);
     for(int i=0;i<7;i++) pots[i].value=0.5f;
@@ -1636,14 +3180,16 @@ void setup() {
     pots[1].value=0.5f;  // shape (mid range)
     pots[2].value=0.0f;  // envelope (Normal)
     pots[3].value=0.0f; pots[4].value=0.0f; pots[5].value=0.0f; pots[6].value=0.0f;
+    audioSetShape(currentShape);  // apply J:PNO default immediately
     audioSetEnvelope(envTable[currentEnv]);
     audioSetVolume(pots[0].value);
+    memset(trkNotes, -1, sizeof(trkNotes));  // init tracker to empty (static 0-init would trigger step-0 notes)
     Serial.println("Ready");
 }
 
 // ==================== LOOP ====================
 void loop() {
-    pollKeyboard();   // keyboard first — shortest path to audioNoteOn
+    s_mainLoopCount++;
     amy_update();
 
     // Close overlay after 200ms feedback window
@@ -1663,251 +3209,20 @@ void loop() {
             if(pressed) overlayKeyPress(row,col);
             continue;
         }
-
-        switch(currentMode){
-            case MODE_SYNTH:{
-                uint8_t note=noteMap.getMidiNote(row,col);
-                activeNotes[row][col]=pressed?note:0;
-                if(arpMode==0){
-                    if(pressed){
-                        float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                        audioNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f));
-                    } else audioNoteOff(note);
-                } else {
-                    // Arp: add/remove from held notes list
-                    if(pressed){
-                        bool found=false;
-                        for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){found=true;break;}
-                        if(!found&&arpNoteCount<32) arpNotes[arpNoteCount++]=note;
-                    } else {
-                        for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){
-                            memmove(&arpNotes[i],&arpNotes[i+1],(arpNoteCount-i-1));
-                            arpNoteCount--;
-                            break;
-                        }
-                        if(arpNoteCount==0&&arpCurrent!=0){audioNoteOff(arpCurrent);arpCurrent=0;}
-                    }
-                }
-                break;
-            }
-            case MODE_OMNI:{
-                if(pressed){
-                    // Release previous chord
-                    if(omniRoot!=0xFF) for(int i=0;i<3;i++) audioNoteOff(omniChordNotes[i]);
-                    uint8_t ni, ct; bool valid=true;
-                    if(row>=1&&row<=3){
-                        ni=(uint8_t)(7-col);   // col0(right)=E(7)..col7(left)=Eb(0)
-                        ct=(uint8_t)(3-row);   // row3(top)=Maj(0), row2=min(1), row1=7th(2)
-                    } else {                   // row==0: B chords at cols 0-2
-                        ni=8;
-                        if(col<3) ct=(uint8_t)col;
-                        else valid=false;
-                    }
-                    if(valid){
-                        omniRoot=ni; omniType=ct;
-                        uint8_t base=(uint8_t)(48+omniNoteOff[ni]+noteMap.getOctave()*12);
-                        for(int i=0;i<3;i++){
-                            omniChordNotes[i]=base+omniChordInt[ct][i];
-                            audioNoteOn(omniChordNotes[i],0.5f);
-                        }
-                    }
-                }
-                break;
-            }
-            case MODE_DRUMS:{
-                if(pressed) audioPlayDrumPad((uint8_t)(row*8+col), volume);
-                break;
-            }
-            case MODE_SAMPLE:{
-                uint8_t kidx=(uint8_t)(row*8+col);
-                if(pressed){
-                    if(sampleMap[row][col].length()>0){
-                        if(audioKeyLoaded(kidx)){
-                            if(samplePlayMode==3){  // Solo: stop all before playing
-                                for(uint8_t k=0;k<SAMPLE_KEY_COUNT;k++) audioStopKey(k);
-                            }
-                            audioPlayKey(kidx, volume);
-                            if(samplePlayMode==2){  // Loop: schedule first retrigger
-                                uint32_t len=audioKeyLengthMs(kidx);
-                                sampleLoopNext[kidx]=millis()+(len>50?len:500);
-                            }
-                        } else {
-                            // Assigned but not loaded (e.g. load was aborted by a preview click).
-                            // Re-queue the load; key will play on next press once ready.
-                            audioLoadKey(sampleMap[row][col].c_str(), kidx);
-                        }
-                    } else if(sdReady&&sdCursor<sdFileCount&&!sdFileIsDir[sdCursor]){
-                        String fp=buildSdFilePath();
-                        sampleMap[row][col]=fp;
-                        audioLoadKey(fp.c_str(), kidx);
-                        Serial.printf("ASSIGN R%dC%d -> %s\n",row,col,fp.c_str());
-                    }
-                } else {  // released
-                    if(samplePlayMode==1||samplePlayMode==2) audioStopKey(kidx);
-                }
-                break;
-            }
-            case MODE_SEQ:{
-                // Each row = one track on current page, each column = one step
-                if(pressed){
-                    uint8_t step=(uint8_t)(KBD_COLS-1-col); // col7=step0..col0=step7
-                    uint8_t track=seqPage*4+row;
-                    seqTrackSel = row;  // highlight pressed track on OLED
-                    bool wasSet=seqPattern[track][step];
-                    seqPattern[track][step]=!wasSet;
-                    // Preview sample when activating a step
-                    if(!wasSet && audioKeyLoaded(SEQ_KEY_BASE+track))
-                        audioPlayKey(SEQ_KEY_BASE+track, volume);
-                }
-                break;
-            }
-            case MODE_MODULAR:{
-                uint8_t note=noteMap.getMidiNote(row,col);
-                activeNotes[row][col]=pressed?note:0;
-                if(pressed){
-                    // Joystick X → velocity: center=0.8, full tilt = ±0.6
-                    float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                    float vel=constrain(0.8f+jx*0.6f, 0.05f, 1.5f);
-                    audioNoteOn(note, vel);
-                } else {
-                    audioNoteOff(note);
-                }
-                break;
-            }
-            case MODE_HYBRID:{
-                uint8_t note=noteMap.getMidiNote(row,col);
-                uint8_t kidx=(uint8_t)(row*8+col);
-                activeNotes[row][col]=pressed?note:0;
-                if(pressed){
-                    float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                    audioNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f));
-                    if(sampleMap[row][col].length()>0 && audioKeyLoaded(kidx))
-                        audioPlayKey(kidx, volume);
-                } else {
-                    audioNoteOff(note);
-                    audioStopKey(kidx);
-                }
-                break;
-            }
-            case MODE_LIGHTPLAY:{
-                if(pressed){
-                    // Find the first free (dim) ripple slot
-                    uint8_t slot=0;
-                    for(uint8_t i=0;i<8;i++) if(ripples[i].bright<10){slot=i;break;}
-                    int gr=KBD_ROWS-1-row, gc=KBD_COLS-1-col;
-                    int li=crdToIdx(gr*KBD_COLS+gc,0);
-                    if(li>=0&&li<NUM_LEDS){
-                        ripples[slot]={(int8_t)li,0.0f,(uint8_t)((row*8+col)*37+80),220};
-                    }
-                    // Also play the note for sound feedback
-                    audioNoteOn(noteMap.getMidiNote(row,col),0.6f);
-                } else {
-                    audioNoteOff(noteMap.getMidiNote(row,col));
-                }
-                break;
-            }
-            case MODE_SYNTH2:{
-                uint8_t note=noteMap.getMidiNote(row,col);
-                activeNotes[row][col]=pressed?note:0;
-                if(pressed){
-                    float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                    audioNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f));
-                } else audioNoteOff(note);
-                break;
-            }
-            case MODE_303: {
-                uint8_t base = noteMap.getMidiNote(row, col);
-                uint8_t note = (uint8_t)constrain((int)base + (int)t303Oct * 12, 0, 127);
-                if (arpMode != 0) {
-                    // Arp mode: manage arpNotes[] like SYNTH does; arp loop calls audioT303NoteOn
-                    if (pressed) {
-                        bool found=false;
-                        for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){found=true;break;}
-                        if(!found&&arpNoteCount<32) arpNotes[arpNoteCount++]=note;
-                    } else {
-                        for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){
-                            memmove(&arpNotes[i],&arpNotes[i+1],(arpNoteCount-i-1));
-                            arpNoteCount--;
-                            break;
-                        }
-                        if(arpNoteCount==0&&arpCurrent!=0){audioT303NoteOff(arpCurrent);arpCurrent=0;}
-                    }
-                    break;
-                }
-                // Direct play (no arp)
-                if (pressed) {
-                    if (t303SlideOn && t303CurrentNote != 0) {
-                        float initSemis = (float)(int8_t)((int)t303CurrentNote - (int)note);
-                        audioT303PitchBend(powf(2.0f, initSemis / 12.0f));
-                        t303SlideFrom = t303CurrentNote;
-                        t303SlideTo   = note;
-                        t303SlideMs   = millis();
-                        t303SlideActive = true;
-                    } else {
-                        t303SlideActive = false;
-                        audioT303PitchBend(1.0f);
-                    }
-                    { float jx303=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                      float vel303=constrain((t303AccentOn?1.2f:0.7f)+jx303*0.4f,0.1f,1.5f);
-                      audioT303NoteOn(note, vel303); }
-                    t303CurrentNote  = note;
-                    t303PressedRow   = (int8_t)row;
-                    t303PressedCol   = (int8_t)col;
-                } else {
-                    if ((int8_t)row == t303PressedRow && (int8_t)col == t303PressedCol) {
-                        audioT303NoteOff(note);
-                        t303CurrentNote = 0;
-                        t303PressedRow  = -1;
-                        t303PressedCol  = -1;
-                    }
-                }
-                break;
-            }
-            case MODE_MOD2:{
-                uint8_t note=noteMap.getMidiNote(row,col);
-                activeNotes[row][col]=pressed?note:0;
-                if(pressed){
-                    float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                    float vel=constrain(0.8f+jx*0.6f, 0.05f, 1.5f);
-                    if(mod2PlayMode==MOD2_MONO){
-                        if(mod2LastNote!=0) audioNoteOff(mod2LastNote);
-                        audioNoteOn(note, vel);
-                        mod2LastNote=note;
-                    } else if(mod2PlayMode==MOD2_SLIDE){
-                        if(mod2LastNote!=0 && mod2LastNote!=note){
-                            // Start glide: keep old note playing, bend toward new note
-                            slideFromNote=mod2LastNote; slideToNote=note;
-                            slideStartMs=millis(); slideActive=true;
-                        } else {
-                            // No previous note: play directly
-                            audioNoteOn(note, vel);
-                            mod2LastNote=note;
-                        }
-                    } else {
-                        // Poly
-                        audioNoteOn(note, vel);
-                        mod2LastNote=note;
-                    }
-                } else {
-                    // Cancel slide if releasing the source note
-                    if(slideActive && note==slideFromNote){
-                        slideActive=false;
-                        audioNoteOff(slideFromNote);
-                        mod2LastNote=0;
-                        audioSetPitchBend(1.0f);
-                    } else {
-                        audioNoteOff(note);
-                        if(note==mod2LastNote) mod2LastNote=0;
-                    }
-                }
-                break;
-            }
-            default: break;
-        }
+        // Note audio handled immediately by handleNoteKeyAudio() via kbdPollTask callback.
     }
     if(btn1PressTime>0&&!btn1Handled&&(millis()-btn1PressTime>=600)){
-        btn1Handled=true; menuOpen=!menuOpen;
-        if(menuOpen){audioAllNotesOff();omniRoot=0xFF;menuRow=0;menuCol=0;}
+        btn1Handled=true;
+#if CONFIG_TINYUSB_MIDI_ENABLED
+        if (currentMode == MODE_MIDI) {
+            midiPotSel = (midiPotSel < 0) ? 0 : -1;  // toggle pot config mode
+        } else {
+#endif
+            menuOpen=!menuOpen;
+            if(menuOpen){audioAllNotesOff();omniRoot=0xFF;menuRow=0;menuCol=0;}
+#if CONFIG_TINYUSB_MIDI_ENABLED
+        }
+#endif
     }
 
     // ---- JOYSTICK CLICK ----
@@ -1915,6 +3230,61 @@ void loop() {
     if(click&&!lastClick){
         if(menuOpen){
             selectMenuItem();
+        } else if(currentMode==MODE_GRANULAR&&sdReady){
+            // Granular: click navigates folders or loads selected file as granular source
+            if(sdCursor<sdFileCount){
+                if(sdFiles[sdCursor]==".."){
+                    if(sdPath=="/"){audioAllNotesOff();menuOpen=true;menuRow=0;menuCol=0;}
+                    else{int ls=sdPath.lastIndexOf('/',sdPath.length()-2);sdListDir(ls<=0?"/":sdPath.substring(0,ls+1));}
+                } else if(sdFileIsDir[sdCursor]){
+                    String np=sdPath; if(!np.endsWith("/"))np+="/"; np+=sdFiles[sdCursor]; sdListDir(np);
+                } else if(isAudioFile(sdFiles[sdCursor].c_str())){
+                    granFilePath = buildSdFilePath();
+                    audioLoadGranularSource(granFilePath.c_str());
+                    granComputed = false;
+                    granWinStart = 0.0f; granWinEnd = 1.0f;
+                    granPlayingSlice = -1; granKeyHeld = false;
+                    for (int i = 0; i <= GRANULAR_MAX_SLICES; i++) granSplits[i] = 0.0f;
+                    granPotNeedsSync = true;
+                }
+            }
+        } else if(currentMode==MODE_GRANULAR2&&sdReady){
+            // Granular2: click navigates or loads file into gran2LoadTarget slot
+            if(sdCursor<sdFileCount){
+                if(sdFiles[sdCursor]==".."){
+                    if(sdPath=="/"){audioAllNotesOff();menuOpen=true;menuRow=0;menuCol=0;}
+                    else{int ls=sdPath.lastIndexOf('/',sdPath.length()-2);sdListDir(ls<=0?"/":sdPath.substring(0,ls+1));}
+                } else if(sdFileIsDir[sdCursor]){
+                    String np=sdPath; if(!np.endsWith("/"))np+="/"; np+=sdFiles[sdCursor]; sdListDir(np);
+                } else if(isAudioFile(sdFiles[sdCursor].c_str())){
+                    uint8_t t = gran2LoadTarget;
+                    // Unload the old slot first: pcm_load (inside the service task) will call
+                    // pcm_unload_preset on the source, freeing the buffer that FWD extern16
+                    // presets still reference. Stopping + unloading here prevents dangling pointers
+                    // during the load window, which caused FWD to play garbage while REV (using
+                    // its own PSRAM copy) still worked.
+                    for (uint8_t r = 0; r < KBD_NOTE_ROWS; r++) {
+                        for (uint8_t c = 0; c < KBD_COLS; c++) {
+                            uint8_t si, sl; bool rv;
+                            gran2KeyInfo(r, c, si, sl, rv);
+                            if (si == t) audioStopGranular2((uint8_t)(r * KBD_COLS + c));
+                        }
+                    }
+                    audioUnloadGranular2Slot(t);
+                    gran2[t].path     = buildSdFilePath();
+                    gran2[t].loaded   = false;
+                    gran2[t].computed = false;
+                    gran2[t].sliceCount = 0;
+                    for (int i = 0; i <= GRAN2_MAX_SLICES; i++) gran2[t].splits[i] = 0.0f;
+                    audioLoadGranular2Source(gran2[t].path.c_str(), t);
+                    // Advance load target to next empty slot if available
+                    uint8_t numSamp = gran2NumSamples();
+                    for (uint8_t ns = 1; ns < numSamp; ns++) {
+                        uint8_t next = (t + ns) % numSamp;
+                        if (!gran2[next].loaded && gran2[next].path.isEmpty()) { gran2LoadTarget = next; break; }
+                    }
+                }
+            }
         } else if((currentMode==MODE_SAMPLE||currentMode==MODE_SEQ)&&sdReady){
             if(sdCursor<sdFileCount){
                 if(sdFiles[sdCursor]==".."){
@@ -2089,183 +3459,6 @@ void loop() {
         }
     }
 
-    // ---- LEDS (20fps) ----
-    static unsigned long lastLed=0;
-    if(millis()-lastLed>=8){
-        lastLed=millis();
-        for(int i=0;i<NUM_LEDS;i++) leds[i]=CRGB::Black;
-        if(!menuOpen){
-            switch(currentMode){
-                case MODE_FX:
-                    // Active effects as colored LEDs, ordered by activation sequence
-                    for(uint8_t k=0;k<fxOrderCount;k++){
-                        uint8_t i=fxOrderList[k];
-                        int li=crdToIdx(i*2,0); if(li>=0&&li<NUM_LEDS) leds[li]=CHSV(i*60,255,255);
-                    }
-                    break;
-                case MODE_SEQ: {
-                    // Same coordinate transform as all other modes:
-                    // track t = physical row t → gr = KBD_ROWS-1-t = 4-t
-                    // step  s = physical col 7-s → gc = KBD_COLS-1-(7-s) = s
-                    static const uint8_t trackHues[4]={0,85,170,42};
-                    for(int t=0;t<4;t++) for(int s=0;s<8;s++){
-                        uint8_t track=seqPage*4+t;
-                        int idx=(4-t)*KBD_COLS + s;
-                        int li=crdToIdx(idx,0);
-                        if(li<0||li>=NUM_LEDS) continue;
-                        if(seqPattern[track][s]){
-                            bool cur=(seqPlaying&&s==(int)seqStep);
-                            leds[li]=CHSV(trackHues[t],255,cur?255:80);
-                        } else if(seqPlaying&&s==(int)seqStep){
-                            leds[li]=CHSV(trackHues[t],120,40);
-                        }
-                    }
-                    break;
-                }
-                case MODE_LIGHTPLAY: {
-                    // Decay all LEDs
-                    for(int i=0;i<NUM_LEDS;i++) if(rippleBrightMap[i]>12) rippleBrightMap[i]-=12;
-                    else rippleBrightMap[i]=0;
-                    // Update ripples
-                    for(uint8_t r=0;r<8;r++){
-                        if(ripples[r].bright<10) continue;
-                        ripples[r].radius+=0.6f;
-                        ripples[r].bright=(uint8_t)(ripples[r].bright>8?ripples[r].bright-8:0);
-                        // Light LEDs near ripple ring
-                        for(int i=0;i<NUM_LEDS;i++){
-                            // Approximate distance using LED index distance
-                            float dist=fabsf((float)i-(float)ripples[r].ledIdx);
-                            if(dist>NUM_LEDS/2) dist=NUM_LEDS-dist;
-                            float diff=fabsf(dist-ripples[r].radius);
-                            if(diff<1.8f){
-                                uint8_t b=(uint8_t)(ripples[r].bright*(1.0f-diff/1.8f));
-                                if(b>rippleBrightMap[i]) rippleBrightMap[i]=b;
-                            }
-                        }
-                    }
-                    for(int i=0;i<NUM_LEDS;i++)
-                        if(rippleBrightMap[i]>0)
-                            leds[i]=CHSV((uint8_t)(i*17+80),200,rippleBrightMap[i]);
-                    break;
-                }
-                case MODE_LIGHT: {
-                    // Scroll N consecutive LEDs along the strip
-                    static float lightPos = 0.0f;
-                    static unsigned long lastLightMs = 0;
-                    unsigned long now = millis();
-                    float dt = (now - lastLightMs) / 1000.0f;
-                    lastLightMs = now;
-                    // Speed: pot4=0 → 0.1 LED/s; pot4=1 → 36 LED/s (quadratic)
-                    float speed = 0.1f + pots[4].value * pots[4].value * 35.9f;
-                    lightPos = fmodf(lightPos + speed * dt, (float)NUM_LEDS);
-
-                    uint8_t n   = max((uint8_t)1, (uint8_t)(pots[3].value * NUM_LEDS + 0.5f));
-                    uint8_t hue = (uint8_t)(pots[5].value * 255.0f);
-                    uint8_t bri = (uint8_t)(pots[6].value * 255.0f);
-                    for (uint8_t i = 0; i < n; i++) {
-                        uint8_t idx = ((uint8_t)lightPos + i) % NUM_LEDS;
-                        leds[idx] = CHSV(hue, 255, bri);
-                    }
-                    break;
-                }
-                case MODE_303: {
-                    for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
-                        uint8_t base = noteMap.getMidiNote(r, c);
-                        uint8_t note = (uint8_t)constrain((int)base + (int)t303Oct*12, 0, 127);
-                        bool playing = (note == t303CurrentNote && t303CurrentNote != 0);
-                        bool pressed = keyState[r][c];
-                        int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
-                        int li=(idx>=0&&idx<NUM_LEDS+4)?crdToIdx(idx,0):-1;
-                        if(li<0||li>=NUM_LEDS) continue;
-                        if(playing)       leds[li] = t303AccentOn ? CHSV(40,255,255) : CHSV(0,255,255);
-                        else if(pressed)  leds[li] = CHSV(15, 220, 180);  // held but not current: warm amber
-                        else              leds[li] = CHSV(10, 180, 15);
-                    }
-                    break;
-                }
-                default:
-                    for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++)
-                        if(keyState[r][c]){
-                            int gr=KBD_ROWS-1-r,gc=KBD_COLS-1-c,idx=gr*KBD_COLS+gc;
-                            if(idx>=0&&idx<NUM_LEDS+4){int li=crdToIdx(idx,0);
-                                if(li>=0&&li<NUM_LEDS) leds[li]=CHSV((r*8+c)*37+80,255,255);}
-                        }
-                    break;
-            }
-        }
-
-        // ---- OVERLAY LEDs ----
-        // INSTR: toutes les 32 touches de notes, hue unique par shape, amber pour le sélectionné
-        // Autres overlays: cols 4-7 (4-col) ou 6-7 (2-col); même règle de couleur
-        if (s_overlay == OVERLAY_INSTR) {
-            for (uint8_t r2 = 0; r2 < KBD_NOTE_ROWS; r2++) {
-                for (uint8_t c2 = 0; c2 < KBD_COLS; c2++) {
-                    uint8_t opt = (uint8_t)((3u - r2) * 8u + (7u - c2));
-                    if (opt >= (uint8_t)SHAPE_COUNT) continue;
-                    int gr = KBD_ROWS - 1 - (int)r2;
-                    int gc = KBD_COLS - 1 - (int)c2;
-                    int idx = gr * KBD_COLS + gc;
-                    int ledIdx = (idx >= 0 && idx < NUM_LEDS + 4) ? crdToIdx(idx, 0) : -1;
-                    if (ledIdx < 0 || ledIdx >= NUM_LEDS) continue;
-                    bool sel = (currentShape == (SynthShape)opt);
-                    leds[ledIdx] = sel ? CHSV(35, 255, 255) : CHSV((uint8_t)(opt * 8), 255, 255);
-                }
-            }
-        } else if (s_overlay != OVERLAY_NONE) {
-            bool ovl4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET);
-            uint8_t nOpts = ovl4col ? 16 : 8;
-            for (uint8_t opt = 0; opt < nOpts; opt++) {
-                uint8_t r = (uint8_t)(3 - (opt & 3));
-                uint8_t colRank = opt >> 2;  // 0→col7, 1→col6, 2→col5, 3→col4
-                uint8_t c = (uint8_t)(7 - colRank);
-                int gr = KBD_ROWS - 1 - (int)r;
-                int gc = KBD_COLS - 1 - (int)c;
-                int idx = gr * KBD_COLS + gc;
-                int ledIdx = (idx >= 0 && idx < NUM_LEDS + 4) ? crdToIdx(idx, 0) : -1;
-                if (ledIdx < 0 || ledIdx >= NUM_LEDS) continue;
-                bool show = false, sel = false; uint8_t hue = 0;
-                switch (s_overlay) {
-                    case OVERLAY_FX:
-                        if (opt < FX_COUNT) { show=true; sel=fxList[opt].active; hue=(uint8_t)(opt*32); }
-                        break;
-                    case OVERLAY_SCALE_ARP:
-                        if (opt < 4 && opt < (uint8_t)SCALE_COUNT)  { show=true; sel=(noteMap.getScale()==(Scale)opt);         hue=100; }
-                        else if (opt >= 4 && opt < 8 && (opt-4+4) < (uint8_t)SCALE_COUNT) { show=true; sel=(noteMap.getScale()==(Scale)(opt-4+4)); hue=100; }
-                        else if (opt >= 8 && opt < 12)  { show=true; sel=(arpMode==opt-7);                  hue=20;  }
-                        else if (opt >= 12 && opt < 16) { show=true; sel=(noteMap.getOctave()==kOctOpts[opt-12]); hue=200; }
-                        break;
-                    case OVERLAY_ENV:
-                        if (opt < ENV_PRESET_COUNT) { show=true; sel=(currentEnv==(EnvPreset)opt); hue=170; }
-                        break;
-                    case OVERLAY_SEQ_OPT:
-                        if (opt < 3)          { show=true; sel=((uint8_t)seqPlayMode==opt); hue=150; }
-                        else if (opt==3||opt==4) { show=true; sel=false; hue=60; }
-                        break;
-                    case OVERLAY_SAMP_OPT:
-                        if (opt < 4)  { show=true; sel=((uint8_t)samplePlayMode==opt); hue=60; }
-                        else if (opt==4) { show=true; sel=false; hue=0; }
-                        break;
-                    case OVERLAY_303:
-                        if      (opt==0)             { show=true; sel=(t303Wave==SAW_DOWN);                hue=0;   }
-                        else if (opt==1)             { show=true; sel=(t303Wave==PULSE);                   hue=0;   }
-                        else if (opt==2)             { show=true; sel=t303SlideOn;                         hue=150; }
-                        else if (opt==3)             { show=true; sel=t303AccentOn;                        hue=40;  }
-                        else if (opt>=4 && opt<=7)   { show=true; sel=(t303Oct==(int8_t)((int)opt-6));    hue=200; }
-                        else if (opt>=8 && opt<=11)  { show=true; sel=(arpMode==(int)(opt-8));             hue=20;  }
-                        break;
-                    case OVERLAY_303_PRESET:
-                        if (opt < T303_TONE_COUNT) { show=true; sel=(t303ToneIdx==opt); hue=(uint8_t)(opt*20+60); }
-                        break;
-                    default: break;
-                }
-                // 100% brightness; amber pour sélectionné, hue catégorie pour disponible
-                if (show) leds[ledIdx] = sel ? CHSV(35, 255, 255) : CHSV(hue, 255, 255);
-            }
-        }
-
-        FastLED.show();
-    }
-
     // ---- SAMPLE LOOP: retrigger held keys ----
     if(currentMode==MODE_SAMPLE&&samplePlayMode==2&&!menuOpen){
         uint32_t now=millis();
@@ -2295,6 +3488,7 @@ void loop() {
         if(fabsf(volume-lv)>0.01f){
             audioSetVolume(volume);
             audioSetSampleVolume(volume);
+
             lv=volume;
         }
 
@@ -2306,13 +3500,14 @@ void loop() {
                 if(bpm<40) bpm=40; if(bpm>600) bpm=600;
                 lpBpm=pots[2].value;
                 if(fxList[5].active && audioReady) applyFxEffect(5); // re-sync delay to new BPM
+                if(fxList[8].active && audioReady) applyFxEffect(8); // re-sync resecho to new BPM
             }
         }
 
         if(audioReady&&!menuOpen){
             switch(currentMode){
                 case MODE_SYNTH: {
-                    static float lp1=-1, lp2=-1, lp3fm=-1, lp4fm=-1;
+                    static float lp1=0.5f, lp2=-1, lp3fm=-1, lp4fm=-1;  // lp1=0.5 matches initial pots[1] so J:PNO default is not overridden on first loop
                     // Pot 1 = Shape (always)
                     if(fabsf(pots[1].value-lp1)>0.01f){
                         uint8_t si=(uint8_t)(pots[1].value*((uint8_t)SHAPE_COUNT-0.01f));
@@ -2584,6 +3779,19 @@ void loop() {
                     }
                     break;
                 }
+                case MODE_MIDI: {
+#if CONFIG_TINYUSB_MIDI_ENABLED
+                    if (!midiActive) break;
+                    for (int p = 0; p < 7; p++) {
+                        if (midiPotCC[p] > 127) continue;  // 0xFF = disabled
+                        if (fabsf(pots[p].value - midiLpPots[p]) > 0.005f) {
+                            usbMIDI.controlChange(midiPotCC[p], (uint8_t)(pots[p].value * 127.f), midiChannel);
+                            midiLpPots[p] = pots[p].value;
+                        }
+                    }
+#endif
+                    break;
+                }
                 default: break;
             }
         }
@@ -2612,8 +3820,22 @@ void loop() {
         // that cause an audible pop/click on each value change.
         if (fxList[0].active && !fxList[6].active && audioReady) {
             float target = fxList[0].params[0];
-            lpfSmoothCut += (target - lpfSmoothCut) * 0.15f; // ~60ms time constant, smoother
+            float prevCut = lpfSmoothCut;
+            lpfSmoothCut += (target - lpfSmoothCut) * 0.5f; // faster convergence (~30ms to 90%)
             audioSetFilterFreq(lpfSmoothCut, fxList[0].params[1]);
+            // audioSetFilterFreq targets SYNTH_CH only — T303_CH needs its own event.
+            if (currentMode == MODE_303) {
+                amy_event t3e = amy_default_event();
+                t3e.synth = T303_CH;
+                t3e.filter_freq_coefs[COEF_CONST] = lpfSmoothCut;
+                t3e.filter_freq_coefs[COEF_EG0]   = t303EnvMod;
+                t3e.resonance = fxList[0].params[1];
+                amy_add_event(&t3e);
+            }
+            // Keep GR2 oscillators in sync while the cutoff is actively converging.
+            // Only fires during the ~10 ticks after a cutoff change (when fabsf delta > 1 Hz).
+            if (fabsf(lpfSmoothCut - prevCut) > 1.0f)
+                audioSetGranular2FilterFreq(lpfSmoothCut, fxList[0].params[1]);
         }
 
         // MODULAR: joystick Y pitch bend + LFO vibrato (10ms tick)
@@ -2722,6 +3944,26 @@ void loop() {
             }
         }
 
+        // MIDI joystick: Y=Pitch Bend (vertical), X=Modulation CC#1 (push right)
+#if CONFIG_TINYUSB_MIDI_ENABLED
+        if (currentMode == MODE_MIDI && midiActive && !menuOpen) {
+            float jx = cachedJoyX / 64.0f;  // -1..+1
+            float jy = cachedJoyY / 64.0f;
+            // Pitch Bend: Y axis (push down = bend up), ±5% deadzone
+            double pb = (fabsf(jy) > 0.05) ? (double)-jy : 0.0;
+            if (fabsf((float)pb - midiLastPB) > 0.008f) {
+                usbMIDI.pitchBend(pb, midiChannel);
+                midiLastPB = (float)pb;
+            }
+            // Modulation: X axis, full range — left(-1)=0, center=64, right(+1)=127
+            uint8_t mod = (uint8_t)constrain((int)((jx + 1.0f) * 63.5f), 0, 127);
+            if (mod != midiLastMod) {
+                usbMIDI.controlChange(1, mod, midiChannel);
+                midiLastMod = mod;
+            }
+        }
+#endif
+
         // SYNTH2: joystick Y scrolls patches (150ms debounce)
         if(currentMode==MODE_SYNTH2&&!menuOpen&&audioReady){
             static unsigned long lastS2Nav=0;
@@ -2740,6 +3982,210 @@ void loop() {
             }
         }
 
+        // GRANULAR pots: frame-by-frame delta — no jump on slice change, fully bidirectional.
+        // Pot A (pots[3]) → sx or window start.  Pot B (pots[4]) → sx+1 or window end.
+        // Split control: pure delta — the pot's movement (not position) is applied to the
+        // split. Baseline re-syncs on every key press and on state changes (sub-mode toggle,
+        // new sample load) so the pots are always responsive immediately.
+        // Bidirectional cascade keeps splits[] non-decreasing: if sx crosses a neighbor,
+        // that neighbor is pushed to sx and the propagation continues outward.
+        if (currentMode==MODE_GRANULAR && granComputed && audioReady) {
+            static float lastPA = 0.0f, lastPB = 0.0f;
+            static unsigned long winDebMs = 0;
+
+            if (granPotNeedsSync) {
+                granPotNeedsSync = false;
+                lastPA = pots[3].value;
+                lastPB = pots[4].value;
+            }
+
+            if (s_overlay == OVERLAY_FX) {
+                // FX overlay active: pots control the selected effect instead of splits.
+                if (fxList[fxSelected].active) {
+                    static float lpGranFx[4] = {-1,-1,-1,-1};
+                    static uint8_t lpGranFxSel = 0xFF;
+                    if (lpGranFxSel != fxSelected || fxPotNeedSync) {
+                        for (int p = 0; p < 4; p++) lpGranFx[p] = pots[3+p].value;
+                        lpGranFxSel = fxSelected; fxPotNeedSync = false;
+                    }
+                    bool fxChanged = false;
+                    for (int p = 0; p < 4; p++) {
+                        if (fxList[fxSelected].paramNames[p][0] == '\0') continue;
+                        if (fabsf(pots[3+p].value - lpGranFx[p]) > 0.001f) {
+                            float mn = fxList[fxSelected].paramMin[p];
+                            float mx = fxList[fxSelected].paramMax[p];
+                            if (fxSelected == 0 && p == 0)
+                                fxList[0].params[0] = mn * powf(mx/mn, pots[3].value);
+                            else
+                                fxList[fxSelected].params[p] = mn + (mx - mn) * pots[3+p].value;
+                            lpGranFx[p] = pots[3+p].value;
+                            fxChanged = true;
+                        }
+                    }
+                    if (fxChanged && fxSelected != 0) applyFxEffect(fxSelected);
+                }
+                lastPA = pots[3].value; lastPB = pots[4].value;
+            } else if (granPlayingSlice >= 0 && granPlayingSlice < granSliceCount) {
+                // --- Split control (delta, bidirectional cascade) ---
+                int x = granPlayingSlice;
+                float dpA = pots[3].value - lastPA;
+                float dpB = pots[4].value - lastPB;
+                lastPA = pots[3].value;
+                lastPB = pots[4].value;
+                bool changed = false;
+
+                // Pot A → splits[x]. All splits movable, including splits[0] (start of used region).
+                if (fabsf(dpA) > 0.002f) {
+                    granSplits[x] = constrain(granSplits[x] + dpA, 0.0f, 1.0f);
+                    for (int i = x-1; i >= 0; i--) {
+                        if (granSplits[i] > granSplits[i+1]) granSplits[i] = granSplits[i+1];
+                        else break;
+                    }
+                    for (int i = x+1; i <= granSliceCount; i++) {
+                        if (granSplits[i] < granSplits[i-1]) granSplits[i] = granSplits[i-1];
+                        else break;
+                    }
+                    changed = true;
+                }
+
+                // Pot B → splits[x+1]. All splits movable, including splits[N] (end of used region).
+                if (fabsf(dpB) > 0.002f) {
+                    granSplits[x+1] = constrain(granSplits[x+1] + dpB, 0.0f, 1.0f);
+                    for (int i = x; i >= 0; i--) {
+                        if (granSplits[i] > granSplits[i+1]) granSplits[i] = granSplits[i+1];
+                        else break;
+                    }
+                    for (int i = x+2; i <= granSliceCount; i++) {
+                        if (granSplits[i] < granSplits[i-1]) granSplits[i] = granSplits[i-1];
+                        else break;
+                    }
+                    changed = true;
+                }
+
+                if (changed) audioApplyGranularSplits(granSplits, granSliceCount);
+            } else {
+                // --- Global window control (no slice selected) ---
+                float dpA = (pots[3].value - lastPA) * 0.5f;
+                float dpB = (pots[4].value - lastPB) * 0.5f;
+                lastPA = pots[3].value; lastPB = pots[4].value;
+
+                if (fabsf(dpA) > 0.004f || fabsf(dpB) > 0.004f) {
+                    float ws = granWinStart + dpA;
+                    float we = granWinEnd   + dpB;
+                    if (ws < 0.0f) ws = 0.0f;
+                    if (we > 1.0f) we = 1.0f;
+                    if (we < ws + 0.05f) we = ws + 0.05f;
+                    if (we > 1.0f) { we = 1.0f; ws = we - 0.05f; if (ws < 0.0f) ws = 0.0f; }
+                    granWinStart = ws; granWinEnd = we;
+                    winDebMs = millis();
+                }
+                if (winDebMs && millis() - winDebMs >= 300) {
+                    winDebMs = 0;
+                    audioSetGranularWindow(granWinStart, granWinEnd);
+                    granSliceCount = audioComputeGranularSlices(granSubMode & 1u, granWaveform);
+                    granComputed = (granSliceCount > 0);
+                    if (granComputed)
+                        for (int i = 0; i <= granSliceCount; i++) granSplits[i] = i / (float)granSliceCount;
+                }
+            }
+        }
+
+        // GRANULAR2 pots: per-sample split delta control (same cascade logic as GRANULAR).
+        // Pot A (pots[3]) → splits[sliceIdx], Pot B (pots[4]) → splits[sliceIdx+1].
+        // Only affects the active sample; other samples' splits are untouched.
+        if (currentMode == MODE_GRANULAR2 && audioReady) {
+            static float g2LastPA = 0.0f, g2LastPB = 0.0f;
+            static float lpGr2Fx[4] = {-1,-1,-1,-1};
+            static uint8_t lpGr2FxSel = 0xFF;
+
+            bool anyFxActive = false;
+            for (uint8_t fi = 0; fi < FX_COUNT; fi++) if (fxList[fi].active) { anyFxActive = true; break; }
+
+            if (anyFxActive) {
+                if (fxList[fxSelected].active) {
+                    if (lpGr2FxSel != fxSelected || fxPotNeedSync) {
+                        for (int p = 0; p < 4; p++) lpGr2Fx[p] = pots[3+p].value;
+                        lpGr2FxSel = fxSelected; fxPotNeedSync = false;
+                    }
+                    bool fxChanged = false;
+                    for (int p = 0; p < 4; p++) {
+                        if (fxList[fxSelected].paramNames[p][0] == '\0') continue;
+                        if (fabsf(pots[3+p].value - lpGr2Fx[p]) > 0.001f) {
+                            float mn = fxList[fxSelected].paramMin[p];
+                            float mx = fxList[fxSelected].paramMax[p];
+                            if (fxSelected == 0 && p == 0)
+                                fxList[0].params[0] = mn * powf(mx/mn, pots[3].value);
+                            else
+                                fxList[fxSelected].params[p] = mn + (mx - mn) * pots[3+p].value;
+                            lpGr2Fx[p] = pots[3+p].value;
+                            fxChanged = true;
+                        }
+                    }
+                    if (fxChanged) {
+                        if (fxSelected != 0) {
+                            applyFxEffect(fxSelected);
+                        } else {
+                            // LPF: sync smooth value immediately so new notes use current cutoff,
+                            // then push the update to any currently-playing GR2 oscillators.
+                            lpfSmoothCut = fxList[0].params[0];
+                            audioSetGranular2FilterFreq(lpfSmoothCut, fxList[0].params[1]);
+                        }
+                    }
+                }
+                // Sync split baselines so closing FX overlay doesn't cause phantom split jumps.
+                g2LastPA = pots[3].value; g2LastPB = pots[4].value;
+            } else if (gran2ActiveSample >= 0) {
+                uint8_t as = (uint8_t)gran2ActiveSample;
+                if (as < GRAN2_MAX_SAMPLES && gran2[as].computed && gran2ActiveSlice >= 0) {
+                    if (gran2PotNeedsSync) {
+                        gran2PotNeedsSync = false;
+                        // Recenter both encoders so splits can move in either direction
+                        // regardless of where they bottomed out on the previous key press.
+                        pots[3].value = 0.5f; g2LastPA = 0.5f;
+                        pots[4].value = 0.5f; g2LastPB = 0.5f;
+                    }
+
+                    int x = gran2ActiveSlice;
+                    Gran2State& gs = gran2[as];
+                    float dpA = pots[3].value - g2LastPA;
+                    float dpB = pots[4].value - g2LastPB;
+                    g2LastPA = pots[3].value;
+                    g2LastPB = pots[4].value;
+                    bool changed = false;
+
+                    if (fabsf(dpA) > 0.002f) {
+                        gs.splits[x] = constrain(gs.splits[x] + dpA, 0.0f, 1.0f);
+                        // Cascade left: pull lower neighbours down if they overshot
+                        for (int i = x-1; i >= 0; i--) {
+                            if (gs.splits[i] > gs.splits[i+1]) gs.splits[i] = gs.splits[i+1]; else break;
+                        }
+                        // Cascade right: push upper neighbours up if they were overtaken
+                        for (int i = x+1; i <= gs.sliceCount; i++) {
+                            if (gs.splits[i] < gs.splits[i-1]) gs.splits[i] = gs.splits[i-1]; else break;
+                        }
+                        changed = true;
+                    }
+                    if (fabsf(dpB) > 0.002f) {
+                        gs.splits[x+1] = constrain(gs.splits[x+1] + dpB, 0.0f, 1.0f);
+                        // Cascade left: pull x (and lower) down if splits[x+1] went below them
+                        for (int i = x; i >= 0; i--) {
+                            if (gs.splits[i] > gs.splits[i+1]) gs.splits[i] = gs.splits[i+1]; else break;
+                        }
+                        // Cascade right: push x+2 (and higher) up if splits[x+1] overtook them
+                        for (int i = x+2; i <= gs.sliceCount; i++) {
+                            if (gs.splits[i] < gs.splits[i-1]) gs.splits[i] = gs.splits[i-1]; else break;
+                        }
+                        changed = true;
+                    }
+                    if (changed) {
+                        audioApplyGranular2Splits(as, gs.splits, gs.sliceCount, gran2PlayMode == 1);
+                        // Presets are updated in-place; the PCM renderer picks up the new loop
+                        // boundary on the next audio block without a playback reset.
+                    }
+                }
+            }
+        }
+
         // Global pitch bend via JY — SYNTH / SYNTH2 / HYBRID (MODULAR/MOD2 handle it themselves)
         if((currentMode==MODE_SYNTH||currentMode==MODE_SYNTH2||currentMode==MODE_HYBRID)&&!menuOpen&&audioReady){
             float jy=cachedJoyY/64.0f;
@@ -2747,16 +4193,79 @@ void loop() {
             audioSetPitchBend(powf(2.0f,bend/12.0f));
         }
 
-        // SD browser joystick navigation (SAMPLE and SEQ modes)
-        if((currentMode==MODE_SAMPLE||currentMode==MODE_SEQ)&&!menuOpen&&sdReady){
+        // SD browser joystick navigation (SAMPLE, SEQ, and GRANULAR — always browsable)
+        bool needsSdNav = (currentMode==MODE_SAMPLE||currentMode==MODE_SEQ)
+                       || currentMode==MODE_GRANULAR
+                       || currentMode==MODE_GRANULAR2;
+        if(needsSdNav&&!menuOpen&&sdReady){
             static unsigned long lastSdNav=0;
             float ny=cachedJoyY/64.0f;
-            uint8_t visLines=(currentMode==MODE_SEQ)?7:8;
+            bool gran2AnyComputed = false;
+            if (currentMode==MODE_GRANULAR2) for (uint8_t _s=0;_s<GRAN2_MAX_SAMPLES;_s++) if (gran2[_s].computed) { gran2AnyComputed=true; break; }
+            uint8_t visLines=(currentMode==MODE_SEQ)?7
+                            :(currentMode==MODE_GRANULAR&&!granComputed)?13
+                            :(currentMode==MODE_GRANULAR&&granComputed)?8
+                            :(currentMode==MODE_GRANULAR2&&!gran2AnyComputed)?13
+                            :(currentMode==MODE_GRANULAR2)?7:8;
             if(millis()-lastSdNav>=150){
                 if(ny<-0.3f&&sdCursor>0){sdCursor--;if(sdCursor<sdScroll)sdScroll=sdCursor;lastSdNav=millis();}
                 if(ny>0.3f&&sdCursor<sdFileCount-1){sdCursor++;if(sdCursor>=(int)(sdScroll+visLines))sdScroll=sdCursor-visLines+1;lastSdNav=millis();}
             }
         }
+
+        // ---- TRACKER: step advance + note playback ----
+        if(currentMode==MODE_TRACKER && trkPlaying && audioReady){
+            uint32_t stepMs = 60000UL / (uint32_t)bpm / 4;  // 16th note interval
+            if(millis() - trkLastStepMs >= stepMs){
+                trkLastStepMs += stepMs;
+                trkStep = (trkStep + 1) % TRACKER_STEPS;
+                for(int t=0; t<TRACKER_TRACKS; t++){
+                    float vel = (trkNotes[t][trkStep][0] >= 0) ? trkVel[t][trkStep] / 127.0f : 0.7f;
+                    if(vel < 0.05f) vel = 0.7f;
+                    if(t < TRACKER_SYNTHS){
+                        // Release previous chord notes on this track's dedicated AMY channel
+                        for(int ci=0;ci<TRK_CHORD_SIZE;ci++){
+                            if(trkPlayingNote[t][ci]>=0){
+                                audioTrackerNoteOff((uint8_t)t,(uint8_t)trkPlayingNote[t][ci]);
+                                trkPlayingNote[t][ci]=-1;
+                            }
+                        }
+                        if(trkNotes[t][trkStep][0]<0) continue;
+                        // Play all chord notes for this step on the track's own channel
+                        for(int ci=0;ci<TRK_CHORD_SIZE;ci++){
+                            if(trkNotes[t][trkStep][ci]<0) break;
+                            audioTrackerNoteOn((uint8_t)t,(uint8_t)trkNotes[t][trkStep][ci],vel);
+                            trkPlayingNote[t][ci]=trkNotes[t][trkStep][ci];
+                        }
+                    } else if(t == TRACKER_DRUM_TRK){
+                        if(trkNotes[t][trkStep][0]<0) continue;
+                        audioPlayDrumPad((uint8_t)trkNotes[t][trkStep][0], vel);
+                    } else {
+                        if(trkNotes[t][trkStep][0]<0) continue;
+                        audioPlayKey((uint8_t)(t - TRACKER_SAMP_BASE), vel);
+                    }
+                }
+            }
+        }
+
+        // ---- MIDI receive: host→LED (LaunchPad protocol) ----
+#if CONFIG_TINYUSB_MIDI_ENABLED
+        if(currentMode==MODE_MIDI && midiActive){
+            midiEventPacket_t pkt;
+            while(usbMIDI.readPacket(&pkt)){
+                uint8_t status = pkt.byte1 & 0xF0;
+                uint8_t note   = pkt.byte2;
+                uint8_t velo   = pkt.byte3;
+                if(note > 63) continue;  // LaunchPad grid is 8×8 = 64 notes
+                uint8_t r = note / 8;
+                uint8_t c = note % 8;
+                if(r < KBD_ROWS && c < KBD_COLS){
+                    if(status == 0x90 && velo > 0) midiLedVel[r][c] = velo;
+                    else                            midiLedVel[r][c] = 0;
+                }
+            }
+        }
+#endif
 
         // Menu joystick navigation
         if(menuOpen){
