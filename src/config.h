@@ -23,6 +23,10 @@ enum AppMode : uint8_t {
     MODE_GRANULAR2, // granular2: multi-sample (2 or 4), fwd+rev only, per-sample split control
     MODE_MIDI,      // USB MIDI device: keyboard → NoteOn/Off, host → LED feedback (LaunchPad)
     MODE_TRACKER,   // 32-step quantized recorder: left 4×4 = instruments, right 4×4 = notes
+    MODE_DRUM2,     // TR-808 style: 8 pads, per-pad pitch/decay/volume, sequencer, FX
+    MODE_SYSEQ,     // 16-step polyphonic synth sequencer (up to 4 notes/step)
+    MODE_303S,      // 16-step TB-303 step sequencer (note + accent + slide per step)
+    MODE_SS2,       // 16-step sample sequencer: 16 slots, per-step alteration, shared clock
     MODE_COUNT
 };
 
@@ -35,7 +39,10 @@ enum MenuItem : uint8_t {
     MENU_ABOUT, MENU_HYBRID, MENU_MODULAR,
     MENU_SYNTH2, MENU_MOD2, MENU_303,
     MENU_GRANULAR, MENU_GRANULAR2, MENU_MIDI,
-    MENU_TRACKER, MENU_ITEM_COUNT
+    MENU_TRACKER, MENU_DRUM2, MENU_SYSEQ,
+    MENU_303S,
+    MENU_SS2,
+    MENU_ITEM_COUNT
 };
 static const char* menuLabels[] = {
     "SYNTH","OMNI","DRUMS",
@@ -44,7 +51,9 @@ static const char* menuLabels[] = {
     "BATT","HYBRD","MODUL",
     "SYN2","MOD2","303",
     "GRAN","GR2","MIDI",
-    "TRKR"
+    "TRKR","DR2","SSEQ",
+    "303S",
+    "SS2"
 };
 #define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
 
@@ -144,7 +153,7 @@ static const char* fxNames[] = {"LPF","DRIVE","DELAY","REVERB"};
 #define DRUM_PAD_COUNT       32  // 32 unique drum samples (one per key)
 #define DRUM_SAMPLERATE    8000  // 16kHz source / 2 for hardware 2x compensation
 #define SAMPLE_PRESET_BASE  200  // AMY presets 200-231 for key-assigned samples
-#define SAMPLE_OSC_BASE     110  // AMY oscillators 110-141 for key sample playback
+#define SAMPLE_OSC_BASE     182  // AMY oscillators 182-213 for key sample playback (above SYNTH_CH range 125-148 and GRANULAR 150-181)
 #define SAMPLE_KEY_COUNT     32  // 4×8 keys, each can hold one RAM-loaded sample
 
 // ==================== GRANULAR ====================
@@ -182,6 +191,7 @@ static const char* fxNames[] = {"LPF","DRIVE","DELAY","REVERB"};
 #define GRAN2_FWD_BASE     277   // AMY presets 277-308 (4 samples × 8 slices, fwd)
 #define GRAN2_REV_BASE     309   // AMY presets 309-340 (4 samples × 8 slices, rev)
 #define GRAN2_TAIL_BASE    341   // AMY presets 341-344 (1 per sample): full-reversed buffer for FUL-reverse mode
+#define SAMPLE_REV_PRESET_BASE 345  // AMY presets 345-360: reversed copies of SS2 slots (keyIdx 0-15)
 // OSCs: reuse GRANULAR_OSC_BASE (150-181), modes are mutually exclusive
 
 // ==================== TRACKER ====================
@@ -196,6 +206,13 @@ static const char* fxNames[] = {"LPF","DRIVE","DELAY","REVERB"};
 // ==================== BUTTON LABELS ====================
 // SEQ key base: use the last 8 slots of the SAMPLE key space (keyIdx 24-31) for 8 sequencer tracks
 #define SEQ_KEY_BASE 24
+
+// ==================== SS2 ====================
+// SS2 reuses the first 16 SAMPLE key slots (keyIdx 0-15, presets 200-215, oscs 182-197).
+// SS2 and SAMPLE mode cannot both have samples loaded simultaneously,
+// but since they're separate modes, samples persist until the user reloads in the other mode.
+#define SS2_SLOTS    16
+#define SS2_KEY_BASE  0   // keyIdx 0-15
 
 // MOD2 waveform morph: 3 zones across encoder range
 static const SynthShape mod2ShapeSteps[] = {
@@ -237,5 +254,11 @@ static const char* btnLabels[][4] = {
     {"OSC","Env","Flt","Oct"},      // MODULAR — btn1=env / btn3=oct
     {"Ptch-","Ptch+","","Oct"},     // SYNTH2 — patch ±1 / octave
     {"LFO","Mode","Oct",""},        // MOD2 — LFO mode / Poly-Mono / octave
-    {"FX","Wv/Arp","Sus","Tone"},    // 303 — btn0=FX, btn1=Wave/Oct/Acc/Sld/Arp overlay, btn2=Sustain toggle, btn3=Tone presets
+    {"FX","Wv/Arp","Sus","Tone"},    // 303
+    {"","","",""},                  // GRANULAR (15)
+    {"","","",""},                  // GRANULAR2 (16)
+    {"","","",""},                  // MIDI (17)
+    {"","","",""},                  // TRACKER (18)
+    {"FX","Ply","Rec","Seq"},       // DRUM2 — btn0=FX, btn1=Play/Stop, btn2=Rec, btn3=Seq/Pad
+    {"FX","Ply","Env","Seq"},       // SYSEQ — btn0=FX, btn1=Play/Stop, btn2=Env, btn3=Seq/Pad
 };

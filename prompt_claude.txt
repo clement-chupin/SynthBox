@@ -1,0 +1,124 @@
+Pour les séquenceurs (Drums, Samples, Synth, 303),
+Je veux les noms SDru, SSmp Ssyn S303
+J'ai soit le mode tempo first, soit le mode note first pour l'attribution des notes sur le tempo
+mode tempo first : on appuie sur le tempo auquel on veut attribué des notes, et on appuie sur les notes en question, actuellement, le Ssyn
+mode note first : on joue une note / sample / drum sur la partie des notes, on peut obtenir des altérations sur cette partie via la ligne d'altération pour les drums, ou la touche d'altération pour la 303 et Samples
+on appelera élément = notes / sample / drums
+puis on place ces éléments sur les tempo
+
+on aura :
+2 lignes de 8 touche de tempo
+2 lignes de 8 touches d'éléments, ce qui permet pour tous les séquenceur d'avoir 16 tempo
+et 
+SDru : 8 drums, 8 altérations
+SSmp : 16 samples
+Ssyn : 16 notes
+S303 : 16 notes
+
+attention, joué une autre élément ne doit pas affecté le dernier tempo
+il est également possible de placé le même éléments sur plusieurs tempo sans ré appuyer sur l'élément
+le S303 a la subtilité d'accueillir uniquement une seule note par tempo, le placement d'un note sur un tempo ecrase le tempo précédent
+pour le silence, possible dans tous les modes, on réappuie sur l'élément actuellement activé
+le silence spécifique à la 303, il suffit d'essayer de placé une même note sur une note déja activé
+donc placement de note différentes = ecrasé la note
+donc placement de note pareille = désactivé la note
+
+
+Pour les altérations, on a :
+mode SDrum =
+    mode aléatoire : on joue la note avec une probabilité de 50%
+    mode double : on joue 2 fois de suite la note
+    mode pitch aléatoire : on joue la note avec un pitch aléatoire
+mode S303 = 
+    mode accentué : note plus forte avec une ouverture du cutoff pour laissé passé les fréquence plus aigue
+    mode slide : vient partir de la note précédente pour faire un slide sur la note actuellement
+mode SSmp
+    mode reverse : le sample est joué à l'envers
+    mode full : le sample est joué en entier, et n'est pas coupé quand on passe aux notes suivantes
+mode Ssyn 
+    mode full : la note joué en continu jusqu'à ce que n'importe quel autre note soit joué sur les tempo suivants 
+
+
+
+Pour ces séquenceur, je veux que les touches de fonctions soient :
+B1 : play/pause du séquenceur
+B2 : FX/octave/preset de son, qu'on place sur les touches différentes option permettant d'activé ou  non les FX, de sélectionné l'octave et sélectionné le preset de son (instrument pour le mode synth, forme d'onde pour la 303)
+B3 : mode rec dans le mode instrument, altérations dans le mode séquenceur
+rappel : le bouton d'altération permet d'altéré le mode de jeux et la couleur de l'élément à placé, il n'affecte pas le dernier élément placé
+B4 : passage du mode intrument au mode séquenceur
+
+Attention la difficulté se trouve dans le mode Ssmp, le séquenceur de samples qui necessite un navigateur de fichier.
+Pour le séquenceur de sample, je veux qu'il n'y ai que le mode séquenceur, on aura donc :
+B1 : play/pause du séquenceur
+B2 : FX/octave/preset de son, qu'on place sur les touches différentes option permettant d'activé ou  non les FX, de sélectionné l'octave et sélectionné le preset de son (instrument pour le mode synth, forme d'onde pour la 303)
+B3 : automap les samples sur les touches du dossier actuelle
+B4 : clear le mapping actuelle
+avec la possibilité de mappé un sample en naviguant dans les fichier et en appuyant sur la touches d'éléments pour y affecter le sample actuellement sélectionné
+
+Le joystick est libre pour les mode Drums, Synth, 303,
+on l'utilisera pour altérer le tempo/swing du séquenceur
+
+pour les potards généraux, on a :
+P1 : Volume de l'instrument
+P2 : preset d'instrument (pour affecter le Synth et 303)
+P3 : BPM synchronisé entre tous les séquenceur, on bloquera le BPM en fonction de la puissance de calcul, il est possible qu'on ne puisse pas avoir un BPM trop élevé
+
+P4-P7 :
+Drums : 
+    modifie le pitch, le volume et le decay de chacun des drums
+303 :
+    modifie le mod, le cutoff, la resonnance et la reverb de la 303
+
+
+Pour le changement de forme d'onde de la 303, je veux un système de waveform / wavefolder, qui permet via le P2 d'accéder à une large variété de formes d'ondes sonore
+
+
+
+
+On passe à d'autres changements que je veux sur mon synthé :
+Limité la resonnance à 3.0 de tous les LPF disponible, et les initialisé à 1.5 de resonnance
+Pour le LPF dans FX, le transformé en un filtre plus général, avec une initlisation en tant que LPF, mais avec en choix :
+LPF : low pass filter
+LaF : Ladder filter
+HPF : high pass filter
+BPF : band pass filter
+RBF : reject band filter
+
+Avec toujours en réglage le cutoff et la resonnance, mais un troisième potard qui vient régler le type de filter
+
+
+essaie d'implémenter un filtre Steiner :
+
+Contrairement au filtre Ladder classique qui utilise une cascade de transistors, le Steiner repose sur une topologie différente :
+    Il propose en général trois sorties simultanées :
+        LPF (Low Pass Filter) – coupe les aigus
+        HPF (High Pass Filter) – coupe les basses
+        BPF (Band Pass Filter) – ne laisse passer qu’une bande centrale
+
+    Ces trois modes sont indépendants et peuvent être mixés ensemble ou modulés séparément.
+
+    Il est souvent plus sensible à l’auto-oscillation, même sans signal en entrée.
+
+    Il réagit plus vite et de façon plus rugueuse aux modulations.
+Résultat : le filtre Steiner est idéal pour les sons 
+abrasifs, les textures modulaires, les effets criards 
+ou acides, mais peut aussi devenir sombre et liquide en
+ jouant sur la résonance et les combinaisons de modes.
+
+
+
+https://www.sud-claviers.com/synthetiseur-comprendre-les-elements-cles/
+
+
+
+
+
+
+
+
+
+
+B1 = BTN raw=3 mapped=0
+B4 = BTN raw=2 mapped=1
+B4 = BTN raw=1 mapped=2
+B4 = BTN raw=0 mapped=3

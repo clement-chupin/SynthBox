@@ -19,7 +19,7 @@ static USBMIDI usbMIDI("GrvEP");
 #endif
 // Patch names from Diapasonix (258 Juno+DX7 presets) — wrapped to avoid ODR conflict
 namespace { // anonymous namespace: translation-unit local
-#include "../other_projects/Diapasonix/display/patch_names.h"
+#include "../../other_projects/Diapasonix/display/patch_names.h"
 }
 #define SYNTH2_PATCH_COUNT 258
 
@@ -91,7 +91,8 @@ static bool fxPotNeedSync = false;
 // Overlay menu system
 enum OverlayType : uint8_t {
     OVERLAY_NONE=0, OVERLAY_FX, OVERLAY_SCALE_ARP, OVERLAY_ENV,
-    OVERLAY_INSTR, OVERLAY_SEQ_OPT, OVERLAY_SAMP_OPT, OVERLAY_303, OVERLAY_303_PRESET
+    OVERLAY_INSTR, OVERLAY_SEQ_OPT, OVERLAY_SAMP_OPT, OVERLAY_303, OVERLAY_303_PRESET,
+    OVERLAY_SYSEQ, OVERLAY_SEQB2
 };
 static OverlayType    s_overlay        = OVERLAY_NONE;
 static unsigned long  s_overlayCloseAt = 0;   // millis() when overlay auto-closes (0=no pending close)
@@ -130,10 +131,11 @@ static bool     slideActive   = false;   // slide: glide in progress
 
 // ==================== TB-303 STATE ====================
 static float         t303Cutoff      = 500.0f;    // base filter cutoff Hz
-static float         t303Reso        = 4.0f;      // resonance 1-4
+static float         t303Reso        = 1.5f;      // resonance 1-3
 static float         t303EnvMod      = 0.0f;      // filter EG depth (0=off, classic plat)
 static float         t303Decay       = 500.0f;    // EG decay ms (fixed — not pot-controlled)
-static uint8_t       t303Wave        = SAW_DOWN;  // AMY wave constant (SAW_DOWN, PULSE, TRIANGLE, SINE…)
+static uint8_t       t303Wave        = SAW_DOWN;  // AMY wave constant (SAW_DOWN, PULSE, TRIANGLE, SINE…) or T303_NAP_WAVE
+#define T303_NAP_WAVE 200   // narrow pulse sentinel: PULSE with narrow duty (~10%), P2 varies [0.01, 0.15]
 static int8_t        t303Oct         = 0;         // octave offset -1..+1
 static bool          t303AccentOn    = false;
 static bool          t303SustainOn   = false;     // OFF=pluck (clear decay), ON=held at full amp
@@ -141,7 +143,7 @@ static bool          t303SlideOn     = false;
 static uint8_t       t303CurrentNote = 0;
 static int8_t        t303PressedRow  = -1;
 static int8_t        t303PressedCol  = -1;
-static float         t303Reverb      = 0.0f;      // reverb send level 0→1 (P5)
+static float         t303Duration    = 0.5f;      // gate ratio 0→1 (P5): 0=10% of step, 1=full step
 static uint8_t       t303ToneIdx     = 0;         // selected preset index
 // Pot tracking for 303 (file-scope so preset loader can force resync)
 static float         lp303[4]        = {-1.f,-1.f,-1.f,-1.f};
@@ -167,6 +169,86 @@ static uint8_t       t303SlideFrom   = 0;         // source note
 static uint8_t       t303SlideTo     = 0;         // target note
 static unsigned long t303SlideMs     = 0;         // glide start timestamp
 
+
+// ==================== DRUM2 STATE ====================
+#define DRUM2_PADS  8
+#define DRUM2_OH    5   // open hihat → choked by CH
+#define DRUM2_CH    6   // closed hihat → chokes OH
+#define DR2_STEPS  16   // 16th-note steps per loop
+// Physical drum preset indices (within DRUM_PRESET_BASE)
+static const uint8_t kDrum2Remap[DRUM2_PADS] = {0, 2, 5, 10, 6, 9, 5, 12};
+// KK1, SN1, HHC, CLP, BNG, OHH, CHH, RDE
+static const char* kDrum2Labels[DRUM2_PADS]  = {"KK1","SN1","HHC","CLP","BNG","OHH","CHH","RDE"};
+static uint8_t       drum2Pitch[DRUM2_PADS]  = {69,69,69,69,69,69,69,69};
+static float         drum2Decay[DRUM2_PADS]  = {0,0,200,0,0,400,100,0};
+static float         drum2Volume[DRUM2_PADS] = {1,1,1,1,1,1,1,1};
+static int8_t        drum2SelPad             = 0;
+// Sequencer
+static uint8_t       drum2SeqVel[DRUM2_PADS][DR2_STEPS] = {};  // 0=off, else velocity 1-127
+static uint8_t       drum2SeqRow[DRUM2_PADS][DR2_STEPS] = {};  // row variation recorded (0-3)
+static uint8_t       drum2SeqMod[DRUM2_PADS][DR2_STEPS] = {};  // step modifier: 0=norm 1=prob 2=rpit 3=dbl
+static bool          drum2Playing    = false;
+static uint8_t       drum2Step       = 0;
+static bool          drum2RecArmed   = false;
+static bool          drum2SeqView    = false;  // false=pad view, true=step grid view
+static unsigned long drum2LastStepMs = 0;
+static unsigned long drum2PadFlashMs[DRUM2_PADS]   = {};
+static unsigned long drum2DblPendingAt[DRUM2_PADS] = {}; // scheduled "double hit" timestamp
+static uint8_t       drum2DblPitch[DRUM2_PADS]     = {}; // pitch captured for deferred doubled hit
+
+// Row variation: each keyboard row gives a different hit character
+struct Dr2RowVar { float vel; int8_t pitchOff; float decayFact; };
+static const Dr2RowVar kDr2RowVar[KBD_NOTE_ROWS] = {
+    {0.30f, -5, 0.25f},  // row 0: ghost  (very soft, low-pitched, short)
+    {0.55f, -2, 0.60f},  // row 1: soft   (quiet, slightly low, shorter)
+    {0.80f,  0, 1.00f},  // row 2: normal (baseline)
+    {1.00f, +3, 1.40f},  // row 3: accent (full vel, higher pitch, long sustain)
+};
+
+// Per-step pitch offset (kept for tick compatibility, always 0 in seq view)
+static int8_t  drum2SeqPitchOff[DRUM2_PADS][DR2_STEPS] = {};
+// Per-pad current alteration mode (Row 1 cycles this; Row 0 resets to 0)
+//   0=normal  1=prob50%  2=randpitch  3=double
+static uint8_t drum2PadAltMode[DRUM2_PADS] = {};
+static bool    drum2SelFromAlt = false;  // true if pad was last selected from the alt row
+// drum2Playing/drum2Step/drum2LastStepMs are SHARED with SYSEQ (synced sequencer)
+
+// ==================== SYSEQ STATE ====================
+#define SYSEQ_STEPS 16
+#define SYSEQ_CHORD 16   // max notes per step
+static bool     syseqSeqView   = false;
+static uint8_t  syseqSelStep   = 0;
+// syseqStep and syseq playing state use drum2Step/drum2Playing/drum2LastStepMs (shared clock)
+static uint8_t  syseqNotes[SYSEQ_STEPS][SYSEQ_CHORD] = {};  // 0=empty, else MIDI note+1
+static uint8_t  syseqVels [SYSEQ_STEPS][SYSEQ_CHORD] = {};  // velocity 1-127
+static uint8_t  syseqActive[SYSEQ_CHORD] = {};  // notes currently held by sequencer (for note-off)
+static uint8_t  syseqActiveCnt = 0;
+static uint8_t  syseqAlt    [SYSEQ_STEPS] = {};  // per-step: 0=NRM 1=FUL (hold note through empty steps)
+static bool     syseqActiveIsFull = false;        // true if currently-playing notes have FUL alt
+
+// ==================== 303S STATE ====================
+#define S303_STEPS 16
+static bool    s303SeqView    = false;
+static uint8_t s303SelStep    = 0;
+static uint8_t s303Note  [S303_STEPS] = {};  // 0=empty, else MIDI note+1
+static uint8_t s303Alt   [S303_STEPS] = {};  // per-step: 0=NRM 1=ACC 2=SLD
+static uint8_t        s303CurNote    = 0;
+static uint8_t s303SelNote    = 0;           // note selected for step placement (MIDI+1), 0=none
+static uint8_t s303PendingAlt = 0;           // alt applied at placement time (0=NRM 1=ACC 2=SLD)
+
+// ==================== SS2 STATE ====================
+static uint16_t ss2Note  [SS2_SLOTS] = {};           // step→slot bitmask: bit i = slot i plays on this step
+static uint8_t  ss2Alt   [SS2_SLOTS] = {};           // per-step: 0=NRM 1=REV 2=FUL 3=SIL
+static char     ss2Path  [SS2_SLOTS][128] = {};       // file path for each slot
+static bool     ss2Loaded[SS2_SLOTS] = {};            // true when audioLoadKey finished
+static uint8_t  ss2SelStep  = 0;
+static uint8_t  ss2SelSlot  = 0;
+static bool     ss2SeqView  = false;
+static uint8_t  ss2PlayMode = 0;  // 0=NRM (play to end) 1=OVR (new sample cuts all running)
+static uint8_t  ss2CurSlot = 0xFF;                   // slot playing from sequencer (0xFF=none)
+static uint32_t ss2LastPlayMs[SS2_SLOTS] = {};        // millis() of last trigger per slot (for FUL)
+
+// ==================== SDS STATE ====================
 
 // Light play ripple state (MODE_LIGHTPLAY)
 struct Ripple { int8_t ledIdx; float radius; uint8_t hue; uint8_t bright; };
@@ -314,6 +396,8 @@ static inline uint8_t pianoNote(uint8_t row, uint8_t col, uint8_t baseNote) {
 bool    menuOpen       = false;
 uint8_t menuRow        = 0, menuCol = 0;
 bool    lastClick      = false;
+uint32_t joyClickMs   = 0;    // millis() when joystick click started (0=not pressed)
+bool    joyLongFired  = false; // long-click action already triggered this press
 uint32_t btn1PressTime = 0;
 bool    btn1Handled    = false;
 
@@ -332,12 +416,11 @@ struct FxEffect {
 };
 
 FxEffect fxList[] = {
-    // LPF: 4-pole 24dB/oct (FILTER_LPF24 — Moog-style ladder character)
-    // Cut: 65Hz (AMY floor, ~silence at 24dB/oct) to 18kHz (fully open)
-    {"LPF",      false, {2000.0f, 4.0f,  0.0f, 0.0f},
-     {"Cut","Res","",""},
+    // FILT: general filter — type selected by Typ param (0=LPF,1=LaF/24dB,2=HPF,3=BPF)
+    {"FILT",     false, {2000.0f, 1.5f, 0.0f, 0.0f},
+     {"Cut","Res","Typ",""},
      {65.0f,   0.5f, 0.0f, 0.0f},
-     {18000.0f,  4.0f, 0.0f, 0.0f}},
+     {18000.0f, 3.0f, 3.0f, 0.0f}},
     // Overdrive: filter resonance saturation
     {"OVERDRIVE",false, {0.6f, 0.0f,  0.0f, 0.0f},
      {"Drv","","",""},
@@ -417,14 +500,19 @@ void applyFxEffect(uint8_t fx) {
         return !fxList[0].active && !fxList[1].active && !fxList[6].active;
     };
     switch (fx) {
-        case 0:  // LPF
-            Serial.printf("FX0 LPF %s cut=%.0f res=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f, on?e.params[1]:1.5f);
-            audioSetAllFilters(on ? e.params[0] : 0.0f, on ? e.params[1] : 1.5f);
+        case 0: {  // FILT — general filter (0=LPF 1=LaF/LPF24 2=HPF 3=BPF)
+            static const uint8_t kFiltAMY[] = {FILTER_LPF, FILTER_LPF24, FILTER_HPF, FILTER_BPF};
+            static const char* kFiltName[]  = {"LPF","LaF","HPF","BPF"};
+            uint8_t ti = (uint8_t)constrain((int)roundf(e.params[2]), 0, 3);
+            Serial.printf("FX0 FILT %s cut=%.0f res=%.2f typ=%s\n",
+                on?"ON":"off", on?e.params[0]:0.0f, on?e.params[1]:1.5f, kFiltName[ti]);
+            audioSetAllFiltersT(on ? e.params[0] : 0.0f, on ? e.params[1] : 1.5f,
+                                on ? kFiltAMY[ti] : FILTER_LPF24);
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
-            // Restore T303_CH native filter when FX LPF is disabled in 303 mode.
-            // (Smooth tick applies FX LPF to T303_CH while active; it stops on deactivation.)
-            if (!on && currentMode == MODE_303) audioT303Params(t303Cutoff, t303Reso, t303EnvMod, t303Decay);
+            if (!on && (currentMode == MODE_303 || currentMode == MODE_303S))
+                audioT303Params(t303Cutoff, t303Reso, t303EnvMod, t303Decay);
             break;
+        }
         case 1:  // Overdrive
             Serial.printf("FX1 OVD %s drv=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
             audioSetOverdrive(on ? e.params[0] : 0.0f);
@@ -543,6 +631,33 @@ void switchMode(AppMode newMode) {
         t303CurrentNote=0; t303SlideActive=false; t303PressedRow=-1; t303PressedCol=-1;
         applyFxEffect(2);  // restore global reverb to FX state on 303 exit
     }
+    if (currentMode==MODE_DRUM2){
+        drum2RecArmed=false;
+        // Sequencer keeps playing (shared with SYSEQ)
+    }
+    if (currentMode==MODE_SYSEQ){
+        // Stop synth notes from sequencer; keep shared clock running
+        for(uint8_t i=0;i<syseqActiveCnt;i++) audioNoteOff(syseqActive[i]);
+        syseqActiveCnt=0; syseqActiveIsFull=false;
+        // Stop held keyboard notes
+        for(uint8_t r2=0;r2<KBD_NOTE_ROWS;r2++)
+            for(uint8_t c2=0;c2<KBD_COLS;c2++)
+                if(activeNotes[r2][c2]){ audioNoteOff(activeNotes[r2][c2]); activeNotes[r2][c2]=0; }
+    }
+    if (currentMode==MODE_303S){
+        if (s303CurNote) { audioT303NoteOff(s303CurNote); s303CurNote=0; }
+        audioT303PitchBend(1.0f);
+        t303SlideActive=false;
+        for(uint8_t r2=0;r2<KBD_NOTE_ROWS;r2++)
+            for(uint8_t c2=0;c2<KBD_COLS;c2++)
+                if(activeNotes[r2][c2]){ audioT303NoteOff(activeNotes[r2][c2]); activeNotes[r2][c2]=0; }
+    }
+    if (currentMode==MODE_SS2){
+        for(uint8_t r2=0;r2<KBD_NOTE_ROWS;r2++)
+            for(uint8_t c2=0;c2<KBD_COLS;c2++)
+                activeNotes[r2][c2]=0;
+        // Keep samples in PSRAM — other sequencer modes may use them
+    }
     if (currentMode==MODE_GRANULAR)  audioUnloadGranular();
     if (currentMode==MODE_GRANULAR2) audioUnloadGranular2();
     if (currentMode==MODE_TRACKER && trkPlaying) {
@@ -585,7 +700,34 @@ void switchMode(AppMode newMode) {
     if (newMode==MODE_303 && audioReady) {
         audioT303SetSustain(t303SustainOn ? 1.0f : 0.0f);
         audioT303Init(t303Cutoff, t303Reso, t303EnvMod, t303Decay, t303Wave);
-        audioSetReverb(t303Reverb * 0.8f, 0.85f, 0.5f, 3000.0f);
+    }
+    if (newMode==MODE_DRUM2) {
+        drum2Step=0; drum2LastStepMs=millis();
+        drum2SeqView=false;
+        memset(drum2PadFlashMs,   0, sizeof(drum2PadFlashMs));
+        memset(drum2DblPendingAt, 0, sizeof(drum2DblPendingAt));
+    }
+    if (newMode==MODE_SYSEQ) {
+        syseqSelStep=0;
+        syseqSeqView=false;
+        if (audioReady) { audioSetShape(currentShape); audioSetEnvelope(envTable[currentEnv]); }
+        // Shared clock continues if already playing; will sync on next step
+    }
+    if (newMode==MODE_303S) {
+        s303SelStep=0;
+        s303SeqView=false;
+        s303CurNote=0;
+        t303Duration = 0.5f;
+        t303Decay = 30.0f * powf(100.0f, 0.5f);   // ≈300ms at default 50%
+        lp303[2] = pots[5].value;                   // pot pickup: keep t303Duration=50% until pot moves
+        if (audioReady) audioT303Init(t303Cutoff, t303Reso, t303EnvMod, t303Decay,
+                                       t303Wave==T303_NAP_WAVE ? PULSE : t303Wave);
+        // Shared clock continues if already playing
+    }
+    if (newMode==MODE_SS2) {
+        ss2SelStep=0; ss2SelSlot=0; ss2SeqView=false; ss2CurSlot=0xFF; ss2PlayMode=0;
+        if (sdReady) sdListDir(sdPath.length()>1 ? sdPath.c_str() : "/");
+        for(uint8_t i=0;i<SS2_SLOTS;i++) ss2Loaded[i] = ss2Path[i][0] && audioKeyLoaded(SS2_KEY_BASE+i);
     }
     if (newMode==MODE_GRANULAR && sdReady) { sdListDir("/"); granWinStart=0.0f; granWinEnd=1.0f; granPlayingSlice=-1; granKeyHeld=false; granPotNeedsSync=true; }
     if (newMode==MODE_GRANULAR2 && sdReady) {
@@ -668,6 +810,10 @@ void selectMenuItem() {
         case MENU_GRANULAR2: switchMode(MODE_GRANULAR2);  break;
         case MENU_MIDI:      switchMode(MODE_MIDI);       break;
         case MENU_TRACKER:   switchMode(MODE_TRACKER);    break;
+        case MENU_DRUM2:     switchMode(MODE_DRUM2);       break;
+        case MENU_SYSEQ:     switchMode(MODE_SYSEQ);       break;
+        case MENU_303S:      switchMode(MODE_303S);        break;
+        case MENU_SS2:       switchMode(MODE_SS2); if(sdReady) sdListDir("/"); break;
         default: break;
     }
 }
@@ -690,6 +836,7 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
         if (row >= KBD_NOTE_ROWS) { s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0; return; }
         uint8_t opt = (uint8_t)((3u - row) * 8u + (7u - col));
         if (opt < (uint8_t)SHAPE_COUNT) {
+            audioAllNotesOff();  // release active voices before resetting oscillator pool
             currentShape = (SynthShape)opt;
             audioSetShape(currentShape);
         }
@@ -697,7 +844,7 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
         return;
     }
 
-    bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET);
+    bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET || s_overlay == OVERLAY_SYSEQ || s_overlay == OVERLAY_SEQB2);
     // FX overlay needs 3 columns (col5-7) when FX_COUNT > 8; others use 2 (col6-7) or 4 (col4-7)
     uint8_t colMin = is4col ? 4u : (s_overlay == OVERLAY_FX && FX_COUNT > 8 ? 5u : 6u);
     if (col < colMin) { s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0; return; }
@@ -722,8 +869,6 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
                     applyFxEffect(opt);
                     if (opt == 0 && fxList[0].active) lpfSmoothCut = fxList[0].params[0];
                     // In 303 mode, restore 303's own reverb when FX reverb is disabled
-                    if (currentMode == MODE_303 && opt == 2 && !fxList[2].active && audioReady)
-                        audioSetReverb(t303Reverb * 0.8f, 0.85f, 0.5f, 3000.0f);
                 }
                 Serial.printf("OVL FX[%d] %s\n", opt, fxList[opt].active?"ON":"OFF");
             }
@@ -748,6 +893,8 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
                     audioT303SetAmpEnv((float)envTable[currentEnv].atk,
                                        envTable[currentEnv].sus,
                                        (float)envTable[currentEnv].rel);
+            } else if (opt >= 12 && opt < 16) {
+                noteMap.setOctave(kOctOpts[opt-12]);
             }
             break;
         case OVERLAY_SEQ_OPT:
@@ -788,6 +935,18 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
             else if (opt >= 4 && opt <= 7)   { t303Oct = (int8_t)((int)opt - 6); }  // opt4→-2, opt5→-1, opt6→0, opt7→+1
             else if (opt >= 8 && opt <= 11)  { arpMode = (opt == 8) ? 0 : (int)(opt - 8); if(arpMode==0){arpNoteCount=0; arpCurrent=0;} }
             break;
+        case OVERLAY_SYSEQ:
+            if (opt < 8 && opt < (uint8_t)SHAPE_COUNT) {
+                audioAllNotesOff();
+                currentShape = (SynthShape)opt;
+                audioSetShape(currentShape);
+            } else if (opt >= 8 && opt < 12) {
+                noteMap.setOctave(kOctOpts[opt-8]);
+            } else if (opt >= 12 && opt < 16) {
+                arpMode = (int)(opt - 12);
+                if (arpMode == 0) { arpNoteCount = 0; arpCurrent = 0; }
+            }
+            break;
         case OVERLAY_303_PRESET:
             if (opt < T303_TONE_COUNT) {
                 t303ToneIdx = opt;
@@ -803,6 +962,47 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
                 }
             }
             break;
+        case OVERLAY_SEQB2: {
+            // bx[0-8]: FX toggles, bx[9-11]: octave (pitched modes), bx[12-15]: mode preset
+            if (opt < FX_COUNT) {
+                fxSelected = opt;
+                fxList[opt].active = !fxList[opt].active;
+                if (fxList[opt].active) { fxOrderAdd(opt); fxPotNeedSync = true; }
+                else fxOrderRemove(opt);
+                if (opt == 6) {
+                    if (!fxList[6].active) {
+                        if (fxList[0].active) applyFxEffect(0);
+                        else if (fxList[1].active) applyFxEffect(1);
+                        else { audioSetAllFilters(0.0f, 1.0f); audioRestoreShapeFilter(currentShape); }
+                    }
+                } else {
+                    applyFxEffect(opt);
+                    if (opt == 0 && fxList[0].active) lpfSmoothCut = fxList[0].params[0];
+                }
+                Serial.printf("SEQB2 FX[%d] %s\n", opt, fxList[opt].active?"ON":"OFF");
+                s_overlayCloseAt = 0;  // keep overlay open after FX toggle
+                return;
+            } else if (opt >= 9 && opt < 12) {
+                // Octave -2/-1/0/+1 (index maps: 9→kOctOpts[0], 10→kOctOpts[1], 11→kOctOpts[2])
+                if (currentMode == MODE_SYSEQ)
+                    noteMap.setOctave(kOctOpts[opt - 9]);
+            } else if (opt >= 12 && opt < 16) {
+                // Preset / waveform selection — mode-specific
+                uint8_t presetIdx = opt - 12;
+                if (currentMode == MODE_SYSEQ) {
+                    // Shape selection (SHAPE 0-3 mapped on bx 12-15)
+                    if (presetIdx < (uint8_t)SHAPE_COUNT) {
+                        audioAllNotesOff();
+                        currentShape = (SynthShape)presetIdx;
+                        audioSetShape(currentShape);
+                    }
+                } else if (currentMode == MODE_SS2) {
+                    if (presetIdx == 0) ss2PlayMode = 0;  // NRM
+                    if (presetIdx == 1) ss2PlayMode = 1;  // OVR
+                }
+            }
+            break;
+        }
         default: break;
     }
     // Show selection feedback for 200ms before closing
@@ -907,6 +1107,45 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                         if (old != OVERLAY_FX) s_overlay = OVERLAY_FX;
                         break;
                     }
+                    case MODE_DRUM2:
+                        drum2Playing = !drum2Playing;
+                        if (drum2Playing) { drum2Step=0; drum2LastStepMs=millis(); }
+                        else {
+                            drum2RecArmed=false;
+                            for(uint8_t i=0;i<syseqActiveCnt;i++) audioNoteOff(syseqActive[i]); syseqActiveCnt=0; syseqActiveIsFull=false;
+                            memset(drum2DblPendingAt,0,sizeof(drum2DblPendingAt));
+                            if (s303CurNote) { audioT303NoteOff(s303CurNote); s303CurNote=0; }
+                            t303SlideActive=false; audioT303PitchBend(1.0f); ss2CurSlot=0xFF;
+                        }
+                        break;
+                    case MODE_303S:
+                        drum2Playing = !drum2Playing;
+                        if (drum2Playing) { drum2Step=0; drum2LastStepMs=millis(); }
+                        else {
+                            if (s303CurNote) { audioT303NoteOff(s303CurNote); s303CurNote=0; }
+                            audioT303PitchBend(1.0f); t303SlideActive=false;
+                            memset(drum2DblPendingAt,0,sizeof(drum2DblPendingAt));
+                        }
+                        break;
+                    case MODE_SS2:
+                        drum2Playing = !drum2Playing;
+                        if (drum2Playing) { drum2Step=0; drum2LastStepMs=millis(); ss2CurSlot=0xFF; }
+                        else {
+                            if (s303CurNote) { audioT303NoteOff(s303CurNote); s303CurNote=0; }
+                            t303SlideActive=false; audioT303PitchBend(1.0f);
+                            ss2CurSlot=0xFF; memset(drum2DblPendingAt,0,sizeof(drum2DblPendingAt));
+                        }
+                        break;
+                    case MODE_SYSEQ:
+                        drum2Playing = !drum2Playing;
+                        if (drum2Playing) { drum2Step=0; drum2LastStepMs=millis(); }
+                        else {
+                            for(uint8_t i=0;i<syseqActiveCnt;i++) audioNoteOff(syseqActive[i]); syseqActiveCnt=0; syseqActiveIsFull=false;
+                            memset(drum2DblPendingAt,0,sizeof(drum2DblPendingAt));
+                            if (s303CurNote) { audioT303NoteOff(s303CurNote); s303CurNote=0; }
+                            t303SlideActive=false; audioT303PitchBend(1.0f); ss2CurSlot=0xFF;
+                        }
+                        break;
                     default: break;
                 }
             }
@@ -986,6 +1225,112 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_303)            s_overlay=OVERLAY_303;            }
             if (btn==2) { t303SustainOn = !t303SustainOn; if(audioReady) audioT303SetSustain(t303SustainOn ? 1.0f : 0.0f); }
             if (btn==3) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_303_PRESET)     s_overlay=OVERLAY_303_PRESET;     }
+            break;
+        case MODE_DRUM2:
+            // B1(btn0)=Play handled in the btn==0 block above (must reach second switch via btn==1,2,3)
+            if (btn==1) {  // B2: FX overlay
+                OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0;
+                if (old!=OVERLAY_FX) s_overlay=OVERLAY_FX;
+            }
+            if (btn==2) {  // B3: Rec toggle
+                drum2RecArmed = !drum2RecArmed;
+            }
+            if (btn==3) {  // B4: SEQ/PAD toggle
+                drum2SeqView = !drum2SeqView;
+            }
+            break;
+        case MODE_303S:
+            // B1(btn0)=Play handled in btn==0 block above
+            if (btn==1) {  // B2: FX overlay
+                OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0;
+                if (old!=OVERLAY_FX) s_overlay=OVERLAY_FX;
+            }
+            if (btn==2) {  // B3: pending alt (SEQ) / accent toggle (PAD)
+                if (s303SeqView) {
+                    s303PendingAlt = (s303PendingAlt + 1) % 3;  // NRM→ACC→SLD→NRM
+                } else {
+                    t303AccentOn = !t303AccentOn;
+                }
+            }
+            if (btn==3) {  // B4: SEQ/PAD toggle
+                s303SeqView = !s303SeqView;
+                if (!s303SeqView) {
+                    for(uint8_t r2=0;r2<KBD_NOTE_ROWS;r2++)
+                        for(uint8_t c2=0;c2<KBD_COLS;c2++)
+                            if(activeNotes[r2][c2]){ audioT303NoteOff(activeNotes[r2][c2]); activeNotes[r2][c2]=0; }
+                }
+            }
+            break;
+        case MODE_SS2:
+            // B1(btn0)=Play handled in btn==0 block above
+            if (btn==1) {  // B2: FX overlay
+                OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0;
+                if (old!=OVERLAY_FX) s_overlay=OVERLAY_FX;
+            }
+            if (btn==2) {  // B3: cycle alt for selected step (SEQ) / automap (PAD)
+                if (ss2SeqView) {
+                    ss2Alt[ss2SelStep] = (ss2Alt[ss2SelStep] + 1) % 4;  // NRM→REV→FUL→SIL
+                } else if (sdReady) {
+                    // Unload existing slots before remapping (free PSRAM)
+                    audioClearAllKeys();
+                    for(uint8_t i=0;i<SS2_SLOTS;i++) { ss2Path[i][0]='\0'; ss2Loaded[i]=false; }
+                    uint8_t slotIdx = 0;
+                    for (int fi = 0; fi < sdFileCount && slotIdx < SS2_SLOTS; fi++) {
+                        if (!sdFileIsDir[fi] && isAudioFile(sdFiles[fi].c_str())) {
+                            char fp[256];
+                            snprintf(fp,sizeof(fp),"%s%s",sdPath.c_str(),sdFiles[fi].c_str());
+                            strncpy(ss2Path[slotIdx],fp,sizeof(ss2Path[0])-1);
+                            ss2Path[slotIdx][sizeof(ss2Path[0])-1]='\0';
+                            audioLoadKey(fp,(uint8_t)(SS2_KEY_BASE+slotIdx));
+                            slotIdx++;
+                        }
+                    }
+                }
+            }
+            if (btn==3) {  // B4: toggle PAD/SEQ view
+                ss2SeqView = !ss2SeqView;
+            }
+            break;
+        case MODE_SYSEQ:
+            // B1(btn0)=Play handled in btn==0 block above
+            if (btn==1) {  // B2: FX overlay
+                OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0;
+                if (old!=OVERLAY_FX) s_overlay=OVERLAY_FX;
+            }
+            if (btn==2) {
+                if (syseqSeqView) {  // SEQ view: B3 cycles alt for selected step
+                    static uint8_t s_syseqPendAlt = 0;
+                    s_syseqPendAlt = (s_syseqPendAlt + 1) % 2;  // 0=NRM 1=FUL
+                    syseqAlt[syseqSelStep] = s_syseqPendAlt;
+                } else {
+                    OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0;
+                    if(old!=OVERLAY_SYSEQ) s_overlay=OVERLAY_SYSEQ;
+                }
+            }
+            if (btn==3) {
+                for(uint8_t r2=0;r2<KBD_NOTE_ROWS;r2++)
+                    for(uint8_t c2=0;c2<KBD_COLS;c2++)
+                        if(activeNotes[r2][c2]){ audioNoteOff(activeNotes[r2][c2]); activeNotes[r2][c2]=0; }
+                syseqSeqView = !syseqSeqView;
+                if (syseqSeqView) {
+                    // Compact non-empty steps to consecutive positions from step 0
+                    uint8_t tmpN[SYSEQ_STEPS][SYSEQ_CHORD] = {};
+                    uint8_t tmpV[SYSEQ_STEPS][SYSEQ_CHORD] = {};
+                    uint8_t dst = 0;
+                    for (uint8_t s = 0; s < SYSEQ_STEPS; s++) {
+                        bool has = false;
+                        for (uint8_t i = 0; i < SYSEQ_CHORD; i++) if (syseqNotes[s][i]) { has = true; break; }
+                        if (has) {
+                            memcpy(tmpN[dst], syseqNotes[s], sizeof(syseqNotes[0]));
+                            memcpy(tmpV[dst], syseqVels[s],  sizeof(syseqVels[0]));
+                            dst++;
+                        }
+                    }
+                    memcpy(syseqNotes, tmpN, sizeof(syseqNotes));
+                    memcpy(syseqVels,  tmpV,  sizeof(syseqVels));
+                    syseqSelStep = 0;
+                }
+            }
             break;
         case MODE_MOD2:
             // Btn1=LFO mode (Off→Pt:SIN…Pt:S&H→Ft:SIN…Ft:S&H), Btn2=Poly/Mono, Btn3=Oct
@@ -1145,7 +1490,7 @@ void drawScreen() {
     // 4-col overlays (SCALE_ARP, 303, 303_PRESET):  4×4 grid, 32×32px par case
     if (s_overlay != OVERLAY_NONE) {
         struct OvBox { char l1[12]; char l2[14]; char l3[14]; bool avail, sel; };
-        bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET);
+        bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET || s_overlay == OVERLAY_SYSEQ || s_overlay == OVERLAY_SEQB2);
         OvBox bx[16];
         memset(bx, 0, sizeof(bx));
 
@@ -1224,7 +1569,7 @@ void drawScreen() {
                 }
                 break;
             }
-            case OVERLAY_ENV:
+            case OVERLAY_ENV: {
                 for (int i = 0; i < (int)ENV_PRESET_COUNT; i++) {
                     bx[i].avail = true; bx[i].sel = (currentEnv == (EnvPreset)i);
                     strncpy(bx[i].l1, envNames[i], sizeof(bx[i].l1)-1);
@@ -1232,7 +1577,14 @@ void drawScreen() {
                     snprintf(bx[i].l3, sizeof(bx[i].l3), "S:%d%% R:%d",
                              (int)(envTable[i].sus * 100), envTable[i].rel);
                 }
+                static const char* ol[] = {"-2","-1"," 0","+1"};
+                for (int i = 0; i < 4; i++) {
+                    bx[12+i].avail = true;
+                    strncpy(bx[12+i].l1, ol[i], sizeof(bx[12+i].l1)-1);
+                    bx[12+i].sel = (noteMap.getOctave() == kOctOpts[i]);
+                }
                 break;
+            }
             case OVERLAY_INSTR: {
                 uint8_t maxS = min((uint8_t)16, (uint8_t)SHAPE_COUNT);
                 for (uint8_t i = 0; i < maxS; i++) {
@@ -1294,11 +1646,73 @@ void drawScreen() {
                 }
                 break;
             }
+            case OVERLAY_SYSEQ: {
+                // col7 (bx 0-3): shapes 0-3 | col6 (bx 4-7): shapes 4-7
+                // col5 (bx 8-11): octave -2/-1/0/+1 | col4 (bx 12-15): arp Off/Up/Dn/Rnd
+                for (int i = 0; i < 8 && i < (int)SHAPE_COUNT; i++) {
+                    bx[i].avail = true;
+                    strncpy(bx[i].l1, shapeNames[i], sizeof(bx[i].l1)-1);
+                    bx[i].sel = (currentShape == (SynthShape)i);
+                }
+                static const char* octN[] = {"-2","-1"," 0","+1"};
+                for (int i = 0; i < 4; i++) {
+                    bx[8+i].avail = true;
+                    strncpy(bx[8+i].l1, octN[i], sizeof(bx[8+i].l1)-1);
+                    bx[8+i].sel = (noteMap.getOctave() == kOctOpts[i]);
+                }
+                static const char* arpN[] = {"Off","Up","Dn","Rnd"};
+                for (int i = 0; i < 4; i++) {
+                    bx[12+i].avail = true;
+                    strncpy(bx[12+i].l1, arpN[i], sizeof(bx[12+i].l1)-1);
+                    bx[12+i].sel = (arpMode == i);
+                }
+                break;
+            }
+            case OVERLAY_SEQB2: {
+                // col7 (bx 0-3): FX 0-3   col6 (bx 4-7): FX 4-7
+                // col5 (bx 8-11): FX 8 + octave (bx9-11)
+                // col4 (bx 12-15): mode preset (shape/wave)
+                static const char* kFiltTypAbbr[] = {"LPF","LaF","HPF","BPF"};
+                for (int i = 0; i < (int)FX_COUNT; i++) {
+                    bx[i].avail = true;
+                    bx[i].sel   = fxList[i].active;
+                    if (i == 0 && fxList[0].active) {
+                        uint8_t ti = (uint8_t)constrain((int)(fxList[0].params[2] * 3.999f), 0, 3);
+                        strncpy(bx[i].l1, kFiltTypAbbr[ti], sizeof(bx[i].l1)-1);
+                    } else {
+                        char a[4]; strncpy(a, fxList[i].name, 3); a[3]='\0';
+                        strncpy(bx[i].l1, a, sizeof(bx[i].l1)-1);
+                    }
+                }
+                // bx9-11: octave for pitched modes (not 303 — octave via joystick)
+                bool hasPitch = (currentMode == MODE_SYSEQ);
+                static const char* octNb[] = {"-2","-1"," 0","+1"};
+                for (int i = 0; i < 3; i++) {
+                    if (hasPitch) {
+                        bx[9+i].avail = true;
+                        strncpy(bx[9+i].l1, octNb[i+1], sizeof(bx[9+i].l1)-1);  // -1/0/+1
+                        bx[9+i].sel = (noteMap.getOctave() == kOctOpts[i+1]);
+                    }
+                }
+                // bx12-15: mode preset
+                if (currentMode == MODE_SYSEQ) {
+                    static const char* shapeAbbr[] = {"SIN","PLS","SWD","SWU"};
+                    for (int i = 0; i < 4 && i < (int)SHAPE_COUNT; i++) {
+                        bx[12+i].avail = true;
+                        strncpy(bx[12+i].l1, shapeAbbr[i], sizeof(bx[12+i].l1)-1);
+                        bx[12+i].sel = (currentShape == (SynthShape)i);
+                    }
+                } else if (currentMode == MODE_SS2) {
+                    bx[12].avail=true; strncpy(bx[12].l1,"NRM",sizeof(bx[12].l1)-1); bx[12].sel=(ss2PlayMode==0);
+                    bx[13].avail=true; strncpy(bx[13].l1,"OVR",sizeof(bx[13].l1)-1); bx[13].sel=(ss2PlayMode==1);
+                }
+                break;
+            }
             default: break;
         }
 
         // Render: 4-col → 32px, 3-col → 42px, 2-col → 64px cells
-        int ncols = is4col ? 4 : (s_overlay == OVERLAY_FX && FX_COUNT > 8 ? 3 : 2);
+        int ncols = is4col ? 4 : (s_overlay == OVERLAY_FX && FX_COUNT > 8 ? 3 : 2);  // SEQB2 is 4-col via is4col
         int cw    = 128 / ncols;
         for (int i = 0; i < ncols * 4; i++) {
             int gc = i / 4, gr = i % 4;
@@ -1519,84 +1933,97 @@ void drawScreen() {
             }
             // ---- SAMPLE ----
             case MODE_SAMPLE: {
-                oled.drawStr(0,0,"SAMPLE");
-                oled.drawHLine(0,9,128);
-                {char pb[22]; snprintf(pb,sizeof(pb),"%.21s",sdPath.c_str()); oled.drawStr(0,12,pb);}
+                // Same 4x6 font + 7px spacing as GR2 browser
+                oled.setFont(u8g2_font_4x6_tf);
+                {
+                    char pb[32];
+                    snprintf(pb, sizeof(pb), "SAMPLE %.24s", sdPath.c_str());
+                    oled.drawStr(0, 7, pb);
+                }
+                oled.drawHLine(0, 9, 128);
                 if(!sdReady){
-                    oled.drawStr(10,40,"SD not found");
-                    oled.drawStr(10,55,"Click = retry");
+                    oled.drawStr(10, 40, "SD not found");
+                    oled.drawStr(10, 55, "Click = retry");
                 } else {
-                    // File list — 8 items, 8px spacing keeps last item (y=76) clear of separator at y=93
-                    int vis=8;
-                    for(int i=0;i<vis&&(i+sdScroll)<sdFileCount;i++){
-                        int idx=i+sdScroll, y=20+i*8; bool sel=(idx==sdCursor);
-                        bool mapped=false;
+                    // File list — 10 items at 7px spacing (matches GR2 browse layout)
+                    for(int i = 0; i < 10 && (i + sdScroll) < sdFileCount; i++){
+                        int idx = i + sdScroll; bool sel = (idx == sdCursor);
+                        bool mapped = false;
                         if(!sdFileIsDir[idx]){
                             char fpath[80];
-                            snprintf(fpath,sizeof(fpath),"%s%s%s",
-                                sdPath.c_str(),sdPath.endsWith("/")?"":"/",sdFiles[idx].c_str());
-                            for(int r=0;r<KBD_NOTE_ROWS&&!mapped;r++)
-                                for(int c=0;c<KBD_COLS&&!mapped;c++)
-                                    if(sampleMap[r][c]==fpath) mapped=true;
+                            snprintf(fpath, sizeof(fpath), "%s%s%s",
+                                sdPath.c_str(), sdPath.endsWith("/") ? "" : "/", sdFiles[idx].c_str());
+                            for(int r = 0; r < KBD_NOTE_ROWS && !mapped; r++)
+                                for(int c = 0; c < KBD_COLS && !mapped; c++)
+                                    if(sampleMap[r][c] == fpath) mapped = true;
                         }
-                        char line[25];
+                        char line[29];
                         bool isWav = !sdFileIsDir[idx] && isWavFile(sdFiles[idx].c_str());
-                        if(sdFileIsDir[idx]) snprintf(line,sizeof(line),"%s[%s]",sel?">":"  ",sdFiles[idx].c_str());
-                        else snprintf(line,sizeof(line),"%s%s%s%s",sel?">":"  ",mapped?"*":"",isWav?"":"~",sdFiles[idx].c_str());
-                        line[24]='\0';
-                        oled.drawStr(0,y,line);
+                        if(sdFileIsDir[idx]) snprintf(line, sizeof(line), "%c[%.24s]", sel ? '>' : ' ', sdFiles[idx].c_str());
+                        else snprintf(line, sizeof(line), "%c%s%s%.25s", sel ? '>' : ' ', mapped ? "*" : "", isWav ? "" : "~", sdFiles[idx].c_str());
+                        oled.drawStr(0, 17 + i * 7, line);
+                        if(sel) oled.drawHLine(0, 18 + i * 7, 128);
                     }
                     // Mini progress grid: 4 rows × 8 cols, cells 15×3px, 1px gap between rows.
-                    // Grid starts at cy=94 so row 0 ends at y=108 — leaves clear gap before status text.
-                    // □=unassigned  ▭=loading (frame)  ▬=loaded (filled)
-                    oled.drawHLine(0, 93, 128);
-                    uint8_t nLoaded=0, nErr=0, errType=KEY_ERR_NONE;
-                    for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
-                        uint8_t kidx=(uint8_t)(r*8+c);
-                        int cx=(7-c)*16, cy=94+(3-r)*4;
-                        bool assigned=sampleMap[r][c].length()>0;
-                        bool loaded=audioKeyLoaded(kidx);
-                        uint8_t kerr=audioKeyError(kidx);
-                        if(loaded){ oled.drawBox(cx,cy,15,3); nLoaded++; }
+                    // □=unassigned  ▭=loading (frame)  ▬=loaded (filled)  ✚=error
+                    oled.drawHLine(0, 88, 128);
+                    uint8_t nLoaded = 0, nErr = 0, errType = KEY_ERR_NONE;
+                    for(int r = 0; r < KBD_NOTE_ROWS; r++) for(int c = 0; c < KBD_COLS; c++){
+                        uint8_t kidx = (uint8_t)(r * 8 + c);
+                        int cx = (7 - c) * 16, cy = 89 + (3 - r) * 4;
+                        bool assigned = sampleMap[r][c].length() > 0;
+                        bool loaded = audioKeyLoaded(kidx);
+                        uint8_t kerr = audioKeyError(kidx);
+                        if(loaded){ oled.drawBox(cx, cy, 15, 3); nLoaded++; }
                         else if(kerr){
-                            // '+' cross = load error (visible even at 15×3px)
-                            oled.drawHLine(cx,cy+1,15);
-                            oled.drawVLine(cx+7,cy,3);
-                            nErr++; errType=kerr;
+                            oled.drawHLine(cx, cy + 1, 15);
+                            oled.drawVLine(cx + 7, cy, 3);
+                            nErr++; errType = kerr;
                         }
-                        else if(assigned) oled.drawFrame(cx,cy,15,3);
+                        else if(assigned) oled.drawFrame(cx, cy, 15, 3);
                     }
-                    // Status lines (4x6 font — smaller to stay below grid with safe margin)
-                    oled.setFont(u8g2_font_4x6_tf);
-                    if(nErr>0){
-                        // Error detail on hint line so play-mode stays visible below
-                        uint32_t freeKb=(uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);
-                        const char* eStr=errType==KEY_ERR_ALLOC?"RAM":errType==KEY_ERR_FORMAT?"fmt":"I/O";
-                        snprintf(buf,sizeof(buf),"!%u %s %ukB B3=clr",nErr,eStr,(unsigned)freeKb);
-                        oled.drawStr(0,116,buf);
+                    // Status / hint lines
+                    if(nErr > 0){
+                        uint32_t freeKb = (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+                        const char* eStr = errType == KEY_ERR_ALLOC ? "RAM" : errType == KEY_ERR_FORMAT ? "fmt" : "I/O";
+                        snprintf(buf, sizeof(buf), "!%u %s %ukB B3=clr", nErr, eStr, (unsigned)freeKb);
+                        oled.drawStr(0, 111, buf);
                     } else {
-                        // FX line: show selected active effect + up to 3 params; hint if none active
                         const FxEffect& selFx = fxList[fxSelected];
-                        if (selFx.active) {
+                        if(selFx.active){
                             char fxLine[33]; snprintf(fxLine, sizeof(fxLine), "[%.3s]", selFx.name);
-                            for (int p = 0; p < 4; p++) {
-                                if (!selFx.paramNames[p][0]) continue;
+                            for(int p = 0; p < 4; p++){
+                                if(!selFx.paramNames[p][0]) continue;
                                 char fv[6]; fmtFloat(fv, sizeof(fv), selFx.params[p]);
                                 char ent[9]; snprintf(ent, sizeof(ent), " %.2s:%.4s", selFx.paramNames[p], fv);
-                                if (strlen(fxLine) + strlen(ent) < sizeof(fxLine) - 1)
+                                if(strlen(fxLine) + strlen(ent) < sizeof(fxLine) - 1)
                                     strcat(fxLine, ent);
                             }
-                            oled.drawStr(0, 116, fxLine);
+                            oled.drawStr(0, 111, fxLine);
                         } else {
-                            if(sdCursor<sdFileCount && !sdFileIsDir[sdCursor])
-                                oled.drawStr(0,116,"Key=asgn B2=map Clk=dir");
+                            if(sdCursor < sdFileCount && !sdFileIsDir[sdCursor])
+                                oled.drawStr(0, 111, "Key=asgn B2=map Clk=dir");
                             else
-                                oled.drawStr(0,116,"Clk=open  B2=mapAll");
+                                oled.drawStr(0, 111, "Clk=open  B2=mapAll");
                         }
                     }
-                    // Play-mode status always on last line
-                    snprintf(buf,sizeof(buf),"[%s] %u/%u rdy",kSplayModes[samplePlayMode],nLoaded,SAMPLE_KEY_COUNT);
-                    oled.drawStr(0,124,buf);
+                    snprintf(buf, sizeof(buf), "[%s] %u/%u rdy", kSplayModes[samplePlayMode], nLoaded, SAMPLE_KEY_COUNT);
+                    oled.drawStr(0, 119, buf);
+                    // Active FX abbreviations + BPM on last line (FILT shows type)
+                    {
+                        static const char* kFTLf[]={"LPF","LaF","HPF","BPF"};
+                        char fxstr[20] = ""; uint8_t nfx = 0;
+                        for(uint8_t fi = 0; fi < FX_COUNT; fi++){
+                            if(!fxList[fi].active) continue;
+                            if(nfx++) strncat(fxstr, " ", sizeof(fxstr) - strlen(fxstr) - 1);
+                            char a[4];
+                            if(fi==0){ strncpy(a,kFTLf[(uint8_t)constrain((int)fxList[0].params[2],0,3)],4); }
+                            else{ strncpy(a, fxList[fi].name, 3); a[3] = '\0'; }
+                            strncat(fxstr, a, sizeof(fxstr) - strlen(fxstr) - 1);
+                        }
+                        snprintf(buf, sizeof(buf), "BPM:%u FX:%s", bpm, nfx ? fxstr : "--");
+                        oled.drawStr(0, 127, buf);
+                    }
                     oled.setFont(u8g2_font_5x7_tf);
                 }
                 break;
@@ -1698,11 +2125,17 @@ void drawScreen() {
                 // Params for selected (if active)
                 if (fxList[fxSelected].active) {
                     oled.setFont(u8g2_font_4x6_tf);
+                    static const char* kFiltTypLabel[] = {"LPF","LaF","HPF","BPF"};
                     char pb[40]; int ppos = 0;
                     for (int p = 0; p < 4; p++) {
                         if (!fxList[fxSelected].paramNames[p][0]) continue;
-                        ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "%s:%.1f ",
-                                         fxList[fxSelected].paramNames[p], fxList[fxSelected].params[p]);
+                        if (fxSelected == 0 && p == 2) {
+                            uint8_t ti = (uint8_t)constrain((int)roundf(fxList[0].params[2]), 0, 3);
+                            ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "Typ:%s ", kFiltTypLabel[ti]);
+                        } else {
+                            ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "%s:%.1f ",
+                                             fxList[fxSelected].paramNames[p], fxList[fxSelected].params[p]);
+                        }
                     }
                     // ResEcho: append BPM-synced subdivision info (params[3] is internal, not named)
                     if (fxSelected == 8) {
@@ -1899,6 +2332,672 @@ void drawScreen() {
                 oled.drawStr(0,122,buf);
                 break;
             }
+            // ---- DRUM2 (TR-808 style + sequencer) ----
+            case MODE_DRUM2: {
+                // Active FX string (3-char abbrevs; FILT shows type: LPF/LaF/HPF/BPF)
+                static const char* kFTL[]={"LPF","LaF","HPF","BPF"};
+                char fxstr[32]="";
+                for(uint8_t fi=0;fi<FX_COUNT;fi++){
+                    if(!fxList[fi].active) continue;
+                    if(fxstr[0]) strncat(fxstr," ",sizeof(fxstr)-strlen(fxstr)-1);
+                    char a[4];
+                    if(fi==0){ strncpy(a,kFTL[(uint8_t)constrain((int)fxList[0].params[2],0,3)],4); }
+                    else{ strncpy(a,fxList[fi].name,3); a[3]='\0'; }
+                    strncat(fxstr,a,sizeof(fxstr)-strlen(fxstr)-1);
+                }
+                if(!fxstr[0]) strncpy(fxstr,"--",3);
+                static const char* kAltName[4]={"NRM","50%","RND","DBL"};
+                // u8g2 drawStr: y = baseline. 5x7→chars at [y-6,y+1]. 4x6→chars at [y-5,y+1].
+                // Pad strip: drawBox(x,bY,w,9) + drawStr(x,bY+7,...) puts chars at bY+2..bY+7 ✓
+                // Vol bar:   drawFrame(x,vY,100,6) + drawStr(104,vY+5,...) → label chars = bar height ✓
+
+                if(drum2SeqView){
+                    // ═══ DR2 SEQ VIEW ════════════════════════════════
+                    // Row 0: header (5x7 baseline=7 → chars y=1..8)
+                    oled.setFont(u8g2_font_5x7_tf);
+                    snprintf(buf,sizeof(buf),"SEQ %s  %d BPM  [%s]",
+                             drum2Playing?"[>]":"[ ]",bpm,kDrum2Labels[drum2SelPad]);
+                    oled.drawStr(0,7,buf);
+                    oled.drawHLine(0,9,128);
+
+                    // Step grid: 2 rows × 8 cells, 16px wide × 14px tall
+                    // Row 1: y=10..23, Row 2: y=25..38
+                    for(int half=0;half<2;half++){
+                        int cy=10+half*15;
+                        for(int sc=0;sc<8;sc++){
+                            uint8_t step=(uint8_t)(half*8+sc);
+                            int cx=sc*16;
+                            bool act=(drum2SeqVel[drum2SelPad][step]>0);
+                            bool cur=drum2Playing&&(step==(uint8_t)drum2Step);
+                            uint8_t m=act?drum2SeqMod[drum2SelPad][step]:0;
+                            if(cur){
+                                oled.drawBox(cx,cy,15,14);
+                                if(!act){oled.setDrawColor(0);oled.drawBox(cx+2,cy+3,11,8);oled.setDrawColor(1);}
+                            }else if(act){
+                                switch(m){
+                                    case 0: oled.drawBox(cx+1,cy+1,13,12); break;
+                                    case 1: oled.drawBox(cx+1,cy+1,13,6);oled.drawFrame(cx+1,cy+8,13,5); break;
+                                    case 2: oled.drawBox(cx+1,cy+1,13,12);oled.setDrawColor(0);oled.drawBox(cx+4,cy+4,7,5);oled.setDrawColor(1); break;
+                                    case 3: oled.drawBox(cx+1,cy+1,5,12);oled.drawBox(cx+9,cy+1,5,12); break;
+                                }
+                            }else{
+                                oled.drawFrame(cx,cy,15,14);
+                            }
+                        }
+                    }
+                    oled.drawHLine(0,39,128);
+
+                    // Pad strip: box y=40..48, text baseline=47 → chars y=42..47 ✓
+                    oled.setFont(u8g2_font_4x6_tf);
+                    for(int pi=0;pi<DRUM2_PADS;pi++){
+                        int px=pi*15+2;
+                        bool sel=(pi==drum2SelPad);
+                        if(sel){oled.drawBox(px-2,40,17,9);oled.setDrawColor(0);}
+                        oled.drawStr(px,47,kDrum2Labels[pi]);
+                        oled.setDrawColor(1);
+                    }
+                    oled.drawHLine(0,50,128);
+
+                    // Alt + pitch (5x7 baseline=58 → chars y=52..59)
+                    oled.setFont(u8g2_font_5x7_tf);
+                    snprintf(buf,sizeof(buf),"Alt: %-3s    Pt: %d",
+                             kAltName[drum2PadAltMode[drum2SelPad]],
+                             drum2Pitch[drum2SelPad]);
+                    oled.drawStr(0,58,buf);
+                    oled.drawHLine(0,60,128);
+
+                    // FX (4x6 baseline=67 → chars y=62..67)
+                    oled.setFont(u8g2_font_4x6_tf);
+                    snprintf(buf,sizeof(buf),"FX: %s",fxstr);
+                    oled.drawStr(0,67,buf);
+
+                    // Pad vol bar y=69..74
+                    {   int vw=(int)(drum2Volume[drum2SelPad]*100);
+                        oled.drawStr(0,74,"V:");
+                        oled.drawFrame(9,69,80,6);
+                        if(vw>0) oled.drawBox(9,69,vw*80/100,6);
+                        snprintf(buf,sizeof(buf),"%d%%",vw);
+                        oled.drawStr(91,74,buf);
+                        oled.drawStr(108,74,"P5=Vol");
+                    }
+
+                    // Hint / REC (baseline=82 → chars y=77..82)
+                    if(drum2RecArmed){
+                        oled.drawRBox(0,76,50,9,2);
+                        oled.setDrawColor(0); oled.drawStr(4,83,"REC ARM"); oled.setDrawColor(1);
+                        oled.drawStr(55,83,"B4=Pad  JY=vel JX=swg");
+                    }else{
+                        oled.drawStr(0,83,"B3=Rec  B4=Pad  JY=vel JX=swg");
+                    }
+                }else{
+                    // ═══ DR2 PAD VIEW ════════════════════════════════
+                    // Header (5x7 baseline=7 → chars y=1..8)
+                    oled.setFont(u8g2_font_5x7_tf);
+                    snprintf(buf,sizeof(buf),"DR2 %s  %d BPM",
+                             drum2Playing?"[>]":"[ ]",bpm);
+                    oled.drawStr(0,7,buf);
+                    oled.drawHLine(0,9,128);
+
+                    // Pad params (5x7 baseline=17 → chars y=11..18)
+                    // If REC armed: inverted box y=10..19, text still at baseline=17
+                    snprintf(buf,sizeof(buf),"[%s]  Pt:%d  Dcy:%.0f",
+                             kDrum2Labels[drum2SelPad],
+                             (int)drum2Pitch[drum2SelPad],
+                             drum2Decay[drum2SelPad]);
+                    if(drum2RecArmed){
+                        oled.drawRBox(0,10,128,10,2);
+                        oled.setDrawColor(0); oled.drawStr(2,17,buf); oled.setDrawColor(1);
+                    }else{
+                        oled.drawStr(0,17,buf);
+                    }
+                    oled.drawHLine(0,20,128);
+
+                    // Step bar: cells 7×9 at y=22..30
+                    for(int s=0;s<DR2_STEPS;s++){
+                        int sx=s*8;
+                        bool cur=drum2Playing&&(s==(int)drum2Step);
+                        bool has=(drum2SeqVel[drum2SelPad][s]>0);
+                        if(cur&&has){ oled.drawBox(sx,22,7,9);oled.setDrawColor(0);oled.drawBox(sx+1,23,5,7);oled.setDrawColor(1);}
+                        else if(cur){ oled.drawBox(sx,22,7,9);}
+                        else if(has){ oled.drawBox(sx+1,23,5,7);}
+                        else{         oled.drawFrame(sx,22,7,9);}
+                    }
+                    oled.drawHLine(0,32,128);
+
+                    // Pad strip: box y=33..41, text baseline=40 → chars y=35..40 ✓
+                    oled.setFont(u8g2_font_4x6_tf);
+                    for(int pi=0;pi<DRUM2_PADS;pi++){
+                        int px=pi*15+2;
+                        bool sel=(pi==drum2SelPad);
+                        if(sel){oled.drawBox(px-2,33,17,9);oled.setDrawColor(0);}
+                        oled.drawStr(px,40,kDrum2Labels[pi]);
+                        oled.setDrawColor(1);
+                    }
+                    oled.drawHLine(0,43,128);
+
+                    // FX (4x6 baseline=50 → chars y=45..50)
+                    snprintf(buf,sizeof(buf),"FX: %s",fxstr);
+                    oled.drawStr(0,50,buf);
+                    oled.drawHLine(0,52,128);
+
+                    // Alt mode (5x7 baseline=60 → chars y=54..61)
+                    oled.setFont(u8g2_font_5x7_tf);
+                    snprintf(buf,sizeof(buf),"Alt: %s",kAltName[drum2PadAltMode[drum2SelPad]]);
+                    oled.drawStr(0,60,buf);
+                    oled.drawHLine(0,62,128);
+
+                    // Pad vol bar y=64..69
+                    oled.setFont(u8g2_font_4x6_tf);
+                    {   int vw=(int)(drum2Volume[drum2SelPad]*100);
+                        oled.drawStr(0,69,"V:");
+                        oled.drawFrame(9,64,88,6);
+                        if(vw>0) oled.drawBox(9,64,vw*88/100,6);
+                        snprintf(buf,sizeof(buf),"%d%%",vw);
+                        oled.drawStr(100,69,buf);
+                    }
+
+                    // Hints (4x6 baseline=78,85)
+                    oled.drawStr(0,78,"P3=Pit P4=Dcy P5=Vol B3=Rec");
+                    oled.drawStr(0,85,"B2=Ply B4=Seq  JY=vel JX=swg");
+                }
+                break;
+            }
+            // ---- SYSEQ — 16-step polyphonic synth sequencer ----
+            case MODE_SYSEQ: {
+                // Active FX string (FILT shows type: LPF/LaF/HPF/BPF)
+                static const char* kFTLs[]={"LPF","LaF","HPF","BPF"};
+                char fxstr[32]="";
+                for(uint8_t fi=0;fi<FX_COUNT;fi++){
+                    if(!fxList[fi].active) continue;
+                    if(fxstr[0]) strncat(fxstr," ",sizeof(fxstr)-strlen(fxstr)-1);
+                    char a[4];
+                    if(fi==0){ strncpy(a,kFTLs[(uint8_t)constrain((int)fxList[0].params[2],0,3)],4); }
+                    else{ strncpy(a,fxList[fi].name,3); a[3]='\0'; }
+                    strncat(fxstr,a,sizeof(fxstr)-strlen(fxstr)-1);
+                }
+                if(!fxstr[0]) strncpy(fxstr,"--",3);
+                static const char* ssnn[]={"C","c","D","d","E","F","f","G","g","A","a","B"};
+
+                if(syseqSeqView){
+                    // ═══ SSEQ SEQ VIEW ═══════════════════════════════
+                    // Header (5x7 baseline=7 → chars y=1..8)
+                    oled.setFont(u8g2_font_5x7_tf);
+                    snprintf(buf,sizeof(buf),"SSEQ %s  %d BPM  S:%02d",
+                             drum2Playing?"[>]":"[ ]",bpm,syseqSelStep);
+                    oled.drawStr(0,7,buf);
+                    oled.drawHLine(0,9,128);
+
+                    // Step grid: row1 y=10..23, row2 y=25..38
+                    // Note text baseline = cy+11 → chars cy+6..cy+11 (lower-center of 14px cell)
+                    oled.setFont(u8g2_font_4x6_tf);
+                    for(int half=0;half<2;half++){
+                        int cy=10+half*15;
+                        for(int sc=0;sc<8;sc++){
+                            uint8_t step=(uint8_t)(half*8+sc);
+                            int cx=sc*16;
+                            uint8_t cnt=0;
+                            for(uint8_t i=0;i<SYSEQ_CHORD;i++) if(syseqNotes[step][i]) cnt++;
+                            bool cur=drum2Playing&&(step==(uint8_t)drum2Step);
+                            bool sel=(step==syseqSelStep);
+                            if(cur){
+                                oled.drawBox(cx,cy,15,14);
+                                if(!cnt){oled.setDrawColor(0);oled.drawBox(cx+2,cy+3,11,8);oled.setDrawColor(1);}
+                            }else if(sel&&cnt){
+                                oled.drawFrame(cx,cy,15,14);oled.drawBox(cx+2,cy+2,11,10);
+                            }else if(sel){
+                                oled.drawFrame(cx,cy,15,14);oled.drawFrame(cx+1,cy+1,13,12);
+                            }else if(cnt){
+                                oled.drawBox(cx+1,cy+1,13,12);
+                            }else{
+                                oled.drawFrame(cx,cy,15,14);
+                            }
+                            if(cnt){
+                                uint8_t fn=0;
+                                for(uint8_t i=0;i<SYSEQ_CHORD;i++) if(syseqNotes[step][i]){fn=syseqNotes[step][i];break;}
+                                if(fn){ uint8_t n=fn-1;
+                                    char nb[4]; snprintf(nb,sizeof(nb),"%s%d",ssnn[n%12],(int)(n/12)-1);
+                                    oled.setDrawColor(0);
+                                    oled.drawStr(cx+1,cy+11,nb);
+                                    oled.setDrawColor(1);
+                                }
+                                // FUL alt indicator: small bar at top of cell
+                                if(syseqAlt[step]==1) oled.drawHLine(cx+3,cy+1,9);
+                            }
+                        }
+                    }
+                    oled.drawHLine(0,39,128);
+
+                    // Held notes (4x6 baseline=46 → chars y=41..46)
+                    {
+                        char hbuf[22]="";
+                        for(uint8_t r2=0;r2<KBD_NOTE_ROWS&&strlen(hbuf)<18;r2++)
+                            for(uint8_t c2=0;c2<KBD_COLS&&strlen(hbuf)<18;c2++)
+                                if(activeNotes[r2][c2]){
+                                    uint8_t n=activeNotes[r2][c2];
+                                    char nb[5]; snprintf(nb,sizeof(nb),"%s%d ",ssnn[n%12],(int)(n/12)-1);
+                                    strncat(hbuf,nb,sizeof(hbuf)-strlen(hbuf)-1);
+                                }
+                        if(hbuf[0]) snprintf(buf,sizeof(buf),"HLD: %s",hbuf);
+                        else         strncpy(buf,"HLD: (none)",sizeof(buf)-1);
+                        oled.drawStr(0,46,buf);
+                    }
+
+                    // Step content (4x6 baseline=54 → chars y=49..54)
+                    {
+                        char sbuf[22]="";
+                        for(uint8_t i=0;i<SYSEQ_CHORD&&strlen(sbuf)<18;i++){
+                            if(!syseqNotes[syseqSelStep][i]) continue;
+                            uint8_t n=syseqNotes[syseqSelStep][i]-1;
+                            char nb[5]; snprintf(nb,sizeof(nb),"%s%d ",ssnn[n%12],(int)(n/12)-1);
+                            strncat(sbuf,nb,sizeof(sbuf)-strlen(sbuf)-1);
+                        }
+                        snprintf(buf,sizeof(buf),"S%02d: %s [%s]",syseqSelStep,
+                                 sbuf[0]?sbuf:"--", syseqAlt[syseqSelStep]?"FUL":"NRM");
+                        oled.drawStr(0,54,buf);
+                    }
+                    oled.drawHLine(0,56,128);
+
+                    // FX (4x6 baseline=63 → chars y=58..63)
+                    snprintf(buf,sizeof(buf),"FX: %s",fxstr);
+                    oled.drawStr(0,63,buf);
+
+                    // Vol bar y=65..70, label baseline=70 → chars y=65..70 ✓
+                    {   int vw=min(100,(int)(pots[0].value*100));
+                        oled.drawFrame(0,65,100,6);
+                        if(vw>0) oled.drawBox(0,65,vw,6);
+                        snprintf(buf,sizeof(buf),"%d%%",(int)(pots[0].value*100));
+                        oled.drawStr(104,70,buf);
+                    }
+
+                    // Hint (4x6 baseline=79 → chars y=74..79)
+                    oled.drawStr(0,79,"B3=FUL B4=Pad  B2=Opt");
+                }else{
+                    // ═══ SSEQ PAD VIEW ═══════════════════════════════
+                    // Header (5x7 baseline=7 → chars y=1..8)
+                    oled.setFont(u8g2_font_5x7_tf);
+                    snprintf(buf,sizeof(buf),"SSEQ %s  %d BPM  Oct:%+d",
+                             drum2Playing?"[>]":"[ ]",bpm,noteMap.getOctave());
+                    oled.drawStr(0,7,buf);
+                    oled.drawHLine(0,9,128);
+
+                    // Shape + Env (5x7 baseline=18 → chars y=12..19)
+                    snprintf(buf,sizeof(buf),"%-8s  Env: %-3s",
+                             shapeNames[currentShape],envNames[currentEnv]);
+                    oled.drawStr(0,18,buf);
+                    oled.drawHLine(0,20,128);
+
+                    // Scale + Arp (5x7 baseline=29 → chars y=23..30)
+                    {   const char* arpStr=(arpMode==0)?"Off":(arpMode==1)?"Up":(arpMode==2)?"Dn":(arpMode==3)?"Rnd":"UD";
+                        snprintf(buf,sizeof(buf),"Scale:%-5s  Arp:%s",
+                                 scaleName(noteMap.getScale()),arpStr);
+                        oled.drawStr(0,29,buf);
+                    }
+                    oled.drawHLine(0,31,128);
+
+                    // Step mini bar: 16 cells 7×9 at y=33..41
+                    for(int s=0;s<SYSEQ_STEPS;s++){
+                        int sx=s*8;
+                        bool cur=drum2Playing&&(s==(int)drum2Step);
+                        uint8_t cnt=0;
+                        for(uint8_t i=0;i<SYSEQ_CHORD;i++) if(syseqNotes[s][i]) cnt++;
+                        if(cur&&cnt){ oled.drawBox(sx,33,7,9);oled.setDrawColor(0);oled.drawBox(sx+1,34,5,7);oled.setDrawColor(1);}
+                        else if(cur){ oled.drawBox(sx,33,7,9);}
+                        else if(cnt){ oled.drawBox(sx+1,34,5,7);}
+                        else{         oled.drawFrame(sx,33,7,9);}
+                    }
+                    oled.drawHLine(0,43,128);
+
+                    // FX (4x6 baseline=50 → chars y=45..50)
+                    oled.setFont(u8g2_font_4x6_tf);
+                    snprintf(buf,sizeof(buf),"FX: %s",fxstr);
+                    oled.drawStr(0,50,buf);
+                    oled.drawHLine(0,52,128);
+
+                    // Vol bar y=54..59, label baseline=59 → chars y=54..59 ✓
+                    {   int vw=min(100,(int)(pots[0].value*100));
+                        oled.drawFrame(0,54,100,6);
+                        if(vw>0) oled.drawBox(0,54,vw,6);
+                        snprintf(buf,sizeof(buf),"%d%%",(int)(pots[0].value*100));
+                        oled.drawStr(104,59,buf);
+                    }
+
+                    // Hint (4x6 baseline=68 → chars y=63..68)
+                    oled.drawStr(0,68,"B2=Menu  B4=Seq");
+                }
+                break;
+            }
+            // ---- 303S — TB-303 step sequencer ----
+            case MODE_303S: {
+                static const char* s3nn[]={"C","c","D","d","E","F","f","G","g","A","a","B"};
+                static const char* s3wn[]={"SIN","SQR","SAW","SUP","TRI","NSE","KS"};
+                const char* s3wname = (t303Wave==T303_NAP_WAVE) ? "NAP" : (t303Wave < 7) ? s3wn[t303Wave] : "---";
+                char s3fxstr[20]="";
+                { static const char* kFTL3[]={"LPF","LaF","HPF","BPF"};
+                  uint8_t nfx=0;
+                  for(uint8_t fi=0;fi<FX_COUNT;fi++){
+                      if(!fxList[fi].active) continue;
+                      if(nfx++) strncat(s3fxstr," ",sizeof(s3fxstr)-strlen(s3fxstr)-1);
+                      char a[4];
+                      if(fi==0){ strncpy(a,kFTL3[(uint8_t)constrain((int)fxList[0].params[2],0,3)],4); }
+                      else{ strncpy(a,fxList[fi].name,3); a[3]='\0'; }
+                      strncat(s3fxstr,a,sizeof(s3fxstr)-strlen(s3fxstr)-1);
+                  }
+                  if(!s3fxstr[0]) strncpy(s3fxstr,"--",3);
+                }
+                if (s303SeqView) {
+                    // ═══ 303S SEQ VIEW ═══════════════════════════════
+                    static const char* s3alt[]={"NRM","ACC","SLD"};
+                    oled.setFont(u8g2_font_5x7_tf);
+                    snprintf(buf,sizeof(buf),"303S %s %dBPM S:%02d Alt:[%s]",
+                             drum2Playing?"[>]":"[ ]",bpm,s303SelStep,s3alt[s303PendingAlt]);
+                    oled.drawStr(0,7,buf);
+                    oled.drawHLine(0,9,128);
+
+                    // Step grid: 2 rows × 8 cells, 16×14px each
+                    oled.setFont(u8g2_font_4x6_tf);
+                    for(int half=0;half<2;half++){
+                        int cy=10+half*15;
+                        for(int sc=0;sc<8;sc++){
+                            uint8_t step=(uint8_t)(half*8+sc);
+                            int cx=sc*16;
+                            bool hasNote=(s303Note[step]>0);
+                            bool cur=drum2Playing&&(step==(uint8_t)drum2Step);
+                            bool sel=(step==s303SelStep);
+                            if(cur){
+                                oled.drawBox(cx,cy,15,14);
+                                if(!hasNote){oled.setDrawColor(0);oled.drawBox(cx+2,cy+3,11,8);oled.setDrawColor(1);}
+                            }else if(sel&&hasNote){
+                                oled.drawFrame(cx,cy,15,14);oled.drawBox(cx+2,cy+2,11,10);
+                            }else if(sel){
+                                oled.drawFrame(cx,cy,15,14);oled.drawFrame(cx+1,cy+1,13,12);
+                            }else if(hasNote){
+                                oled.drawBox(cx+1,cy+1,13,12);
+                            }else{
+                                oled.drawFrame(cx,cy,15,14);
+                            }
+                            if(hasNote){
+                                uint8_t n=s303Note[step]-1;
+                                char nb[4]; snprintf(nb,sizeof(nb),"%s%d",s3nn[n%12],(int)(n/12)-1);
+                                oled.setDrawColor(0);
+                                oled.drawStr(cx+1,cy+11,nb);
+                                oled.setDrawColor(1);
+                            }
+                            // Alt indicator (top-right corner): ACC=dot, SLD=dash, SIL=X
+                            if(s303Alt[step]==1) oled.drawPixel(cx+13,cy+1);
+                            else if(s303Alt[step]==2) oled.drawHLine(cx+11,cy+1,3);
+                        }
+                    }
+                    oled.drawHLine(0,39,128);
+
+                    // Step detail: selected note → step's current note
+                    {
+                        uint8_t sn = s303Note[s303SelStep];
+                        char stepNote[6]; if(sn){ uint8_t m=sn-1; snprintf(stepNote,sizeof(stepNote),"%s%d",s3nn[m%12],(int)(m/12)-1); }
+                        else strncpy(stepNote,"--",3);
+                        char selNote[6]; if(s303SelNote){ uint8_t m=s303SelNote-1; snprintf(selNote,sizeof(selNote),"%s%d",s3nn[m%12],(int)(m/12)-1); }
+                        else strncpy(selNote,"--",4);
+                        snprintf(buf,sizeof(buf),"Sel:%-4s  S%02d:%-4s  Alt:%s",
+                                 selNote, s303SelStep, stepNote, s3alt[s303PendingAlt]);
+                        oled.drawStr(0,47,buf);
+                    }
+
+                    // Wave + oct + FX (4x6 baseline=54)
+                    snprintf(buf,sizeof(buf),"Wv:%-3s Oct:%+d  FX:%s",s3wname,t303Oct,s3fxstr);
+                    oled.drawStr(0,54,buf);
+                    oled.drawHLine(0,56,128);
+
+                    // Vol bar y=58..63
+                    {   int vw=min(100,(int)(pots[0].value*100));
+                        oled.drawFrame(0,58,100,5);
+                        if(vw>0) oled.drawBox(0,58,vw,5);
+                        snprintf(buf,sizeof(buf),"%d%%",(int)(pots[0].value*100));
+                        oled.drawStr(104,63,buf);
+                    }
+
+                    // Hints (baseline=72)
+                    oled.drawStr(0,72,"B3=Alt B4=Pad P2=Wv JX=vel JY=Oct");
+
+                    // ── Pot params in bigger font ────────────────────
+                    oled.setFont(u8g2_font_6x10_tf);
+                    oled.drawHLine(0,75,128);
+                    snprintf(buf,sizeof(buf),"Cut:%-4d  Res:%.1f",(int)t303Cutoff,t303Reso);
+                    oled.drawStr(0,88,buf);
+                    snprintf(buf,sizeof(buf),"Dur:%.0f%%  Mod:%-4.1f",t303Duration*100.0f,t303EnvMod);
+                    oled.drawStr(0,102,buf);
+
+                    // Waveform preview y=105..124 — shows the effect of P2 on the current wave
+                    {
+                        const int WX=0,WY=105,WW=128,WH=20,cy=WY+WH/2,ah=WH/2-2;
+                        oled.setFont(u8g2_font_4x6_tf);
+                        oled.drawFrame(WX,WY,WW,WH);
+                        float p2=pots[1].value;
+                        if(t303Wave==PULSE||t303Wave==T303_NAP_WAVE){
+                            float duty=(t303Wave==PULSE)?(0.5f-p2*0.48f):(0.15f-p2*0.14f);
+                            int dw=max(2,min(WW-4,(int)(duty*(WW-2))));
+                            int hy=WY+1, ly=WY+WH-2;
+                            oled.drawHLine(WX+1,hy,dw);
+                            oled.drawVLine(WX+1+dw,hy,ly-hy+1);
+                            oled.drawHLine(WX+2+dw,ly,WW-3-dw);
+                        } else {
+                            float g=(p2<0.01f)?1.0f:powf(4.0f,p2);
+                            int prev=cy;
+                            for(int i=0;i<WW-2;i++){
+                                float t=(float)i/(float)(WW-3);
+                                float base=(t303Wave==TRIANGLE)?((t<0.5f)?(4*t-1):(3-4*t)):
+                                           (t303Wave==SAW_UP)?(2*t-1):(1-2*t);
+                                float s=base*g, ph=fmodf(s+1.0f,4.0f);
+                                if(ph<0.0f) ph+=4.0f;
+                                float yv=(ph<2.0f)?(ph-1.0f):(3.0f-ph);
+                                int py=constrain(cy-(int)(yv*ah+0.5f),WY+1,WY+WH-2);
+                                if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py);
+                                else    oled.drawPixel(WX+1,py);
+                                prev=py;
+                            }
+                        }
+                    }
+                } else {
+                    // ═══ 303S PAD VIEW ═══════════════════════════════
+                    oled.setFont(u8g2_font_5x7_tf);
+                    snprintf(buf,sizeof(buf),"303S %s %dBPM  Wv:%-3s Oct:%+d",
+                             drum2Playing?"[>]":"[ ]",bpm,s3wname,t303Oct);
+                    oled.drawStr(0,7,buf);
+                    oled.drawHLine(0,9,128);
+
+                    // Step mini bar: 16 cells 7×9px at y=11..19
+                    oled.setFont(u8g2_font_4x6_tf);
+                    for(int s=0;s<S303_STEPS;s++){
+                        int sx=s*8;
+                        bool cur=drum2Playing&&(s==(int)drum2Step);
+                        bool hasNote=(s303Note[s]>0);
+                        if(cur&&hasNote){ oled.drawBox(sx,11,7,9);oled.setDrawColor(0);oled.drawBox(sx+1,12,5,7);oled.setDrawColor(1);}
+                        else if(cur){     oled.drawBox(sx,11,7,9);}
+                        else if(hasNote){ oled.drawBox(sx+1,12,5,7);}
+                        else{             oled.drawFrame(sx,11,7,9);}
+                        // Alteration dot: ACC=dot, SLD=dash, SIL=x
+                        if(hasNote){
+                            if(s303Alt[s]==1)      oled.drawPixel(sx+6,11);
+                            else if(s303Alt[s]==2) oled.drawHLine(sx+4,11,3);
+                        }
+                    }
+                    oled.drawHLine(0,21,128);
+
+                    // Wave + filter (baseline=28 → y=23..28)
+                    snprintf(buf,sizeof(buf),"Wv:%-3s Cut:%.0f Res:%.1f",s3wname,t303Cutoff,t303Reso);
+                    oled.drawStr(0,28,buf);
+
+                    // Decay + accent state (baseline=35 → y=30..35)
+                    snprintf(buf,sizeof(buf),"Dec:%.0fms Acc:%s Sld:%s",
+                             t303Decay, t303AccentOn?"ON":"--", t303SlideOn?"ON":"--");
+                    oled.drawStr(0,35,buf);
+
+                    // Current step note (baseline=42 → y=37..42)
+                    {
+                        uint8_t cstep = drum2Playing ? drum2Step : s303SelStep;
+                        uint8_t n = s303Note[cstep];
+                        char noteStr[6]; if(n){ uint8_t m=n-1; snprintf(noteStr,sizeof(noteStr),"%s%d",s3nn[m%12],(int)(m/12)-1); }
+                        else strncpy(noteStr,"--",3);
+                        { static const char* altlbl[]={"NRM","ACC","SLD"};
+                          snprintf(buf,sizeof(buf),"S%02d:%s [%s]",
+                                   cstep, noteStr, altlbl[s303Alt[cstep]]);
+                          oled.drawStr(0,42,buf); }
+                    }
+                    oled.drawHLine(0,44,128);
+
+                    // FX (baseline=51)
+                    snprintf(buf,sizeof(buf),"FX: %s",s3fxstr);
+                    oled.drawStr(0,51,buf);
+
+                    // Vol bar y=54..59
+                    {   int vw=min(100,(int)(pots[0].value*100));
+                        oled.drawFrame(0,54,100,6);
+                        if(vw>0) oled.drawBox(0,54,vw,6);
+                        snprintf(buf,sizeof(buf),"%d%%",(int)(pots[0].value*100));
+                        oled.drawStr(104,59,buf);
+                    }
+
+                    // Hints (baseline=68)
+                    oled.drawStr(0,68,"B3=Acc B4=Seq P2=Wv JX=vel");
+
+                    // ── Pot params in bigger font ────────────────────
+                    oled.setFont(u8g2_font_6x10_tf);
+                    oled.drawHLine(0,71,128);
+                    snprintf(buf,sizeof(buf),"Cut:%-4d  Res:%.1f",(int)t303Cutoff,t303Reso);
+                    oled.drawStr(0,84,buf);
+                    snprintf(buf,sizeof(buf),"Dur:%.0f%%  Mod:%-4.1f",t303Duration*100.0f,t303EnvMod);
+                    oled.drawStr(0,98,buf);
+
+                    // Waveform preview y=101..120
+                    {
+                        const int WX=0,WY=101,WW=128,WH=20,cy=WY+WH/2,ah=WH/2-2;
+                        oled.setFont(u8g2_font_4x6_tf);
+                        oled.drawFrame(WX,WY,WW,WH);
+                        float p2=pots[1].value;
+                        if(t303Wave==PULSE||t303Wave==T303_NAP_WAVE){
+                            float duty=(t303Wave==PULSE)?(0.5f-p2*0.48f):(0.15f-p2*0.14f);
+                            int dw=max(2,min(WW-4,(int)(duty*(WW-2))));
+                            int hy=WY+1, ly=WY+WH-2;
+                            oled.drawHLine(WX+1,hy,dw);
+                            oled.drawVLine(WX+1+dw,hy,ly-hy+1);
+                            oled.drawHLine(WX+2+dw,ly,WW-3-dw);
+                        } else {
+                            float g=(p2<0.01f)?1.0f:powf(4.0f,p2);
+                            int prev=cy;
+                            for(int i=0;i<WW-2;i++){
+                                float t=(float)i/(float)(WW-3);
+                                float base=(t303Wave==TRIANGLE)?((t<0.5f)?(4*t-1):(3-4*t)):
+                                           (t303Wave==SAW_UP)?(2*t-1):(1-2*t);
+                                float s=base*g, ph=fmodf(s+1.0f,4.0f);
+                                if(ph<0.0f) ph+=4.0f;
+                                float yv=(ph<2.0f)?(ph-1.0f):(3.0f-ph);
+                                int py=constrain(cy-(int)(yv*ah+0.5f),WY+1,WY+WH-2);
+                                if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py);
+                                else    oled.drawPixel(WX+1,py);
+                                prev=py;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            // ---- SS2 — Sample Step Sequencer ----
+            case MODE_SS2: {
+                static const char* ss2alt[]={"NRM","REV","FUL","SIL"};
+                oled.setFont(u8g2_font_4x6_tf);
+
+                if (ss2SeqView) {
+                    // ═══ SS2 SEQ VIEW ════════════════════════════════
+                    oled.setFont(u8g2_font_5x7_tf);
+                    snprintf(buf,sizeof(buf),"SS2 %s %dBPM S:%02d [%s]",
+                             drum2Playing?"[>]":"[ ]",bpm,ss2SelStep,ss2alt[ss2Alt[ss2SelStep]]);
+                    oled.drawStr(0,7,buf);
+                    oled.drawHLine(0,9,128);
+
+                    // Step grid: 2 rows × 8 cells, 16×14px
+                    oled.setFont(u8g2_font_4x6_tf);
+                    for(int half=0;half<2;half++){
+                        int cy=10+half*15;
+                        for(int sc=0;sc<8;sc++){
+                            uint8_t step=(uint8_t)(half*8+sc);
+                            int cx=sc*16;
+                            bool has=(ss2Note[step]!=0);
+                            bool cur=drum2Playing&&(step==(uint8_t)drum2Step);
+                            bool sel=(step==ss2SelStep);
+                            if(cur){ oled.drawBox(cx,cy,15,14);
+                                if(!has){oled.setDrawColor(0);oled.drawBox(cx+2,cy+3,11,8);oled.setDrawColor(1);}
+                            }else if(sel&&has){ oled.drawFrame(cx,cy,15,14);oled.drawBox(cx+2,cy+2,11,10); }
+                            else if(sel){       oled.drawFrame(cx,cy,15,14);oled.drawFrame(cx+1,cy+1,13,12); }
+                            else if(has){       oled.drawBox(cx+1,cy+1,13,12); }
+                            else{               oled.drawFrame(cx,cy,15,14); }
+                            if(has){
+                                int cnt=__builtin_popcount(ss2Note[step]);
+                                char sb[4];
+                                if(cnt==1) snprintf(sb,sizeof(sb),"%02d",(int)__builtin_ctz(ss2Note[step]));
+                                else       snprintf(sb,sizeof(sb),"x%d",cnt);
+                                oled.setDrawColor(cur?0:1);
+                                oled.drawStr(cx+2,cy+11,sb);
+                                oled.setDrawColor(1);
+                            }
+                            // Alt indicator: REV=R pixel, FUL=F pixel, SIL=X mark
+                            if(ss2Alt[step]==1)      { oled.drawPixel(cx+13,cy+1); oled.drawPixel(cx+12,cy+2); }  // REV: diagonal
+                            else if(ss2Alt[step]==2) oled.drawHLine(cx+11,cy+1,3);   // FUL: bar
+                            else if(ss2Alt[step]==3){ oled.drawPixel(cx+12,cy+1);oled.drawPixel(cx+13,cy+2); }  // SIL: cross
+                        }
+                    }
+                    oled.drawHLine(0,39,128);
+
+                    // Step detail
+                    {   uint16_t smask=ss2Note[ss2SelStep];
+                        int cnt=__builtin_popcount(smask);
+                        bool selOn=(smask & (1u<<ss2SelSlot)) != 0;
+                        snprintf(buf,sizeof(buf),"S%02d:%d slot%s Sl%02d:%s [%s]",
+                                 ss2SelStep,cnt,cnt==1?"":"s",
+                                 ss2SelSlot,selOn?"ON":"--",ss2alt[ss2Alt[ss2SelStep]]);
+                        oled.drawStr(0,47,buf); }
+
+                    // Slot detail
+                    {   const char* fn=(ss2Path[ss2SelSlot][0])?
+                            (strrchr(ss2Path[ss2SelSlot],'/')?strrchr(ss2Path[ss2SelSlot],'/')+1:ss2Path[ss2SelSlot]):"(empty)";
+                        snprintf(buf,sizeof(buf),"Slot%02d:%s%s",
+                                 ss2SelSlot,ss2Loaded[ss2SelSlot]?"":"!",fn);
+                        oled.drawStr(0,54,buf); }
+
+                    // Slot loaded bar: 16 dots
+                    oled.drawHLine(0,57,128);
+                    for(int i=0;i<SS2_SLOTS;i++){
+                        int sx=i*8+2;
+                        if(ss2Loaded[i])      oled.drawBox(sx,60,4,4);
+                        else if(ss2Path[i][0]) oled.drawFrame(sx,60,4,4);
+                        // else empty: nothing
+                        if((uint8_t)i==ss2SelSlot) oled.drawPixel(sx+2,65);
+                    }
+
+                    oled.drawStr(0,79,"B3=Alt  B4=Seq/Pad");
+                } else {
+                    // ═══ SS2 PAD VIEW — always shows file browser ════
+                    oled.setFont(u8g2_font_5x7_tf);
+                    snprintf(buf,sizeof(buf),"SS2 Sl:%02d  %.18s",ss2SelSlot,sdPath.c_str());
+                    oled.drawStr(0,7,buf);
+                    oled.drawHLine(0,9,128);
+                    oled.setFont(u8g2_font_4x6_tf);
+                    for(int i=0;i<8&&(i+sdScroll)<sdFileCount;i++){
+                        int fi=i+sdScroll; bool sel=(fi==sdCursor);
+                        snprintf(buf,sizeof(buf),"%c%.26s",
+                                 sel?'>':(sdFileIsDir[fi]?'[':' '),sdFiles[fi].c_str());
+                        oled.drawStr(0,17+i*7,buf);
+                        if(sel) oled.drawHLine(0,18+i*7,128);
+                    }
+                    oled.drawHLine(0,74,128);
+                    // Slot status bar: loaded=filled, assigned=frame, empty=nothing
+                    for(int i=0;i<SS2_SLOTS;i++){
+                        int sx=i*8+2;
+                        if(ss2Loaded[i])       oled.drawBox(sx,76,4,4);
+                        else if(ss2Path[i][0]) oled.drawFrame(sx,76,4,4);
+                        if((uint8_t)i==ss2SelSlot) oled.drawPixel(sx+2,81);
+                    }
+                    oled.drawStr(0,90,"Key=Asgn  B3=AutoMap  B4=Seq");
+                }
+                break;
+            }
             // ---- MOD2 — PolyAnalog-inspired ----
             case MODE_MOD2: {
                 oled.drawStr(0,0,"MOD2"); oled.drawHLine(0,9,128);
@@ -1933,7 +3032,7 @@ void drawScreen() {
             // ---- 303 — TB-303 emulation ----
             case MODE_303: {
                 oled.setFont(u8g2_font_4x6_tf);
-                { static const char* wn[]={"SIN","SQR","SAW","SWU","TRI","NSE","KS"};
+                { static const char* wn[]={"SIN","SQR","SAW","SUP","TRI","NSE","KS"};
                   uint8_t wi=(t303Wave<7)?t303Wave:0;
                   snprintf(buf,sizeof(buf),"303 %s/%s %dBPM%s%s%s",
                            t303Tones[t303ToneIdx].name, wn[wi], bpm,
@@ -1942,7 +3041,7 @@ void drawScreen() {
                 oled.drawStr(0,0,buf); oled.drawHLine(0,7,128);
                 snprintf(buf,sizeof(buf),"Cut:%4dHz  Res:%.1f",(int)t303Cutoff,t303Reso);
                 oled.drawStr(0,17,buf);
-                snprintf(buf,sizeof(buf),"Mod:%4dHz  Rev:%.0f%%",(int)t303EnvMod,t303Reverb*100.0f);
+                snprintf(buf,sizeof(buf),"Mod:%4dHz  Dur:%.0f%%",(int)t303EnvMod,t303Duration*100.0f);
                 oled.drawStr(0,26,buf);
                 { float pk=constrain(t303Cutoff+t303EnvMod,80.0f,8000.0f);
                   snprintf(buf,sizeof(buf),"Oct:%+d  Pk:%.0fHz",t303Oct,pk); }
@@ -1959,8 +3058,15 @@ void drawScreen() {
                     oled.drawStr(0,55,buf);
                 }
                 oled.drawHLine(0,62,128);
-                oled.drawStr(0,71,"P3=Rs P4=Mod P5=Rev P6=Ct | B1=Wv/Arp B3=Tone");
-                oled.setFont(u8g2_font_5x7_tf);
+                oled.drawStr(0,71,"P2=Wv P3=Rs P4=Mod P5=Dur P6=Ct B3=Tn");
+                // ── Pot params in bigger font ────────────────────────
+                oled.setFont(u8g2_font_6x10_tf);
+                oled.drawHLine(0,74,128);
+                snprintf(buf,sizeof(buf),"Cut:%-4d  Res:%.1f",(int)t303Cutoff,t303Reso);
+                oled.drawStr(0,87,buf);
+                snprintf(buf,sizeof(buf),"Dur:%.0f%%  Mod:%-4.1f",t303Duration*100.0f,t303EnvMod);
+                oled.drawStr(0,101,buf);
+                oled.setFont(u8g2_font_4x6_tf);
                 snprintf(buf,sizeof(buf),"Vol:%.0f%%",pots[0].value*100);
                 oled.drawStr(0,118,buf);
                 break;
@@ -2477,7 +3583,7 @@ static void updateLedsAndShow()
                         bool playing = (thisNote == t303CurrentNote && t303CurrentNote != 0);
                         if (playing)     leds[li] = t303AccentOn ? CHSV(40,255,255) : CHSV(0,255,255);
                         else if (pr)     leds[li] = CHSV(15, 220, 180);
-                        else             leds[li] = white ? CHSV(40,100,40) : CHSV(160,255,30);
+                        else             leds[li] = white ? CHSV(28,200,55) : CHSV(128,255,55);
                     } else {
                         uint8_t base = noteMap.getMidiNote(r, c);
                         uint8_t note = (uint8_t)constrain((int)base + (int)t303Oct*12, 0, 127);
@@ -2486,6 +3592,218 @@ static void updateLedsAndShow()
                         if(playing)      leds[li] = t303AccentOn ? CHSV(40,255,255) : CHSV(0,255,255);
                         else if(pressed) leds[li] = CHSV(15, 220, 180);
                         else             leds[li] = CHSV(10, 180, 15);
+                    }
+                }
+                break;
+            }
+            case MODE_DRUM2: {
+                // Pad hue = rainbow across 8 pads (uniform step of 32)
+                // so each pad has a clearly distinct but logically ordered color
+                unsigned long now = millis();
+                for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
+                    int li=(idx>=0&&idx<NUM_LEDS+4)?crdToIdx(idx,0):-1;
+                    if(li<0||li>=NUM_LEDS) continue;
+                    // col=7(left)=pad0(KK1) … col=0(right)=pad7(RDE)
+                    uint8_t padIdx = (uint8_t)(KBD_COLS - 1 - c);
+                    if (padIdx >= DRUM2_PADS) { leds[li]=CRGB::Black; continue; }
+                    uint8_t hue = (uint8_t)(padIdx * 32);
+                    if (drum2SeqView) {
+                        if (r >= 2) {
+                            // Rows 2+3: unified step grid, pitch-based color when offset ≠ 0
+                            uint8_t step = (uint8_t)((r == 3 ? 0 : 8) + (KBD_COLS - 1 - c));
+                            if (step >= DR2_STEPS) { leds[li] = CRGB::Black; continue; }
+                            uint8_t ph   = (uint8_t)(drum2SelPad * 32);
+                            bool active  = (drum2SeqVel[drum2SelPad][step] > 0);
+                            bool curStep = drum2Playing && (step == drum2Step);
+                            int8_t poff  = active ? drum2SeqPitchOff[drum2SelPad][step] : 0;
+                            // Pitch-based hue
+                            uint8_t ledHue = ph;
+                            if (active && poff != 0) {
+                                if      (poff > 7)   ledHue = 0;    // red: high
+                                else if (poff > 0)   ledHue = 35;   // amber
+                                else if (poff < -7)  ledHue = 180;  // blue: low
+                                else                 ledHue = 130;  // cyan
+                            }
+                            // Modifier color: 0=pad 1=prob50%(amber) 2=randpitch(magenta) 3=double(cyan)
+                            static const uint8_t kModHue[4] = {0, 40, 213, 128};
+                            if (active && drum2SeqMod[drum2SelPad][step] > 0)
+                                ledHue = kModHue[drum2SeqMod[drum2SelPad][step]];
+                            if (keyState[r][c])        leds[li] = CHSV(ph,    200, 255);
+                            else if (curStep && active) leds[li] = CHSV(0,      0, 255);
+                            else if (curStep)           leds[li] = CHSV(ph,    255,  80);
+                            else if (active)            leds[li] = CHSV(ledHue, 240, 140);
+                            else                        leds[li] = CHSV(ph,    220,  10);
+                        } else if (r == 1) {
+                            // Row 1: ALTERED note row — color shows alteration mode for each pad
+                            // 0=normal(green) 1=prob50%(amber) 2=randpitch(magenta) 3=double(cyan)
+                            static const uint8_t kAltHue[4] = {80, 40, 213, 128};
+                            uint8_t phue = kAltHue[drum2PadAltMode[padIdx]];
+                            bool isSelPad = (padIdx == (uint8_t)drum2SelPad);
+                            if (keyState[r][c])   leds[li] = CHSV(phue, 220, 255);
+                            else if (isSelPad)    leds[li] = CHSV(phue, 220, 140);
+                            else                  leds[li] = CHSV(phue, 220,  25);
+                        } else {
+                            // Row 0: pad selector (play/audition)
+                            bool justHit = (now - drum2PadFlashMs[padIdx] < 80);
+                            if (keyState[r][c] || justHit)          leds[li] = CHSV(hue, 180, 255);
+                            else if (padIdx == (uint8_t)drum2SelPad) leds[li] = CHSV(hue, 200, 120);
+                            else                                      leds[li] = CHSV(hue, 220,  20);
+                        }
+                    } else {
+                        // Pad view: col=pad, row=velocity layers
+                        bool justHit = (now - drum2PadFlashMs[padIdx] < 80);
+                        if (keyState[r][c] || justHit)
+                            leds[li] = CHSV(hue, 180, 255);   // pressed or seq-triggered
+                        else if (padIdx == (uint8_t)drum2SelPad)
+                            leds[li] = CHSV(hue, 200,  80);   // selected pad dim glow
+                        else
+                            leds[li] = CHSV(hue, 220,  25);   // idle
+                    }
+                }
+                break;
+            }
+            case MODE_SYSEQ: {
+                for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
+                    int li=(idx>=0&&idx<NUM_LEDS+4)?crdToIdx(idx,0):-1;
+                    if(li<0||li>=NUM_LEDS) continue;
+                    if (syseqSeqView) {
+                        if (r >= 2) {
+                            // Top 2 rows: step selector (r=3→steps 0-7, r=2→steps 8-15)
+                            uint8_t step = (uint8_t)((r==3?0:8)+(KBD_COLS-1-c));
+                            uint8_t cnt=0; for(uint8_t i=0;i<SYSEQ_CHORD;i++) if(syseqNotes[step][i]) cnt++;
+                            bool curStep = drum2Playing && (step==(uint8_t)drum2Step);
+                            bool selStep = (step==syseqSelStep);
+                            if (keyState[r][c])        leds[li] = CHSV(0,   0, 255);    // white on press
+                            else if (curStep && cnt)   leds[li] = CHSV(0,   0, 255);    // white beat
+                            else if (curStep)          leds[li] = CHSV(170, 255,  80);  // dim cursor
+                            else if (selStep && cnt)   leds[li] = CHSV(170, 180, 220);  // selected+notes
+                            else if (selStep)          leds[li] = CHSV(170, 120,  80);  // selected empty
+                            else if (cnt)              leds[li] = CHSV(170, 240, 100);  // has notes
+                            else                       leds[li] = CHSV(170, 255,   8);  // empty
+                        } else {
+                            // Bottom 2 rows: hold-to-play keyboard (sequential 2-row mapping)
+                            uint8_t note = noteMap.getMidiNoteByIdx((KBD_COLS-1-c)*2+r);
+                            bool isSeqPlaying = false;
+                            for(uint8_t i=0;i<syseqActiveCnt;i++) if(syseqActive[i]==note) { isSeqPlaying=true; break; }
+                            bool inSelStep = false;
+                            for(uint8_t i=0;i<SYSEQ_CHORD;i++) if(syseqNotes[syseqSelStep][i]==note+1) { inSelStep=true; break; }
+                            if (keyState[r][c] || isSeqPlaying) leds[li] = CHSV(60, 220, 255);
+                            else if (inSelStep)                  leds[li] = CHSV(60, 200, 110);
+                            else                                 leds[li] = CHSV(60, 255,   8);
+                        }
+                    } else {
+                        // PAD view: noteMap piano keyboard
+                        uint8_t note = noteMap.getMidiNote(r, c);
+                        bool playing = false;
+                        for(uint8_t i=0;i<syseqActiveCnt;i++) if(syseqActive[i]==note) { playing=true; break; }
+                        if (keyState[r][c])    leds[li] = CHSV(170, 200, 255);
+                        else if (playing)      leds[li] = CHSV(170, 200, 120);
+                        else                   leds[li] = CHSV(170, 255,  15);
+                    }
+                }
+                break;
+            }
+            case MODE_303S: {
+                for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
+                    int li=(idx>=0&&idx<NUM_LEDS+4)?crdToIdx(idx,0):-1;
+                    if(li<0||li>=NUM_LEDS) continue;
+                    if (s303SeqView) {
+                        if (r >= 2) {
+                            // Top 2 rows: step grid
+                            // Color by per-step alteration: NRM=red(0), ACC=orange(40), SLD=teal(130), SIL=dim
+                            uint8_t step=(uint8_t)((r==3?0:8)+(KBD_COLS-1-c));
+                            bool hasNote=(s303Note[step]>0);
+                            bool curStep=drum2Playing&&(step==(uint8_t)drum2Step);
+                            bool selStep=(step==s303SelStep);
+                            uint8_t alt=s303Alt[step];
+                            static const uint8_t aH[]={0,40,130,0};
+                            static const uint8_t aS[]={240,240,240,30};
+                            if (keyState[r][c])        leds[li] = CHSV(0,   0, 255);
+                            else if (curStep&&hasNote)  leds[li] = CHSV(aH[alt],aS[alt],220);
+                            else if (curStep)           leds[li] = CHSV(0,  180,  60);
+                            else if (selStep&&hasNote)  leds[li] = CHSV(aH[alt],aS[alt],160);
+                            else if (selStep)           leds[li] = CHSV(30, 120,  60);
+                            else if (hasNote)           leds[li] = CHSV(aH[alt],aS[alt], 80);
+                            else                        leds[li] = CHSV(0,  255,   6);
+                        } else {
+                            // Bottom 2 rows: note keyboard — selected note bright, seq playing bright
+                            uint8_t note=noteMap.getMidiNoteByIdx((KBD_COLS-1-c)*2+r);
+                            uint8_t noteWOct=(uint8_t)constrain((int)note+(int)t303Oct*12,0,127);
+                            bool isSel=(s303SelNote==note+1);
+                            bool seqPlay=(noteWOct==s303CurNote&&s303CurNote!=0);
+                            if (keyState[r][c]||seqPlay) leds[li] = CHSV(0, 220, 255);
+                            else if (isSel)              leds[li] = CHSV(0, 180, 140);
+                            else                         leds[li] = CHSV(0, 255,   8);
+                        }
+                    } else {
+                        // PAD view: 303-style keyboard (orange/red theme)
+                        uint8_t note = noteMap.getMidiNote(r, c);
+                        uint8_t noteWOct=(uint8_t)constrain((int)note+(int)t303Oct*12,0,127);
+                        bool playing = (noteWOct==t303CurrentNote && t303CurrentNote!=0);
+                        bool seqPlay = (noteWOct==s303CurNote && s303CurNote!=0);
+                        if (keyState[r][c])       leds[li] = t303AccentOn ? CHSV(40,255,255) : CHSV(0,255,200);
+                        else if (playing||seqPlay) leds[li] = CHSV(0, 255, 120);
+                        else                       leds[li] = CHSV(0, 200,  12);
+                    }
+                }
+                break;
+            }
+            case MODE_SS2: {
+                // 16 slots spread across 2×8 rows. Unique hue per slot (16 even steps across 256).
+                // Step grid in SEQ view uses slot hue; PAD view shows slot status.
+                for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c;
+                    int idx=gr*KBD_COLS+gc;
+                    if(idx<0||idx>=NUM_LEDS+4) continue;
+                    int li=crdToIdx(idx,0);
+                    if(li<0||li>=NUM_LEDS) continue;
+
+                    if (ss2SeqView) {
+                        if (r >= 2) {
+                            // Top 2 rows: 16 step grid
+                            uint8_t step=(uint8_t)((r==3?0:8)+(KBD_COLS-1-c));
+                            bool hasSlot=(ss2Note[step]!=0);
+                            bool curStep=drum2Playing&&(step==(uint8_t)drum2Step);
+                            bool selOn=(ss2Note[step]&(1u<<ss2SelSlot))!=0;
+                            uint8_t alt=ss2Alt[step];
+                            uint8_t dispSlot = hasSlot
+                                ? ((ss2Note[step] & (1u<<ss2SelSlot)) ? ss2SelSlot : (uint8_t)__builtin_ctz(ss2Note[step]))
+                                : 0;
+                            uint8_t slotH = (uint8_t)(dispSlot*16);
+                            uint8_t selH  = (uint8_t)(ss2SelSlot*16);
+                            static const uint8_t aS2[]={240,240,240,30};
+                            if (keyState[r][c])             leds[li] = CHSV(0,   0, 255);
+                            else if (curStep && hasSlot)    leds[li] = CHSV(slotH,aS2[alt],220);
+                            else if (curStep)               leds[li] = CHSV(0,   60, 110);
+                            else if (selOn)                 leds[li] = CHSV(selH,aS2[alt],110);
+                            else                            leds[li] = CHSV(0,  255,   6);
+                        } else {
+                            // Bottom 2 rows: slot selector (2×8 = 16 slots)
+                            uint8_t slot=(uint8_t)((KBD_COLS-1-c)*2+r);
+                            if(slot>=SS2_SLOTS){ leds[li]=CHSV(0,0,0); continue; }
+                            uint8_t slotH=(uint8_t)(slot*16);
+                            bool slotPlaced=false;
+                            for(uint8_t s=0;s<SS2_SLOTS;s++) if(ss2Note[s]&(1u<<slot)){slotPlaced=true;break;}
+                            bool slotPlaying=(slot==ss2CurSlot&&ss2CurSlot!=0xFF);
+                            if (keyState[r][c]||slotPlaying) leds[li]=CHSV(slotH,240,255);
+                            else if(slotPlaced)               leds[li]=CHSV(slotH,220,110);
+                            else                              leds[li]=CHSV(0,  255,  4);
+                        }
+                    } else {
+                        // PAD view: 2×8 slot grid (rows 0-1), dim on rows 2-3
+                        if (r >= 2) { leds[li]=CHSV(0,0,4); continue; }
+                        uint8_t slot=(uint8_t)((KBD_COLS-1-c)*2+r);
+                        if(slot>=SS2_SLOTS){ leds[li]=CHSV(0,0,0); continue; }
+                        uint8_t slotH=(uint8_t)(slot*16);
+                        bool slotPlaced=false;
+                        for(uint8_t s=0;s<SS2_SLOTS;s++) if(ss2Note[s]&(1u<<slot)){slotPlaced=true;break;}
+                        bool slotPlaying=(slot==ss2CurSlot&&ss2CurSlot!=0xFF);
+                        if (keyState[r][c]||slotPlaying) leds[li]=CHSV(slotH,240,255);
+                        else if(slotPlaced)               leds[li]=CHSV(slotH,220,110);
+                        else                              leds[li]=CHSV(0,  255,  4);
                     }
                 }
                 break;
@@ -2508,7 +3826,7 @@ static void updateLedsAndShow()
                         int8_t off = pianoPad[r][c];
                         if (off < 0) continue;
                         bool white = (0xAB5 >> (off % 12)) & 1;
-                        leds[li] = white ? CHSV(40,100,40) : CHSV(160,255,30);
+                        leds[li] = white ? CHSV(28,200,55) : CHSV(128,255,55);
                     }
                 }
                 break;
@@ -2600,8 +3918,8 @@ static void updateLedsAndShow()
                         if (off < 0) { leds[li]=CRGB::Black; continue; }
                         bool white = (0xAB5 >> (off % 12)) & 1;
                         bool pr = keyState[r][c];
-                        leds[li] = white ? (pr ? CHSV(40,100,255) : CHSV(40,100,40))
-                                         : (pr ? CHSV(160,255,255) : CHSV(160,255,30));
+                        leds[li] = white ? (pr ? CHSV(28,200,255) : CHSV(28,200,55))
+                                         : (pr ? CHSV(128,255,255) : CHSV(128,255,55));
                     } else if(keyState[r][c]) {
                         leds[li]=CHSV((r*8+c)*37+80,255,255);
                     }
@@ -2655,6 +3973,7 @@ static void updateLedsAndShow()
                     break;
                 case OVERLAY_ENV:
                     if (opt < ENV_PRESET_COUNT) { show=true; sel=(currentEnv==(EnvPreset)opt); hue=170; }
+                    else if (opt >= 12 && opt < 16) { show=true; sel=(noteMap.getOctave()==kOctOpts[opt-12]); hue=200; }
                     break;
                 case OVERLAY_SEQ_OPT:
                     if (opt < 3)          { show=true; sel=((uint8_t)seqPlayMode==opt); hue=150; }
@@ -2674,6 +3993,11 @@ static void updateLedsAndShow()
                     break;
                 case OVERLAY_303_PRESET:
                     if (opt < T303_TONE_COUNT) { show=true; sel=(t303ToneIdx==opt); hue=(uint8_t)(opt*20+60); }
+                    break;
+                case OVERLAY_SYSEQ:
+                    if (opt < 8)                { show=true; sel=(currentShape==(SynthShape)opt); hue=0;   }
+                    else if (opt < 12)          { show=true; sel=(noteMap.getOctave()==kOctOpts[opt-8]); hue=200; }
+                    else if (opt < 16)          { show=true; sel=(arpMode==(int)(opt-12)); hue=20;  }
                     break;
                 default: break;
             }
@@ -2756,7 +4080,11 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             if(arpMode==0){
                 if(pressed){
                     float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                    audioNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f));
+                    // Scale velocity by 1/sqrt(N) to prevent clipping with polyphony
+                    int held=0;
+                    for(int rr=0;rr<KBD_NOTE_ROWS;rr++) for(int cc=0;cc<KBD_COLS;cc++) if(activeNotes[rr][cc]) held++;
+                    float polyScale = 1.0f / sqrtf(fmaxf(1.0f, (float)held));
+                    audioNoteOn(note, constrain((0.8f+jx*0.6f) * polyScale, 0.05f, 1.0f));
                 } else audioNoteOff(note);
             } else {
                 // Arp: add/remove from held notes list
@@ -2949,6 +4277,265 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     t303CurrentNote = 0;
                     t303PressedRow  = -1;
                     t303PressedCol  = -1;
+                }
+            }
+            break;
+        }
+        case MODE_DRUM2: {
+            if (!pressed) break;
+            if (drum2SeqView) {
+                if (row >= 2) {
+                    // Rows 2+3: 16-step grid
+                    // placeMod = 0 (NRM) if pad was selected from normal row, else current alt mode
+                    uint8_t step = (uint8_t)((row == 3 ? 0 : 8) + (KBD_COLS - 1 - col));
+                    if (step >= DR2_STEPS) break;
+                    uint8_t placeMod = drum2SelFromAlt ? drum2PadAltMode[drum2SelPad] : 0;
+                    if (drum2SeqVel[drum2SelPad][step] > 0) {
+                        if (drum2SeqMod[drum2SelPad][step] == placeMod) {
+                            // Same mod → toggle OFF (remove)
+                            drum2SeqVel[drum2SelPad][step]      = 0;
+                            drum2SeqRow[drum2SelPad][step]      = 0;
+                            drum2SeqMod[drum2SelPad][step]      = 0;
+                            drum2SeqPitchOff[drum2SelPad][step] = 0;
+                        } else {
+                            // Different mod → replace, keep velocity
+                            drum2SeqMod[drum2SelPad][step] = placeMod;
+                        }
+                    } else {
+                        // Empty → place with placeMod
+                        drum2SeqVel[drum2SelPad][step]      = 100;
+                        drum2SeqRow[drum2SelPad][step]      = 2;
+                        drum2SeqMod[drum2SelPad][step]      = placeMod;
+                        drum2SeqPitchOff[drum2SelPad][step] = 0;
+                    }
+                } else if (row == 1) {
+                    // Row 1: alt element row — selects pad as "alt", cycles alt mode 1→2→3→1
+                    uint8_t padIdx = (uint8_t)(KBD_COLS - 1 - col);
+                    if (padIdx >= DRUM2_PADS) break;
+                    drum2SelPad     = (int8_t)padIdx;
+                    drum2SelFromAlt = true;
+                    uint8_t cur = drum2PadAltMode[padIdx];
+                    drum2PadAltMode[padIdx] = (cur == 0 || cur >= 3) ? 1 : cur + 1;
+                } else {
+                    // Row 0: normal element row — selects pad as "normal" (NRM placement)
+                    uint8_t padIdx = (uint8_t)(KBD_COLS - 1 - col);
+                    if (padIdx >= DRUM2_PADS) break;
+                    drum2SelPad     = (int8_t)padIdx;
+                    drum2SelFromAlt = false;
+                    if (padIdx == DRUM2_CH || padIdx == DRUM2_OH) {
+                        uint8_t other = (padIdx == DRUM2_CH) ? DRUM2_OH : DRUM2_CH;
+                        amy_event stop = amy_default_event();
+                        stop.osc = DRUM_OSC_BASE + kDrum2Remap[other];
+                        stop.velocity = 0.0f;
+                        amy_add_event(&stop);
+                    }
+                    audioDrum2Hit(kDrum2Remap[padIdx], 0.70f * drum2Volume[padIdx],
+                                  drum2Pitch[padIdx], drum2Decay[padIdx]);
+                    drum2PadFlashMs[padIdx] = millis();
+                }
+            } else {
+                // Pad mode: col=7(left)=pad0(KK1) … col=0(right)=pad7(RDE)
+                // Rows vary pitch + decay (ghost/soft/normal/accent) for expressive playing
+                uint8_t padIdx = (uint8_t)(KBD_COLS - 1 - col);
+                if (padIdx >= DRUM2_PADS) break;
+                drum2SelPad = (int8_t)padIdx;
+                uint8_t rv = row < KBD_NOTE_ROWS ? row : 2;
+                const Dr2RowVar& var = kDr2RowVar[rv];
+                float vel = var.vel * drum2Volume[padIdx];
+                uint8_t pitch = (uint8_t)constrain((int)drum2Pitch[padIdx] + var.pitchOff, 0, 127);
+                float dec = drum2Decay[padIdx] > 0 ? drum2Decay[padIdx] * var.decayFact : 0;
+                // Choke
+                if (padIdx == DRUM2_CH || padIdx == DRUM2_OH) {
+                    uint8_t other = (padIdx == DRUM2_CH) ? DRUM2_OH : DRUM2_CH;
+                    amy_event stop = amy_default_event();
+                    stop.osc = DRUM_OSC_BASE + kDrum2Remap[other];
+                    stop.velocity = 0.0f;
+                    amy_add_event(&stop);
+                }
+                audioDrum2Hit(kDrum2Remap[padIdx], vel, pitch, dec);
+                drum2PadFlashMs[padIdx] = millis();
+                // Quantized recording — stores row so playback matches the live hit
+                if (drum2RecArmed && drum2Playing) {
+                    unsigned long stepMs = 60000UL / (unsigned long)bpm / 4;
+                    unsigned long elapsed = millis() - drum2LastStepMs;
+                    uint8_t nearStep = (elapsed > stepMs / 2)
+                                     ? (drum2Step + 1) % DR2_STEPS
+                                     : drum2Step;
+                    drum2SeqVel[padIdx][nearStep]      = (uint8_t)constrain((int)(vel * 127.f), 1, 127);
+                    drum2SeqRow[padIdx][nearStep]      = rv;
+                    drum2SeqMod[padIdx][nearStep]      = 0;
+                    drum2SeqPitchOff[padIdx][nearStep] = 0;  // auto-record: no pitch offset
+                }
+            }
+            break;
+        }
+        case MODE_303S: {
+            if (s303SeqView) {
+                if (row >= 2) {
+                    // Top rows (steps): place selected note; same note on occupied step = silence
+                    if (!pressed) break;
+                    uint8_t step = (uint8_t)((row == 3 ? 0 : 8) + (KBD_COLS - 1 - col));
+                    if (step >= S303_STEPS) break;
+                    s303SelStep = step;
+                    if (s303SelNote > 0) {
+                        if (s303Note[step] == s303SelNote) {
+                            s303Note[step] = 0;  // same note → silence
+                        } else {
+                            s303Note[step] = s303SelNote;
+                            s303Alt[step]  = s303PendingAlt;
+                        }
+                    }
+                } else {
+                    // Bottom rows (notes): select note + preview only — never touches steps
+                    uint8_t note = noteMap.getMidiNoteByIdx((KBD_COLS - 1 - col) * 2 + row);
+                    uint8_t notePlay = (uint8_t)constrain((int)note + (int)t303Oct*12, 0, 127);
+                    if (pressed) {
+                        activeNotes[row][col] = note + 1;
+                        s303SelNote = note + 1;
+                        audioT303NoteOn(notePlay, 0.7f);
+                    } else {
+                        activeNotes[row][col] = 0;
+                        audioT303NoteOff(notePlay);
+                    }
+                }
+            } else {
+                // PAD view: play 303 live + auto-record at current step when playing
+                uint8_t note = noteMap.getMidiNote(row, col);
+                uint8_t notePlay = (uint8_t)constrain((int)note + (int)t303Oct*12, 0, 127);
+                if (pressed) {
+                    activeNotes[row][col] = note;
+                    // Slide if was playing and slide is on
+                    if (t303CurrentNote && t303SlideOn) {
+                        t303SlideFrom=t303CurrentNote; t303SlideTo=notePlay;
+                        t303SlideMs=millis(); t303SlideActive=true;
+                    } else {
+                        t303SlideActive=false; audioT303PitchBend(1.0f);
+                    }
+                    float vel = t303AccentOn ? 1.2f : 0.7f;
+                    audioT303NoteOn(notePlay, vel);
+                    t303CurrentNote = notePlay; t303PressedRow=(int8_t)row; t303PressedCol=(int8_t)col;
+                    // Auto-record to current step when playing
+                    if (drum2Playing) {
+                        uint8_t nearStep = drum2Step;
+                        unsigned long stepMs = 60000UL / (unsigned long)bpm / 4;
+                        if (millis() - drum2LastStepMs > stepMs / 2)
+                            nearStep = (drum2Step + 1) % S303_STEPS;
+                        s303Note[nearStep] = note + 1;
+                        if (t303AccentOn && s303Alt[nearStep]==0) s303Alt[nearStep]=1;
+                    }
+                } else {
+                    if ((int8_t)row == t303PressedRow && (int8_t)col == t303PressedCol) {
+                        audioT303NoteOff(notePlay);
+                        t303CurrentNote=0; t303PressedRow=-1; t303PressedCol=-1;
+                    }
+                    activeNotes[row][col] = 0;
+                }
+            }
+            break;
+        }
+        case MODE_SS2: {
+            // Mode unique (pas de toggle vue) — note-first
+            // Top 2 rows (rows 2-3): 16 steps
+            // Bottom 2 rows (rows 0-1): 16 slots (select + assign depuis filebrowser)
+            if (row >= 2) {
+                // Step press: place selected slot on step; same → clear
+                if (!pressed) break;
+                uint8_t step = (uint8_t)((row==3?0:8)+(KBD_COLS-1-col));
+                if (step >= SS2_SLOTS) break;
+                ss2SelStep = step;
+                if (ss2SelSlot < SS2_SLOTS) {
+                    ss2Note[step] ^= (uint16_t)(1u << ss2SelSlot);  // toggle selected slot on/off
+                }
+            } else {
+                // Slot press: sélectionner slot + assigner fichier SD si disponible; sinon preview
+                uint8_t slot=(uint8_t)((KBD_COLS-1-col)*2+row);
+                if (slot>=SS2_SLOTS) break;
+                if (pressed) {
+                    activeNotes[row][col]=(uint8_t)(slot+1);
+                    ss2SelSlot=slot;
+                    if (sdReady && sdCursor<sdFileCount && !sdFileIsDir[sdCursor] && isAudioFile(sdFiles[sdCursor].c_str())) {
+                        char fp[256];
+                        snprintf(fp,sizeof(fp),"%s%s",sdPath.c_str(),sdFiles[sdCursor].c_str());
+                        strncpy(ss2Path[slot],fp,sizeof(ss2Path[0])-1);
+                        ss2Path[slot][sizeof(ss2Path[0])-1]='\0';
+                        audioLoadKey(fp,(uint8_t)(SS2_KEY_BASE+slot));
+                        ss2Loaded[slot]=false;
+                        if (slot < SS2_SLOTS-1) ss2SelSlot=slot+1;
+                    } else if (ss2Loaded[slot]) {
+                        audioPlayKey((uint8_t)(SS2_KEY_BASE+slot),0.8f);
+                    }
+                } else {
+                    activeNotes[row][col]=0;
+                }
+            }
+            break;
+        }
+        case MODE_SYSEQ: {
+            if (syseqSeqView) {
+                if (row >= 2) {
+                    // Top rows (steps): place all currently-held notes; same note = toggle off
+                    if (!pressed) break;
+                    uint8_t step = (uint8_t)((row == 3 ? 0 : 8) + (KBD_COLS - 1 - col));
+                    if (step >= SYSEQ_STEPS) break;
+                    syseqSelStep = step;
+                    // Place each note currently held in bottom rows
+                    for (uint8_t r2=0; r2<KBD_NOTE_ROWS; r2++)
+                        for (uint8_t c2=0; c2<KBD_COLS; c2++) {
+                            if (!activeNotes[r2][c2]) continue;
+                            uint8_t stored = (uint8_t)(activeNotes[r2][c2] + 1);
+                            bool found = false;
+                            for (uint8_t i=0; i<SYSEQ_CHORD; i++)
+                                if (syseqNotes[step][i] == stored) {
+                                    syseqNotes[step][i] = 0; syseqVels[step][i] = 0;
+                                    found = true; break;
+                                }
+                            if (!found)
+                                for (uint8_t i=0; i<SYSEQ_CHORD; i++)
+                                    if (syseqNotes[step][i] == 0) {
+                                        syseqNotes[step][i] = stored;
+                                        syseqVels[step][i]  = 100;
+                                        break;
+                                    }
+                        }
+                } else {
+                    // Bottom rows (notes): select + preview only — no step modification
+                    uint8_t note = noteMap.getMidiNoteByIdx((KBD_COLS - 1 - col) * 2 + row);
+                    if (pressed) {
+                        activeNotes[row][col] = note;
+                        audioNoteOn(note, 0.75f);
+                    } else {
+                        activeNotes[row][col] = 0;
+                        audioNoteOff(note);
+                    }
+                }
+            } else {
+                // PAD view: standard noteMap keyboard + auto-record when playing
+                uint8_t note = noteMap.getMidiNote(row, col);
+                activeNotes[row][col] = pressed ? note : 0;
+                if (pressed) {
+                    float jx = constrain(cachedJoyX/64.0f, -1.0f, 1.0f);
+                    int held = 0;
+                    for(int rr=0;rr<KBD_NOTE_ROWS;rr++) for(int cc=0;cc<KBD_COLS;cc++) if(activeNotes[rr][cc]) held++;
+                    float polyScale = 1.0f / sqrtf(fmaxf(1.0f, (float)held));
+                    float vel = constrain((0.8f + jx*0.6f) * polyScale, 0.05f, 1.0f);
+                    audioNoteOn(note, vel);
+                    // Auto-record at current step if playing
+                    if (drum2Playing) {
+                        bool found = false;
+                        for (uint8_t i = 0; i < SYSEQ_CHORD; i++)
+                            if (syseqNotes[drum2Step][i] == note + 1) { found = true; break; }
+                        if (!found) {
+                            for (uint8_t i = 0; i < SYSEQ_CHORD; i++) {
+                                if (syseqNotes[drum2Step][i] == 0) {
+                                    syseqNotes[drum2Step][i] = note + 1;
+                                    syseqVels[drum2Step][i] = (uint8_t)constrain((int)(vel*127.0f),1,127);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    audioNoteOff(note);
                 }
             }
             break;
@@ -3164,7 +4751,7 @@ void setup() {
     s_audioEventQueue = xQueueCreate(16, sizeof(KeyEvent));
     setNoteKeyCallback(kbdEventBridge);
     s_ledSem = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(audioHandlerTask, "audioHdlr", 4096, nullptr, 22, nullptr, 1);
+    xTaskCreatePinnedToCore(audioHandlerTask, "audioHdlr", 8192, nullptr, 22, nullptr, 1);
     xTaskCreatePinnedToCore(ledUpdateTask,    "led",       3072, nullptr,  4, nullptr, 0);
     xTaskCreatePinnedToCore(statsTask,        "stats",     4096, nullptr,  1, nullptr, 0);
 
@@ -3227,7 +4814,27 @@ void loop() {
 
     // ---- JOYSTICK CLICK ----
     bool click=!digitalRead(JOYSW);
-    if(click&&!lastClick){
+    // Long click (>600ms) in file-browser modes: navigate to parent directory (or menu at root)
+    // Only arm the timer when the press starts inside a browser mode (avoids false fire after menu navigation)
+    {
+        bool isBrw = !menuOpen && sdReady &&
+            (currentMode==MODE_SS2 ||
+             currentMode==MODE_SAMPLE || currentMode==MODE_SEQ ||
+             currentMode==MODE_GRANULAR || currentMode==MODE_GRANULAR2);
+        if (click && !lastClick) { joyClickMs = isBrw ? millis() : 0; joyLongFired = false; }
+    }
+    if (click && !joyLongFired && joyClickMs && (millis() - joyClickMs >= 600)) {
+        joyLongFired = true;
+        bool isBrowserMode = !menuOpen && sdReady &&
+            (currentMode==MODE_SS2 ||
+             currentMode==MODE_SAMPLE || currentMode==MODE_SEQ ||
+             currentMode==MODE_GRANULAR || currentMode==MODE_GRANULAR2);
+        if (isBrowserMode) {
+            if (sdPath == "/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; }
+            else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1)); sdScroll=0; sdCursor=0; }
+        }
+    }
+    if (click && !lastClick && !joyLongFired) {
         if(menuOpen){
             selectMenuItem();
         } else if(currentMode==MODE_GRANULAR&&sdReady){
@@ -3304,11 +4911,34 @@ void loop() {
                     audioLoadAndPlay(fp.c_str(), PCM_PREVIEW_PRESET, volume);
                 }
             }
+        } else if (currentMode==MODE_SS2 && sdReady) {
+            if (sdCursor < sdFileCount) {
+                if (sdFiles[sdCursor]=="..") {
+                    if (sdPath=="/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; }
+                    else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1)); sdScroll=0; sdCursor=0; }
+                } else if (sdFileIsDir[sdCursor]) {
+                    if(!sdPath.endsWith("/")) sdPath+="/"; sdPath+=sdFiles[sdCursor]; sdPath+="/";
+                    sdListDir(sdPath.c_str()); sdScroll=0; sdCursor=0;
+                } else if (isAudioFile(sdFiles[sdCursor].c_str())) {
+                    char fp[256];
+                    snprintf(fp,sizeof(fp),"%s%s",sdPath.c_str(),sdFiles[sdCursor].c_str());
+                    strncpy(ss2Path[ss2SelSlot],fp,sizeof(ss2Path[0])-1);
+                    ss2Path[ss2SelSlot][sizeof(ss2Path[0])-1]='\0';
+                    audioLoadKey(fp,(uint8_t)(SS2_KEY_BASE+ss2SelSlot));
+                    ss2Loaded[ss2SelSlot]=false;
+                    if(ss2SelSlot < SS2_SLOTS-1) ss2SelSlot++;
+                }
+            }
         } else {
             audioAllNotesOff(); omniRoot=0xFF; omniStrumPos=-1;
             menuOpen=true; menuRow=0; menuCol=0;
         }
+        // A short-click was handled — prevent the long-click from also firing for this same press.
+        // Without this, holding the joystick >600ms after a folder entry would trigger the
+        // long-click and immediately navigate back to parent.
+        joyLongFired = true;
     }
+    if (!click) { joyClickMs = 0; joyLongFired = false; }
     lastClick=click;
 
     // ---- OMNICHORD STRUM ----
@@ -3373,6 +5003,159 @@ void loop() {
             float bend=(fabsf(jy)<0.15f)?0:-jy;
             audioSetPitchBend(powf(2.0f,bend*2.0f/12.0f));
             ljy=jy;
+        }
+    }
+
+    // ---- DRUM2 SEQUENCER ----
+    // Doubled-hit deferred fires (from DR2_MOD_DBL steps)
+    for(uint8_t pi=0;pi<DRUM2_PADS;pi++){
+        if(drum2DblPendingAt[pi] && millis() >= drum2DblPendingAt[pi]){
+            audioDrum2Hit(kDrum2Remap[pi], drum2Volume[pi]*0.65f, drum2DblPitch[pi], drum2Decay[pi]*0.5f);
+            drum2PadFlashMs[pi] = millis();
+            drum2DblPendingAt[pi] = 0;
+        }
+    }
+    // ---- SHARED DRUM2+SYSEQ SEQUENCER TICK ----
+    if(drum2Playing){
+        float jx   = constrain(cachedJoyX/64.0f, -1.0f, 1.0f);
+        float jy   = constrain(cachedJoyY/64.0f, -1.0f, 1.0f);
+        float swing = fmaxf(jx, 0.0f) * 0.34f;
+        bool prevEven = ((drum2Step & 1) == 0);
+        float factor  = prevEven ? (1.0f + swing) : (1.0f - swing);
+        unsigned long waitMs = (unsigned long)fmaxf(10.0f, 60000.0f / bpm / 4.0f * factor);
+        if(millis() - drum2LastStepMs >= waitMs){
+            drum2LastStepMs += waitMs;
+            if(millis() - drum2LastStepMs > waitMs) drum2LastStepMs = millis(); // catch-up guard
+            drum2Step = (drum2Step + 1) % DR2_STEPS;
+            for(uint8_t pi=0;pi<DRUM2_PADS;pi++){
+                uint8_t vel8 = drum2SeqVel[pi][drum2Step];
+                if(vel8 == 0) continue;
+                // Row variation stored at record time — apply pitch & decay offsets for playback
+                uint8_t rv = drum2SeqRow[pi][drum2Step];
+                const Dr2RowVar& var = kDr2RowVar[rv < KBD_NOTE_ROWS ? rv : 2];
+                float vel = drum2Volume[pi] * vel8 / 127.0f * (1.0f + jy * 0.25f); // JY ±25% vel
+                vel = constrain(vel, 0.05f, 1.2f);
+                // Per-step pitch: base pot pitch + step offset (from cycling/row-1 edit)
+                uint8_t pitch = (uint8_t)constrain(
+                    (int)drum2Pitch[pi] + (int)drum2SeqPitchOff[pi][drum2Step] + (int)var.pitchOff,
+                    0, 127);
+                float dec = drum2Decay[pi] > 0 ? drum2Decay[pi] * var.decayFact : 0;
+                uint8_t mod = drum2SeqMod[pi][drum2Step];
+                // Choke CH/OH
+                if(pi == DRUM2_CH || pi == DRUM2_OH){
+                    uint8_t other = (pi == DRUM2_CH) ? DRUM2_OH : DRUM2_CH;
+                    if(drum2SeqVel[other][drum2Step] == 0){
+                        amy_event stop = amy_default_event();
+                        stop.osc = DRUM_OSC_BASE + kDrum2Remap[other];
+                        stop.velocity = 0.0f;
+                        amy_add_event(&stop);
+                    }
+                }
+                switch(mod){
+                    case 1: // Probabilistic 50%
+                        if(random(2)){ audioDrum2Hit(kDrum2Remap[pi],vel,pitch,dec); drum2PadFlashMs[pi]=millis(); }
+                        break;
+                    case 2: // Random pitch — audible range 36-96 (C2-C7)
+                        { uint8_t rp=(uint8_t)constrain(36+(int)random(61),0,127);
+                          audioDrum2Hit(kDrum2Remap[pi],vel,rp,dec); drum2PadFlashMs[pi]=millis(); }
+                        break;
+                    case 3: // Double hit: now + exactly half the current step duration
+                        audioDrum2Hit(kDrum2Remap[pi],vel,pitch,dec);
+                        drum2DblPendingAt[pi] = millis() + waitMs/2;
+                        drum2DblPitch[pi] = pitch;
+                        drum2PadFlashMs[pi]=millis();
+                        break;
+                    default: // Normal
+                        audioDrum2Hit(kDrum2Remap[pi],vel,pitch,dec);
+                        drum2PadFlashMs[pi]=millis();
+                        break;
+                }
+            }
+            // ---- SYSEQ notes at same shared step ----
+            {
+                bool newHasNotes = false;
+                for(uint8_t i=0;i<SYSEQ_CHORD;i++) if(syseqNotes[drum2Step][i]) { newHasNotes=true; break; }
+                // FUL: only stop previous notes if new step has notes (sustain through empty steps)
+                if (!syseqActiveIsFull || newHasNotes) {
+                    for(uint8_t i=0;i<syseqActiveCnt;i++) audioNoteOff(syseqActive[i]);
+                    syseqActiveCnt = 0;
+                }
+                if (newHasNotes) {
+                    for(uint8_t i=0;i<SYSEQ_CHORD;i++){
+                        if(!syseqNotes[drum2Step][i]) continue;
+                        uint8_t note = syseqNotes[drum2Step][i] - 1;
+                        float sv = syseqVels[drum2Step][i] / 127.0f;
+                        sv = constrain(sv * (1.0f + jy * 0.25f), 0.05f, 1.2f);
+                        audioNoteOn(note, sv);
+                        if(syseqActiveCnt < SYSEQ_CHORD) syseqActive[syseqActiveCnt++] = note;
+                    }
+                    syseqActiveIsFull = (syseqAlt[drum2Step] == 1);
+                } else if (!syseqActiveIsFull) {
+                    syseqActiveIsFull = false;
+                }
+            }
+            // ---- 303S notes at same shared step (always, regardless of current view) ----
+            {
+                uint8_t s3n = s303Note[drum2Step];
+                uint8_t alt = s303Alt[drum2Step];
+                if (s3n > 0) {
+                    uint8_t midiNote = (uint8_t)constrain((int)(s3n - 1) + (int)t303Oct*12, 0, 127);
+                    float vel = (alt == 1) ? 1.2f : 0.7f;  // ACC=louder
+                    // Slide: previous step must have SLD alteration and a note
+                    uint8_t prevStep = (uint8_t)((drum2Step + S303_STEPS - 1) % S303_STEPS);
+                    bool slideIn = (s303Alt[prevStep]==2) && (s303Note[prevStep] > 0);
+                    if (slideIn && s303CurNote > 0) {
+                        // Slide: start pitch-bend glide (reuse t303SlideActive machinery)
+                        t303SlideFrom = s303CurNote;
+                        t303SlideTo   = midiNote;
+                        t303SlideMs   = millis();
+                        t303SlideActive = true;
+                        audioT303NoteOn(midiNote, vel);  // retrigger at new pitch; AMY blends
+                    } else {
+                        t303SlideActive = false;
+                        audioT303PitchBend(1.0f);
+                        if (s303CurNote) audioT303NoteOff(s303CurNote);
+                        audioT303NoteOn(midiNote, vel);
+                    }
+                    s303CurNote = midiNote;
+                } else {
+                    // Rest: release current note
+                    if (s303CurNote) { audioT303NoteOff(s303CurNote); s303CurNote=0; }
+                    t303SlideActive = false;
+                    audioT303PitchBend(1.0f);
+                }
+            }
+            // ---- SS2 sample at same shared step (always, regardless of current view) ----
+            {
+                uint16_t s2mask = ss2Note[drum2Step];
+                uint8_t alt = ss2Alt[drum2Step];
+                ss2CurSlot = 0xFF;
+                if (s2mask != 0 && alt != 3) {  // SIL = rest
+                    if (ss2PlayMode == 1) audioStopAllSamples();  // OVR: cut all before playing
+                    for (uint8_t slot=0; slot<SS2_SLOTS; slot++) {
+                        if (!(s2mask & (1u << slot))) continue;
+                        ss2Loaded[slot] = audioKeyLoaded((uint8_t)(SS2_KEY_BASE + slot));
+                        if (!ss2Loaded[slot]) continue;
+                        if (alt == 1) {  // REV
+                            audioPlayKeyRev((uint8_t)(SS2_KEY_BASE + slot), 0.7f);
+                            ss2LastPlayMs[slot] = millis();
+                            ss2CurSlot = slot;
+                        } else if (alt == 2) {  // FUL: no retrigger while sample running
+                            uint32_t dur = audioKeyLengthMs((uint8_t)(SS2_KEY_BASE + slot));
+                            uint32_t ela = (uint32_t)(millis() - ss2LastPlayMs[slot]);
+                            if (dur == 0 || ela >= dur || ss2LastPlayMs[slot] == 0) {
+                                audioPlayKey((uint8_t)(SS2_KEY_BASE + slot), 0.7f);
+                                ss2LastPlayMs[slot] = millis();
+                            }
+                            ss2CurSlot = slot;
+                        } else {  // NRM
+                            audioPlayKey((uint8_t)(SS2_KEY_BASE + slot), 0.7f);
+                            ss2LastPlayMs[slot] = millis();
+                            ss2CurSlot = slot;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3459,6 +5242,13 @@ void loop() {
         }
     }
 
+    // ---- SS2: poll audioKeyLoaded for each slot ----
+    if (currentMode==MODE_SS2) {
+        for(uint8_t i=0;i<SS2_SLOTS;i++)
+            if(ss2Path[i][0]) ss2Loaded[i]=audioKeyLoaded((uint8_t)(SS2_KEY_BASE+i));
+    }
+
+
     // ---- SAMPLE LOOP: retrigger held keys ----
     if(currentMode==MODE_SAMPLE&&samplePlayMode==2&&!menuOpen){
         uint32_t now=millis();
@@ -3506,6 +5296,7 @@ void loop() {
 
         if(audioReady&&!menuOpen){
             switch(currentMode){
+                case MODE_SYSEQ:  // SYSEQ uses same pot layout as SYNTH (shape/FX/env)
                 case MODE_SYNTH: {
                     static float lp1=0.5f, lp2=-1, lp3fm=-1, lp4fm=-1;  // lp1=0.5 matches initial pots[1] so J:PNO default is not overridden on first loop
                     // Pot 1 = Shape (always)
@@ -3644,7 +5435,7 @@ void loop() {
                     }
                     // P4 = Filter Resonance — 0.5→6
                     if(fabsf(pots[4].value-lpm[2])>0.002f){
-                        modReso=0.5f+pots[4].value*3.5f;  // 0.5→4.0
+                        modReso=0.5f+pots[4].value*2.5f;  // 0.5→3.0
                         audioSetFilter(modCutoff, modReso);
                         lpm[2]=pots[4].value;
                     }
@@ -3736,14 +5527,158 @@ void loop() {
                         for (int p = 0; p < 4; p++) lp303[p] = pots[3+p].value;
                         break;
                     }
-                    // P3=Reso 1→10  P4=EnvMod 0→10Hz  P5=Reverb 0→1  P6=Cutoff 80→2000Hz(exp)
-                    // P2=BPM (global — not used here)
+                    // P2 = 4-zone waveform morph: SUP(0-0.25) → SAW(0.25-0.5) → TRI(0.5-0.75) → SQR+duty(0.75-1)
+                    {
+                        static float lp303wf=-1.0f;
+                        if(fabsf(pots[1].value-lp303wf)>0.005f){
+                            float p2=pots[1].value;
+                            uint8_t nw = (p2<0.25f)?SAW_UP:(p2<0.50f)?SAW_DOWN:(p2<0.75f)?TRIANGLE:PULSE;
+                            if(nw!=t303Wave){ t303Wave=nw; if(audioReady) audioT303Wave(nw); }
+                            if(t303Wave==PULSE){
+                                float norm=(p2-0.75f)/0.25f;
+                                if(audioReady) audioT303Duty(0.5f-norm*0.48f);
+                            }
+                            lp303wf=p2;
+                        }
+                    }
                     bool ch303=false;
-                    if(fabsf(pots[3].value-lp303[0])>0.002f){ t303Reso=1.0f+pots[3].value*3.0f;           lp303[0]=pots[3].value; ch303=true; }  // 1→4
+                    if(fabsf(pots[3].value-lp303[0])>0.002f){ t303Reso=1.0f+pots[3].value*2.0f;           lp303[0]=pots[3].value; ch303=true; }
                     if(fabsf(pots[4].value-lp303[1])>0.002f){ t303EnvMod=pots[4].value*10.0f;              lp303[1]=pots[4].value; ch303=true; }
-                    if(fabsf(pots[5].value-lp303[2])>0.002f){ t303Reverb=pots[5].value;                    lp303[2]=pots[5].value; if(audioReady) audioSetReverb(t303Reverb*0.8f,0.85f,0.5f,3000.0f); }
+                    if(fabsf(pots[5].value-lp303[2])>0.002f){ t303Duration=pots[5].value; lp303[2]=pots[5].value; audioT303SetSustain(t303Duration); }
                     if(fabsf(pots[6].value-lp303[3])>0.002f){ t303Cutoff=80.0f*powf(25.0f,pots[6].value); lp303[3]=pots[6].value; ch303=true; }
                     if(ch303 && audioReady) audioT303Params(t303Cutoff,t303Reso,t303EnvMod,t303Decay);
+                    break;
+                }
+                case MODE_303S: {
+                    if (s_overlay == OVERLAY_FX) {
+                        if (fxList[fxSelected].active) {
+                            static float lp303sfx[4]={-1,-1,-1,-1};
+                            static uint8_t lp303sFxSel=0xFF;
+                            if (lp303sFxSel!=fxSelected || fxPotNeedSync) {
+                                for (int p=0;p<4;p++) lp303sfx[p]=pots[3+p].value;
+                                lp303sFxSel=fxSelected; fxPotNeedSync=false;
+                            }
+                            bool fxChanged=false;
+                            for (int p=0;p<4;p++) {
+                                if (fxList[fxSelected].paramNames[p][0]=='\0') continue;
+                                if (fabsf(pots[3+p].value-lp303sfx[p])>0.001f) {
+                                    float mn=fxList[fxSelected].paramMin[p];
+                                    float mx=fxList[fxSelected].paramMax[p];
+                                    if (fxSelected==0 && p==0)
+                                        fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
+                                    else
+                                        fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
+                                    lp303sfx[p]=pots[3+p].value;
+                                    fxChanged=true;
+                                }
+                            }
+                            if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
+                        }
+                        for (int p = 0; p < 4; p++) lp303[p] = pots[3+p].value;
+                        break;
+                    }
+                    // P2: per-wave modulation — SQR=duty (50→2%), NAP=narrow duty (15→1%), TRI/SUP/SAW=wavefolder
+                    {
+                        static float lp303swf=-1.0f;
+                        if(fabsf(pots[1].value-lp303swf)>0.005f){
+                            float p2=pots[1].value;
+                            if(t303Wave==PULSE){
+                                if(audioReady) audioT303Duty(0.5f-p2*0.48f);
+                            } else if(t303Wave==T303_NAP_WAVE){
+                                if(audioReady) audioT303Duty(0.15f-p2*0.14f);  // narrow: [0.01, 0.15]
+                            } else {
+                                if(audioReady) audioT303Wavefold(p2);
+                            }
+                            lp303swf=p2;
+                        }
+                    }
+                    bool ch303s=false;
+                    if(fabsf(pots[3].value-lp303[0])>0.002f){ t303Reso=1.0f+pots[3].value*2.0f;           lp303[0]=pots[3].value; ch303s=true; }
+                    if(fabsf(pots[4].value-lp303[1])>0.002f){ t303EnvMod=pots[4].value*10.0f;              lp303[1]=pots[4].value; ch303s=true; }
+                    if(fabsf(pots[5].value-lp303[2])>0.002f){ t303Duration=pots[5].value; lp303[2]=pots[5].value; t303Decay=30.0f*powf(100.0f,t303Duration); audioT303SetSustain(0.0f); ch303s=true; }
+                    if(fabsf(pots[6].value-lp303[3])>0.002f){ t303Cutoff=80.0f*powf(25.0f,pots[6].value); lp303[3]=pots[6].value; ch303s=true; }
+                    if(ch303s && audioReady) audioT303Params(t303Cutoff,t303Reso,t303EnvMod,t303Decay);
+                    break;
+                }
+                case MODE_SS2: {
+                    if (s_overlay == OVERLAY_FX) {
+                        if (fxList[fxSelected].active) {
+                            static float lpSS2fx[4]={-1,-1,-1,-1};
+                            static uint8_t lpSS2FxSel=0xFF;
+                            if (lpSS2FxSel!=fxSelected || fxPotNeedSync) {
+                                for (int p=0;p<4;p++) lpSS2fx[p]=pots[3+p].value;
+                                lpSS2FxSel=fxSelected; fxPotNeedSync=false;
+                            }
+                            bool fxChanged=false;
+                            for (int p=0;p<4;p++) {
+                                if (fxList[fxSelected].paramNames[p][0]=='\0') continue;
+                                if (fabsf(pots[3+p].value-lpSS2fx[p])>0.001f) {
+                                    float mn=fxList[fxSelected].paramMin[p];
+                                    float mx=fxList[fxSelected].paramMax[p];
+                                    if (fxSelected==0 && p==0)
+                                        fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
+                                    else
+                                        fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
+                                    lpSS2fx[p]=pots[3+p].value; fxChanged=true;
+                                }
+                            }
+                            if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
+                        }
+                        break;
+                    }
+                    break;
+                }
+                case MODE_DRUM2: {
+                    static float lpD2[3]    = {-1.f,-1.f,-1.f};
+                    static int8_t lpD2Pad   = -1;
+                    static float lpD2fx[4]  = {-1.f,-1.f,-1.f,-1.f};
+                    static uint8_t lpD2FxSel = 0xFF;
+                    // If any FX is active, pots P3-P6 control the selected FX's parameters.
+                    bool anyFxActive = false;
+                    for (int f=0;f<FX_COUNT;f++) if(fxList[f].active){anyFxActive=true;break;}
+                    if (anyFxActive) {
+                        if (lpD2FxSel != fxSelected || fxPotNeedSync) {
+                            for (int p=0;p<4;p++) lpD2fx[p]=pots[3+p].value;
+                            lpD2FxSel=fxSelected; fxPotNeedSync=false;
+                        }
+                        bool fxChanged=false;
+                        for (int p=0;p<4;p++) {
+                            if (fxList[fxSelected].paramNames[p][0]=='\0') continue;
+                            if (fabsf(pots[3+p].value-lpD2fx[p])>0.001f) {
+                                float mn=fxList[fxSelected].paramMin[p];
+                                float mx=fxList[fxSelected].paramMax[p];
+                                if (fxSelected==0 && p==0)
+                                    fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
+                                else
+                                    fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
+                                lpD2fx[p]=pots[3+p].value; fxChanged=true;
+                            }
+                        }
+                        if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
+                        // Keep pad baselines in sync so no jump when FX are all deactivated
+                        for (int p=0;p<3;p++) lpD2[p]=pots[3+p].value;
+                        lpD2Pad = drum2SelPad;
+                        break;
+                    }
+                    // No active FX — P3=Pitch  P4=Decay  P5=Volume (per selected pad)
+                    lpD2FxSel = 0xFF;  // force FX pot resync next time FX activated
+                    if (lpD2Pad != drum2SelPad) {
+                        lpD2[0]=pots[3].value; lpD2[1]=pots[4].value; lpD2[2]=pots[5].value;
+                        lpD2Pad = drum2SelPad;
+                    }
+                    if(fabsf(pots[3].value-lpD2[0])>0.004f){
+                        drum2Pitch[drum2SelPad]=(uint8_t)constrain((int)(pots[3].value*127.f),0,127);
+                        lpD2[0]=pots[3].value;
+                    }
+                    if(fabsf(pots[4].value-lpD2[1])>0.004f){
+                        drum2Decay[drum2SelPad] = (pots[4].value < 0.05f) ? 0.0f
+                                                : 50.0f * powf(40.0f, pots[4].value);
+                        lpD2[1]=pots[4].value;
+                    }
+                    if(fabsf(pots[5].value-lpD2[2])>0.004f){
+                        drum2Volume[drum2SelPad]=pots[5].value;
+                        lpD2[2]=pots[5].value;
+                    }
                     break;
                 }
                 case MODE_MOD2: {
@@ -3763,7 +5698,7 @@ void loop() {
                     }
                     // P4 = Resonance — linear: 0.5..4
                     if(fabsf(pots[4].value-lp2[2])>0.01f){
-                        mod2Reso=0.5f+pots[4].value*3.5f;  // 0.5→4.0
+                        mod2Reso=0.5f+pots[4].value*2.5f;  // 0.5→3.0
                         m2changed=true; lp2[2]=pots[4].value;
                     }
                     if(m2changed && audioReady) audioSetFilter(mod2Cutoff,mod2Reso);
@@ -3815,7 +5750,15 @@ void loop() {
             audioSetAllFilters(cut, baseRes);
         }
 
-        // Smooth LPF cutoff application — anti-zipper when turning the cutoff encoder.
+        // Detect FILT type change (params[2]); re-apply immediately (biquad reset on type change is expected).
+        if (fxList[0].active && audioReady) {
+            static const uint8_t kFiltAMY2[] = {FILTER_LPF, FILTER_LPF24, FILTER_HPF, FILTER_BPF};
+            static uint8_t s_fxFiltTypeApplied = 0xFF;
+            uint8_t ti = (uint8_t)constrain((int)roundf(fxList[0].params[2]), 0, 3);
+            if (ti != s_fxFiltTypeApplied) { s_fxFiltTypeApplied = ti; applyFxEffect(0); }
+        }
+
+        // Smooth FILT cutoff application — anti-zipper when turning the cutoff encoder.
         // Use audioSetFilterFreq (no filter_type field) to avoid AMY biquad state resets
         // that cause an audible pop/click on each value change.
         if (fxList[0].active && !fxList[6].active && audioReady) {
@@ -3915,7 +5858,7 @@ void loop() {
         }
 
         // 303 portamento slide: interpolate pitch_bend from t303SlideFrom to t303SlideTo
-        if(currentMode==MODE_303 && t303SlideActive && audioReady){
+        if((currentMode==MODE_303||currentMode==MODE_303S) && t303SlideActive && audioReady){
             unsigned long elapsed = millis() - t303SlideMs;
             unsigned long slideDur = max(30UL, 60000UL / (unsigned long)bpm / 4); // one 16th note
             if(elapsed >= slideDur){
@@ -3943,6 +5886,55 @@ void loop() {
                 last303CutSent = effCut;
             }
         }
+
+        // 303S joystick: X=wave (TRI/SUP/SAW/SQR), Y=octave (debounced, hold-scroll)
+        if (currentMode==MODE_303S && !menuOpen) {
+            static unsigned long s303jWvMs=0, s303jOctMs=0;
+            static bool s303jWvArm=false, s303jOctArm=false;
+            float jx=cachedJoyX/64.0f, jy=cachedJoyY/64.0f;
+            unsigned long now=millis();
+            bool jxH=(fabsf(jx)>0.45f), jyH=(fabsf(jy)>0.45f);
+            if(!jxH) s303jWvArm=false;
+            if(!jyH) s303jOctArm=false;
+            if(jxH && (!s303jWvArm || now-s303jWvMs>=150)){
+                int8_t dir=(jx>0)?1:-1;
+                static const uint8_t kT303Waves[]={TRIANGLE, SAW_UP, SAW_DOWN, PULSE, T303_NAP_WAVE};
+                uint8_t ci=0;
+                for(uint8_t i=0;i<5;i++) if(kT303Waves[i]==t303Wave){ci=i;break;}
+                ci=(uint8_t)((ci+5+dir)%5);
+                t303Wave=kT303Waves[ci];
+                uint8_t amyWv=(t303Wave==T303_NAP_WAVE)?PULSE:t303Wave;
+                if(audioReady) audioT303Wave(amyWv);
+                if(t303Wave==PULSE        && audioReady) audioT303Wavefold(0.0f);
+                if(t303Wave==T303_NAP_WAVE && audioReady) { audioT303Wavefold(0.0f); audioT303Duty(0.10f); }
+                s303jWvMs=now; s303jWvArm=true;
+            }
+            if(jyH && (!s303jOctArm || now-s303jOctMs>=300)){
+                int8_t dir=(jy>0)?-1:1;
+                t303Oct=(int8_t)constrain(t303Oct+dir,-3,3);
+                s303jOctMs=now; s303jOctArm=true;
+            }
+        }
+
+        // SS2 joystick: PAD view always scrolls file browser; SEQ view scrolls step/slot
+        if (currentMode==MODE_SS2 && !menuOpen && sdReady) {
+            static unsigned long ss2jMs=0;
+            if (millis()-ss2jMs >= 150) {
+                float jy=cachedJoyY/64.0f;
+                if (!ss2SeqView) {
+                    // PAD: JY scrolls file list
+                    if (jy < -0.4f && sdCursor > 0)           { sdCursor--; if(sdCursor<sdScroll) sdScroll=sdCursor; ss2jMs=millis(); }
+                    if (jy >  0.4f && sdCursor<sdFileCount-1) { sdCursor++; if(sdCursor>=sdScroll+8) sdScroll++; ss2jMs=millis(); }
+                } else {
+                    float jx=cachedJoyX/64.0f;
+                    if (jy < -0.4f && ss2SelSlot > 0)             { ss2SelSlot--; ss2jMs=millis(); }
+                    if (jy >  0.4f && ss2SelSlot < SS2_SLOTS-1)   { ss2SelSlot++; ss2jMs=millis(); }
+                    if (jx < -0.4f && ss2SelStep > 0)             { ss2SelStep--; ss2jMs=millis(); }
+                    if (jx >  0.4f && ss2SelStep < SS2_SLOTS-1)   { ss2SelStep++; ss2jMs=millis(); }
+                }
+            }
+        }
+
 
         // MIDI joystick: Y=Pitch Bend (vertical), X=Modulation CC#1 (push right)
 #if CONFIG_TINYUSB_MIDI_ENABLED
@@ -4281,9 +6273,12 @@ void loop() {
         }
     }
 
-    // ---- DISPLAY (100ms) ----
+    // ---- DISPLAY (100ms, or 200ms at high BPM to reduce sequencer jitter) ----
+    // sendBuffer() blocks ~47ms (I2C 400kHz × 128×128px). At 600 BPM step=25ms,
+    // one step is always late after each display. Doubling the interval halves jitter frequency.
     static unsigned long lastScr=0;
-    if(millis()-lastScr>=100){lastScr=millis();drawScreen();}
+    { unsigned long scrMs = (bpm > 250) ? 200UL : 100UL;
+      if(millis()-lastScr>=scrMs){lastScr=millis();drawScreen();} }
 
     // ---- POWER (500ms) ----
     static unsigned long lastPwr=0;

@@ -2,39 +2,39 @@
 #include "mp3dec.h"
 #include <esp_partition.h>
 // int8_t samples (format: static const int8_t name[], size via sizeof)
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/kick1.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/kick2.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snare1.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snare2.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snare3.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snareB3.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/hihat1.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/bongo1.h"
+#include "kick1.h"
+#include "kick2.h"
+#include "snare1.h"
+#include "snare2.h"
+#include "snare3.h"
+#include "snareB3.h"
+#include "hihat1.h"
+#include "bongo1.h"
 // const int samples (format: const int name[], int nameLength — 16-bit values in 32-bit container)
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/kick3.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/hihat2.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/clap1.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/crash1.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/ride1.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snareB1.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/snareB2.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/bass1.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/bass2.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx1.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx2.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx3.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx4.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx5.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx6.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx7.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx8.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx9.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx10.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx11.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/sfx12.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/guitar1.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/synth1.h"
-#include "../old_project/clavier_v2/SOUNDS/Crunch_E/pad1.h"
+#include "kick3.h"
+#include "hihat2.h"
+#include "clap1.h"
+#include "crash1.h"
+#include "ride1.h"
+#include "snareB1.h"
+#include "snareB2.h"
+#include "bass1.h"
+#include "bass2.h"
+#include "sfx1.h"
+#include "sfx2.h"
+#include "sfx3.h"
+#include "sfx4.h"
+#include "sfx5.h"
+#include "sfx6.h"
+#include "sfx7.h"
+#include "sfx8.h"
+#include "sfx9.h"
+#include "sfx10.h"
+#include "sfx11.h"
+#include "sfx12.h"
+#include "guitar1.h"
+#include "synth1.h"
+#include "pad1.h"
 
 bool audioReady = false;
 
@@ -68,6 +68,7 @@ static volatile uint8_t  s_currentOsc = 0xFF;  // OSC currently being loaded (0x
 static volatile bool     s_keyLoaded[SAMPLE_KEY_COUNT]    = {};
 static uint32_t          s_keyLengthMs[SAMPLE_KEY_COUNT]  = {}; // playback duration per key
 static volatile uint8_t  s_keyError[SAMPLE_KEY_COUNT]     = {}; // KEY_ERR_* per key, 0=OK
+static bool              s_keyHasRev[SAMPLE_KEY_COUNT]    = {}; // true if reversed preset registered (SS2 slots 0-15)
 static uint8_t           s_loadError                      = KEY_ERR_NONE; // set by loaders before return false
 static float s_sampleVolume  = 1.0f;  // 0.0–2.0; applied to vel on sample playback
 static float s_pcmLPFCutoff  = 0.0f;  // 0 = no filter applied to PCM oscillators
@@ -220,6 +221,39 @@ void audioSetAllFilters(float cutoffHz, float resonance) {
     if (s_gran2ActiveOscMask) {
         amy_event ge = amy_default_event();
         ge.filter_type = bypass ? FILTER_NONE : FILTER_LPF24;
+        ge.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
+        if (!bypass) { ge.filter_freq_coefs[COEF_EG0] = 0.0f; ge.filter_freq_coefs[COEF_EG1] = 0.0f; }
+        ge.resonance = bypass ? 1.0f : resonance;
+        uint32_t mask = s_gran2ActiveOscMask;
+        while (mask) {
+            int idx = __builtin_ctz(mask);
+            ge.osc = (uint16_t)(GRANULAR_OSC_BASE + idx);
+            amy_add_event(&ge);
+            mask &= mask - 1;
+        }
+    }
+}
+
+// Same as audioSetAllFilters but with a configurable AMY filter type constant.
+// Use for FX FILT effect when the user selects a different filter topology.
+void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType) {
+    if (!audioReady) return;
+    bool bypass = (cutoffHz <= 10.0f);
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH;
+    e.filter_type = bypass ? FILTER_NONE : filterType;
+    e.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
+    if (!bypass) {
+        e.filter_freq_coefs[COEF_EG0] = 0.0f;
+        e.filter_freq_coefs[COEF_EG1] = 0.0f;
+    }
+    e.resonance = bypass ? 1.0f : resonance;
+    amy_add_event(&e);
+    s_pcmLPFCutoff = bypass ? 0.0f : cutoffHz;
+    s_pcmLPFReso   = bypass ? 1.5f : resonance;
+    if (s_gran2ActiveOscMask) {
+        amy_event ge = amy_default_event();
+        ge.filter_type = bypass ? FILTER_NONE : filterType;
         ge.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
         if (!bypass) { ge.filter_freq_coefs[COEF_EG0] = 0.0f; ge.filter_freq_coefs[COEF_EG1] = 0.0f; }
         ge.resonance = bypass ? 1.0f : resonance;
@@ -637,7 +671,9 @@ void audioSetOverdrive(float drive) {
 void audioSetVolume(float vol) {
     if (!audioReady) return;
     amy_event e = amy_default_event();
-    e.synth = SYNTH_CH; e.volume[0] = vol * 5.0f;
+    e.synth = SYNTH_CH;
+    e.volume[0] = vol * 5.0f;
+    e.volume[1] = vol * 5.0f;  // T303 is on bus 1 — scale together
     amy_add_event(&e);
 }
 
@@ -1659,8 +1695,22 @@ void bgServiceTask(void* /*param*/) {
             if (ok) {
                 s_keyLoaded[keyIdx] = true;
                 s_keyError[keyIdx]  = KEY_ERR_NONE;
-                Serial.printf("[KEY %u] OK  (psram %ukB free)\n",
-                              keyIdx, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);
+                // For SS2 slots (0-15): build a reversed copy in PSRAM for REV playback.
+                s_keyHasRev[keyIdx] = false;
+                if (keyIdx < 16) {
+                    uint32_t rlen = 0;
+                    const int16_t* src = pcm_get_sample_ram_for_preset(SAMPLE_PRESET_BASE + keyIdx, &rlen);
+                    if (src && rlen > 0) {
+                        int16_t* rev = pcm_load(SAMPLE_REV_PRESET_BASE + keyIdx, rlen, PCM_TARGET_RATE / 2, 1, 69, 0, 0);
+                        if (rev) {
+                            for (uint32_t ri = 0; ri < rlen; ri++) rev[ri] = src[rlen - 1 - ri];
+                            s_keyHasRev[keyIdx] = true;
+                        }
+                    }
+                }
+                Serial.printf("[KEY %u] OK rev=%d  (psram %ukB free)\n",
+                              keyIdx, (int)s_keyHasRev[keyIdx],
+                              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);
             } else if (!s_svcAbort) {
                 s_keyError[keyIdx] = s_loadError;
                 Serial.printf("[KEY %u] FAIL err=%u  (psram %ukB free)\n",
@@ -1740,6 +1790,32 @@ void audioPlayKey(uint8_t keyIdx, float vel) {
     amy_add_event(&e);
 }
 
+// Play reversed sample for SS2 slots (keyIdx 0-15). Falls back to forward if no reversed preset.
+void audioPlayKeyRev(uint8_t keyIdx, float vel) {
+    if (!audioReady || keyIdx >= SAMPLE_KEY_COUNT) return;
+    if (!s_keyHasRev[keyIdx]) { audioPlayKey(keyIdx, vel); return; }
+    float v = vel * s_sampleVolume;
+    if (v > 2.0f) v = 2.0f;
+    amy_event e = amy_default_event();
+    e.osc       = SAMPLE_OSC_BASE + keyIdx;
+    e.wave      = PCM;
+    e.preset    = SAMPLE_REV_PRESET_BASE + keyIdx;
+    e.midi_note = 69;
+    e.velocity  = v;
+    e.eg0_times[0] = 5;   e.eg0_values[0] = 1.0f;
+    e.eg0_times[1] = 0;   e.eg0_values[1] = 1.0f;
+    e.eg0_times[2] = 40;  e.eg0_values[2] = 0.0f;
+    e.feedback = 0.0f;
+    if (s_pcmLPFCutoff > 10.0f) {
+        e.filter_type = FILTER_LPF24;
+        e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
+        e.resonance = s_pcmLPFReso;
+    } else {
+        e.filter_type = FILTER_NONE;
+    }
+    amy_add_event(&e);
+}
+
 bool audioKeyLoaded(uint8_t keyIdx) {
     if (keyIdx >= SAMPLE_KEY_COUNT) return false;
     return s_keyLoaded[keyIdx];
@@ -1751,18 +1827,36 @@ uint8_t audioKeyError(uint8_t keyIdx) {
 }
 
 void audioClearAllKeys() {
+    // Stop all sample oscillators so AMY stops reading PCM buffers before we free them.
+    audioStopAllSamples();
+
+    // Abort bgServiceTask FIRST — it may be writing into a preset buffer right now.
+    // We must stop the writer before calling pcm_unload_preset, otherwise pcm_unload_preset
+    // frees PSRAM that bgServiceTask is still writing into → corruption.
+    if (s_loadQueue) {
+        s_svcAbort = true;
+        xQueueReset(s_loadQueue);
+        // Wait up to 300ms for bgServiceTask to notice the abort and finish its current chunk.
+        for (int i = 0; i < 30 && !s_svcDone; i++)
+            vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // Also wait a bit for AMY to finish reading any PCM data (process its event queue).
+    vTaskDelay(pdMS_TO_TICKS(20));
+
     // Unload only sample-mode presets (200-231) and the preview slot (100).
     // pcm_unload_all_presets() would also destroy drum presets (101-132),
     // causing all drums to fall back to the same ROM preset after this call.
     pcm_unload_preset(PCM_PREVIEW_PRESET);
     for (int i = 0; i < SAMPLE_KEY_COUNT; i++)
         pcm_unload_preset(SAMPLE_PRESET_BASE + i);
-    if (!s_loadQueue) return;
-    s_svcAbort = true;
-    xQueueReset(s_loadQueue);
+    for (int i = 0; i < 16; i++)  // SS2 reversed presets
+        pcm_unload_preset(SAMPLE_REV_PRESET_BASE + i);
+
     memset((void*)s_keyLoaded,   0, sizeof(s_keyLoaded));
     memset((void*)s_keyLengthMs, 0, sizeof(s_keyLengthMs));
     memset((void*)s_keyError,    0, sizeof(s_keyError));
+    memset(s_keyHasRev,          0, sizeof(s_keyHasRev));
 }
 
 void audioStopKey(uint8_t keyIdx) {
@@ -1793,23 +1887,25 @@ void audioSetSampleVolume(float v) {
 // Monophonic synth on T303_CH: SAW or SQUARE, resonant 4-pole LPF,
 // amp envelope (EG0) + filter envelope (EG1 via COEF_EG1), portamento via pitch_bend.
 
-// Single EG controls both amp AND filter (COEF_EG0), like the real 303.
-// Decay and sustain applied only at NoteOn — never mid-note (avoids EG restart artifact).
+// Single EG (EG0) controls both amp AND filter (like the real 303).
+// Decay = P5 (50ms tight pluck → 3000ms long sustained bass).
+// Sustain level and decay applied only at NoteOn to avoid EG restart mid-note.
 static float s_t303Decay   = 500.0f;
-static float s_t303Sustain = 0.0f;  // 0.0=pluck (Dec=note length), 1.0=full sustain (Dec affects filter only)
+static float s_t303Sustain = 0.0f;  // 0=note decays to silence, 1=held at full amp until note-off
+extern "C" float amy_wavefold_gain;  // defined in amy.c; controls 303 bus-1 wavefolder (1.0=dry)
 
 void audioT303Init(float cutoff, float reso, float envMod, float decay, uint8_t amyWave) {
     if (!audioReady) return;
     amy_event e = amy_default_event();
     e.synth          = T303_CH;
+    e.bus            = 1;  // dedicated bus for wavefolder processing
     e.num_voices     = 1;
     e.oscs_per_voice = 1;
     e.wave           = amyWave;
-    e.filter_type    = FILTER_LPF24;  // 4-pole, closer to 303 diode ladder character
+    e.filter_type    = FILTER_LPF24;
     e.resonance      = reso;
     e.filter_freq_coefs[COEF_CONST] = cutoff;
     e.filter_freq_coefs[COEF_EG0]   = envMod;  // filter tied to amp EG — single EG, no conflict
-    // Single EG: amp AND filter decay together
     e.eg0_times[0] = 2.0f;   e.eg0_values[0] = 1.0f;
     e.eg0_times[1] = decay;  e.eg0_values[1] = s_t303Sustain;
     e.eg0_times[2] = 30.0f;  e.eg0_values[2] = 0.0f;
@@ -1819,18 +1915,21 @@ void audioT303Init(float cutoff, float reso, float envMod, float decay, uint8_t 
 
 void audioT303NoteOn(uint8_t midiNote, float vel) {
     if (!audioReady) return;
-    // AMY processes eg0 params and midi_note trigger independently;
-    // send envelope update first so the note trigger picks up the latest decay/sustain.
+    // Send full EG spec before the note trigger so AMY picks up the latest decay.
+    // AMY's bp processing requires eg0_times[0] to be set (index 0 is the gate check);
+    // sending only index 1 silently skips the entire breakpoint update.
     { amy_event e = amy_default_event();
       e.synth = T303_CH;
-      e.eg0_times[1]  = s_t303Decay;
-      e.eg0_values[1] = s_t303Sustain;
+      e.eg0_times[0]  = 2;              e.eg0_values[0] = 1.0f;
+      e.eg0_times[1]  = (uint32_t)s_t303Decay;  e.eg0_values[1] = s_t303Sustain;
+      e.eg0_times[2]  = 30;             e.eg0_values[2] = 0.0f;
       amy_add_event(&e); }
     { amy_event e = amy_default_event();
       e.synth     = T303_CH;
       e.midi_note = midiNote;
       e.velocity  = vel;
       amy_add_event(&e); }
+    // Wavefolding applied per-bus in amy_fill_buffer() — no extra oscillators needed.
 }
 
 void audioT303NoteOff(uint8_t midiNote) {
@@ -1849,7 +1948,7 @@ void audioT303Params(float cutoff, float reso, float envMod, float decay) {
     e.synth     = T303_CH;
     e.resonance = reso;
     e.filter_freq_coefs[COEF_CONST] = cutoff;
-    e.filter_freq_coefs[COEF_EG0]   = envMod;  // COEF_EG0, not EG1
+    e.filter_freq_coefs[COEF_EG0]   = envMod;  // filter tied to amp EG
     amy_add_event(&e);
 }
 
@@ -1874,6 +1973,57 @@ void audioT303Wave(uint8_t amyWave) {
     amy_event e = amy_default_event();
     e.synth = T303_CH;
     e.wave  = amyWave;
+    amy_add_event(&e);
+}
+void audioT303Feedback(float fb) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth    = T303_CH;
+    e.feedback = fb;
+    amy_add_event(&e);
+}
+
+void audioT303Duty(float duty) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth          = T303_CH;
+    e.duty_coefs[0]  = duty;  // COEF_CONST: continuous pulse width control
+    amy_add_event(&e);
+}
+
+// P2 texture for TRI/SAW/SWU: wavefolder applied to T303 bus 1 in amy_fill_buffer().
+// depth 0→1: 1x drive (dry) → 4x drive (~2 full folds, FM-like overtones).
+// Precomputed gain avoids powf() in the audio thread.
+void audioT303Wavefold(float depth) {
+    if (depth < 0.01f) {
+        amy_wavefold_gain = 1.0f;
+    } else {
+        amy_wavefold_gain = powf(4.0f, depth);  // 1→4 as depth 0→1
+    }
+}
+
+// ==================== DRUM2 (per-pad pitch/decay control) ====================
+// Extends audioPlayDrumPad: custom MIDI note (pitch) and optional EG decay override.
+void audioDrum2Hit(uint8_t padIdx, float vel, uint8_t midiNote, float decayMs) {
+    if (!audioReady || padIdx >= DRUM_PAD_COUNT) return;
+    amy_event e = amy_default_event();
+    e.osc       = DRUM_OSC_BASE + padIdx;
+    e.wave      = PCM;
+    e.preset    = DRUM_PRESET_BASE + padIdx;
+    e.midi_note = midiNote;
+    e.velocity  = vel;
+    if (decayMs > 0.0f) {
+        e.eg0_times[0]  = 1.0f;   e.eg0_values[0] = 1.0f;
+        e.eg0_times[1]  = decayMs; e.eg0_values[1] = 0.0f;
+        e.eg0_times[2]  = 5.0f;   e.eg0_values[2] = 0.0f;
+    }
+    if (s_pcmLPFCutoff > 10.0f) {
+        e.filter_type = FILTER_LPF24;
+        e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
+        e.resonance = s_pcmLPFReso;
+    } else {
+        e.filter_type = FILTER_NONE; // explicitly clear — oscillator retains previous filter_type otherwise
+    }
     amy_add_event(&e);
 }
 

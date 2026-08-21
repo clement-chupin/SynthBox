@@ -57,6 +57,14 @@ void NoteMap::buildMap() {
     }
 }
 
+uint8_t NoteMap::getMidiNoteByIdx(int idx) const {
+    uint8_t sz = scaleSize[_scale];
+    const uint8_t *intervals = scaleIntervals[_scale];
+    uint8_t baseNote = 48 + (_octave * 12);
+    int midiNote = baseNote + (idx / sz) * 12 + intervals[idx % sz];
+    return (uint8_t)constrain(midiNote, 0, 127);
+}
+
 uint8_t NoteMap::getMidiNote(uint8_t row, uint8_t col) const {
     if (row >= KBD_NOTE_ROWS || col >= KBD_COLS)
         return 0;

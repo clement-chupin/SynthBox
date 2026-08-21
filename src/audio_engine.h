@@ -21,6 +21,7 @@ void audioRestoreShapeFilter(SynthShape shape); // restore native filter after F
 void audioSetVolume(float vol);
 void audioSetFilter(float cutoffHz, float resonance);
 void audioSetAllFilters(float cutoffHz, float resonance); // LPF on synth + all sample/seq oscs (0=open)
+void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType); // same but with explicit filter type
 void audioSetFilterFreq(float cutoffHz, float resonance); // update cutoff/reso only — no filter_type (no state reset)
 void audioSetGranular2FilterFreq(float cutoffHz, float resonance); // smooth update for currently-playing GR2 oscillators
 void audioSetPCMFilter(float cutoffHz, float resonance);  // future PCM triggers only (0=off)
@@ -50,6 +51,7 @@ void audioLoadAndPlay(const char* path, uint16_t preset, float vel);
 // audioKeyError: non-zero (KEY_ERR_*) if the last load for this key failed.
 void audioLoadKey(const char* path, uint8_t keyIdx);
 void audioPlayKey(uint8_t keyIdx, float vel);
+void audioPlayKeyRev(uint8_t keyIdx, float vel); // play reversed sample (SS2 slots only; falls back to fwd)
 void audioStopKey(uint8_t keyIdx);           // send note-off for key's oscillator
 void audioSetSampleVolume(float v);          // 0.0–2.0; default 1.0
 bool audioKeyLoaded(uint8_t keyIdx);
@@ -130,3 +132,10 @@ void audioT303SetAmpEnv(float atkMs, float sus, float relMs);               // n
 void audioT303SetSustain(float sustain);                                    // 0.0=pluck, 1.0=full sustain
 void audioT303PitchBend(float ratio);
 void audioT303Wave(uint8_t amyWave);                                        // any AMY wave constant
+void audioT303Feedback(float fb);                                           // no-op (AMY feedback is inactive for simple waveforms)
+void audioT303Duty(float duty);                                             // PULSE duty 0.5→0.01 for continuous wave morphing
+void audioT303Wavefold(float depth);                                        // wavefolder depth 0→1 for TRI/SAW/SWU — drives signal into triangle fold (1x→4x)
+
+// ==================== DRUM2 (TR-808 style per-pad control) ====================
+// Like audioPlayDrumPad but with per-pad pitch (midiNote) and optional EG decay override.
+void audioDrum2Hit(uint8_t padIdx, float vel, uint8_t midiNote, float decayMs);

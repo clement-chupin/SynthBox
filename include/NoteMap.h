@@ -25,6 +25,7 @@ public:
     int8_t getOctave() const { return _octave; }
 
     uint8_t getMidiNote(uint8_t row, uint8_t col) const;
+    uint8_t getMidiNoteByIdx(int idx) const;
     bool isNoteKey(uint8_t row, uint8_t col) const;
     bool isMenuKey(uint8_t row, uint8_t col) const;
     uint8_t getMenuButton(uint8_t row, uint8_t col) const;

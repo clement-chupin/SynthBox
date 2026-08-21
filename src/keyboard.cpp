@@ -156,8 +156,14 @@ void setupKeyboard()
     Wire1.setTimeout(3);
     delay(200);  // I2C pull-ups and TCA power stabilisation (~10ms needed, 200ms safe)
 
-    if (!keyboard.begin(TCA8418_DEFAULT_ADDR, &Wire1)) {
-        Serial.println("Keyboard begin() FAILED");
+    bool kbdOk = false;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (keyboard.begin(TCA8418_DEFAULT_ADDR, &Wire1)) { kbdOk = true; break; }
+        Serial.printf("Keyboard begin() attempt %d failed, retrying...\n", attempt + 1);
+        delay(200);
+    }
+    if (!kbdOk) {
+        Serial.println("Keyboard begin() FAILED after retries");
         while (1) delay(100);
     }
     Serial.println("Keyboard init OK");
