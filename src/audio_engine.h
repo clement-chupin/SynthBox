@@ -132,9 +132,11 @@ void audioT303SetAmpEnv(float atkMs, float sus, float relMs);               // n
 void audioT303SetSustain(float sustain);                                    // 0.0=pluck, 1.0=full sustain
 void audioT303PitchBend(float ratio);
 void audioT303Wave(uint8_t amyWave);                                        // any AMY wave constant
+void audioI303Init(float cutoff, float reso, float envMod, float decay, uint8_t amyWave); // polyphonic 303 (6 voices)
 void audioT303Feedback(float fb);                                           // no-op (AMY feedback is inactive for simple waveforms)
 void audioT303Duty(float duty);                                             // PULSE duty 0.5→0.01 for continuous wave morphing
-void audioT303Wavefold(float depth);                                        // wavefolder depth 0→1 for TRI/SAW/SWU — drives signal into triangle fold (1x→4x)
+void audioT303Wavefold(float depth);                                        // wavefolder depth 0→1 symmetric — drives signal into triangle fold (1x→8x)
+void audioT303WavefoldAsym(float depth);                                    // wavefolder depth 0→1 positive-only (TRI2: fold peaks, preserve bass)
 
 // ==================== DRUM2 (TR-808 style per-pad control) ====================
 // Like audioPlayDrumPad but with per-pad pitch (midiNote) and optional EG decay override.

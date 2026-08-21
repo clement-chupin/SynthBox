@@ -12,11 +12,7 @@
 #include "NoteMap.h"
 #include "config.h"
 #include "audio_engine.h"
-#if CONFIG_TINYUSB_MIDI_ENABLED
-#include "USB.h"
-#include "USBMIDI.h"
-static USBMIDI usbMIDI("GrvEP");
-#endif
+#include "midi_usb.h"
 // Patch names from Diapasonix (258 Juno+DX7 presets) — wrapped to avoid ODR conflict
 namespace { // anonymous namespace: translation-unit local
 #include "../../other_projects/Diapasonix/display/patch_names.h"
@@ -135,7 +131,11 @@ static float         t303Reso        = 1.5f;      // resonance 1-3
 static float         t303EnvMod      = 0.0f;      // filter EG depth (0=off, classic plat)
 static float         t303Decay       = 500.0f;    // EG decay ms (fixed — not pot-controlled)
 static uint8_t       t303Wave        = SAW_DOWN;  // AMY wave constant (SAW_DOWN, PULSE, TRIANGLE, SINE…) or T303_NAP_WAVE
-#define T303_NAP_WAVE 200   // narrow pulse sentinel: PULSE with narrow duty (~10%), P2 varies [0.01, 0.15]
+#define T303_NAP_WAVE   200  // narrow pulse: PULSE with genuinely narrow duty [0.005, 0.05]
+#define T303_TRI2_WAVE  201  // TRI + asymmetric fold (fold peaks, retain bass)
+#define T303_SAW2_WAVE  202  // SAW_DOWN + symmetric wavefold
+#define T303_SAW3_WAVE  203  // SAW_DOWN + AMY feedback (progressive harmonics)
+#define T303_SQ2_WAVE   204  // SINE + AMY feedback (pure→complex via FM)
 static int8_t        t303Oct         = 0;         // octave offset -1..+1
 static bool          t303AccentOn    = false;
 static bool          t303SustainOn   = false;     // OFF=pluck (clear decay), ON=held at full amp
@@ -147,6 +147,32 @@ static float         t303Duration    = 0.5f;      // gate ratio 0→1 (P5): 0=10
 static uint8_t       t303ToneIdx     = 0;         // selected preset index
 // Pot tracking for 303 (file-scope so preset loader can force resync)
 static float         lp303[4]        = {-1.f,-1.f,-1.f,-1.f};
+
+// Returns the AMY wave constant for any t303Wave value (sentinels map to their base wave).
+static inline uint8_t t303AmyWave(uint8_t w) {
+    switch (w) {
+        case T303_NAP_WAVE:  return PULSE;
+        case T303_TRI2_WAVE: return TRIANGLE;
+        case T303_SAW2_WAVE: return SAW_DOWN;   // SW3: SAW + asymmetric fold
+        case T303_SAW3_WAVE: return PULSE;       // SQ2: PULSE + symmetric fold
+        case T303_SQ2_WAVE:  return SINE;        // SIN: SINE + fold
+        default:             return w;
+    }
+}
+// Returns a short display name for any t303Wave value.
+static inline const char* t303WaveName(uint8_t w) {
+    switch (w) {
+        case TRIANGLE:       return "TRI";
+        case T303_TRI2_WAVE: return "TRI2";
+        case SAW_DOWN:       return "SAW";   // SAW + symmetric fold
+        case T303_SAW2_WAVE: return "SW3";   // SAW + asymmetric fold
+        case PULSE:          return "SQR";   // duty sweep
+        case T303_SAW3_WAVE: return "SQ2";   // PULSE + symmetric fold
+        case T303_SQ2_WAVE:  return "SIN";   // SINE + fold
+        case T303_NAP_WAVE:  return "NAP";
+        default:             return "---";
+    }
+}
 
 struct T303Tone { const char* name; uint8_t amyWave; float cutoff; float reso; float envMod; };
 static const T303Tone t303Tones[] = {
@@ -254,6 +280,9 @@ static uint32_t ss2LastPlayMs[SS2_SLOTS] = {};        // millis() of last trigge
 struct Ripple { int8_t ledIdx; float radius; uint8_t hue; uint8_t bright; };
 static Ripple ripples[8];
 static uint8_t rippleBrightMap[NUM_LEDS] = {};
+
+// ==================== ANIM STATE (MODE_ANIM) ====================
+static uint8_t animIdx = 0;   // active animation: 0=WAVE 1=BARS 2=TECHNO 3=ACID 4=8BIT
 
 // ==================== GRANULAR STATE ====================
 static uint8_t  granSubMode   = 0;        // 0 = 8-slice, 1 = 1/16 energy-ranked
@@ -618,7 +647,8 @@ void switchMode(AppMode newMode) {
     if (currentMode==MODE_SEQ) {
         // Keep SEQ playing only when entering utility/FX modes; kill it for any instrument mode
         bool seqContinues = (newMode==MODE_FX||newMode==MODE_LIGHT||
-                             newMode==MODE_LIGHTPLAY||newMode==MODE_BATTERY||newMode==MODE_SYSINFO);
+                             newMode==MODE_LIGHTPLAY||newMode==MODE_BATTERY||newMode==MODE_SYSINFO||
+                             newMode==MODE_ANIM);
         if (!seqContinues) { audioStopAllSamples(); seqPlaying=false; }
     }
     if (currentMode==MODE_MODULAR||currentMode==MODE_MOD2){
@@ -652,6 +682,9 @@ void switchMode(AppMode newMode) {
             for(uint8_t c2=0;c2<KBD_COLS;c2++)
                 if(activeNotes[r2][c2]){ audioT303NoteOff(activeNotes[r2][c2]); activeNotes[r2][c2]=0; }
     }
+    if (currentMode==MODE_I303){
+        midiAllNotesOff(MIDI_CH_BASS);
+    }
     if (currentMode==MODE_SS2){
         for(uint8_t r2=0;r2<KBD_NOTE_ROWS;r2++)
             for(uint8_t c2=0;c2<KBD_COLS;c2++)
@@ -683,6 +716,11 @@ void switchMode(AppMode newMode) {
     arpNoteCount=0; arpIdx=0; arpCurrent=0; arpUdDir=true;
     s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
     currentMode=newMode;
+    { static const char* kVizMode[MODE_COUNT]={
+          "SYNTH","OMNI","DRUMS","SAMPLE","FX","LIGHT","SEQ","LPLY",
+          "BATT","SYS","HYBRD","MODUL","SYN2","MOD2","303","GRAN",
+          "GR2","MIDI","TRKR","DR2","SSEQ","303S","SS2","ANIM","I303"};
+      Serial.printf("M:%s\n", newMode<MODE_COUNT?kVizMode[newMode]:"?"); }
     if (newMode==MODE_SEQ&&sdReady) sdListDir("/");
     if (newMode==MODE_LIGHTPLAY) memset(rippleBrightMap,0,sizeof(rippleBrightMap));
     if (newMode==MODE_HYBRID&&sdReady) sdListDir("/");
@@ -718,11 +756,24 @@ void switchMode(AppMode newMode) {
         s303SeqView=false;
         s303CurNote=0;
         t303Duration = 0.5f;
-        t303Decay = 30.0f * powf(100.0f, 0.5f);   // ≈300ms at default 50%
-        lp303[2] = pots[5].value;                   // pot pickup: keep t303Duration=50% until pot moves
-        if (audioReady) audioT303Init(t303Cutoff, t303Reso, t303EnvMod, t303Decay,
-                                       t303Wave==T303_NAP_WAVE ? PULSE : t303Wave);
+        t303Decay = 30.0f * powf(100.0f, 0.5f);
+        lp303[2] = pots[5].value;
+        if (audioReady) audioT303Init(t303Cutoff, t303Reso, t303EnvMod, t303Decay, t303AmyWave(t303Wave));
         // Shared clock continues if already playing
+    }
+    if (newMode==MODE_I303) {
+        t303Duration = 0.5f;
+        t303Decay = 30.0f * powf(100.0f, 0.5f);
+        lp303[2] = pots[5].value;
+        if (audioReady) {
+            audioI303Init(t303Cutoff, t303Reso, t303EnvMod, t303Decay, t303AmyWave(t303Wave));
+            float curP2=pots[1].value;
+            if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE) audioT303WavefoldAsym(curP2);
+            else if(t303Wave==PULSE)         audioT303Duty(0.5f-curP2*0.48f);
+            else if(t303Wave==T303_NAP_WAVE) audioT303Duty(0.005f+curP2*0.495f);
+            else if(t303Wave==T303_SAW3_WAVE){ audioT303Duty(0.5f); audioT303Wavefold(curP2); }
+            else                             audioT303Wavefold(curP2);
+        }
     }
     if (newMode==MODE_SS2) {
         ss2SelStep=0; ss2SelSlot=0; ss2SeqView=false; ss2CurSlot=0xFF; ss2PlayMode=0;
@@ -752,9 +803,9 @@ void switchMode(AppMode newMode) {
         midiLastMod = 255; midiLastPB = -999.f;
         for (int p = 0; p < 7; p++) midiLpPots[p] = -1.f;
         // Send All Notes Off + reset controllers on entry
-        for (int n = 0; n < 128; n++) usbMIDI.noteOff((uint8_t)n, 0, midiChannel);
-        usbMIDI.controlChange(121, 0, midiChannel);  // Reset All Controllers
-        usbMIDI.pitchBend((double)0.0, midiChannel);
+        midiAllNotesOff(midiChannel);
+        midiCC(121, 0, midiChannel);  // Reset All Controllers
+        midiPitchBend((double)0.0, midiChannel);
     }
 #endif
 }
@@ -812,8 +863,10 @@ void selectMenuItem() {
         case MENU_TRACKER:   switchMode(MODE_TRACKER);    break;
         case MENU_DRUM2:     switchMode(MODE_DRUM2);       break;
         case MENU_SYSEQ:     switchMode(MODE_SYSEQ);       break;
-        case MENU_303S:      switchMode(MODE_303S);        break;
+        case MENU_303S:      switchMode(MODE_303S);         break;
+        case MENU_I303:      switchMode(MODE_I303);         break;
         case MENU_SS2:       switchMode(MODE_SS2); if(sdReady) sdListDir("/"); break;
+        case MENU_ANIM:      switchMode(MODE_ANIM); break;
         default: break;
     }
 }
@@ -1031,9 +1084,9 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                         if (midiPotSel >= 0) {
                             midiPotSel = -1;  // exit pot config mode
                         } else {
-                            for (int n=0;n<128;n++) usbMIDI.noteOff((uint8_t)n, 0, midiChannel);
+                            midiAllNotesOff(midiChannel);
                             midiChannel = (midiChannel % 16) + 1;  // 1→2→...→16→1
-                            midiLastPB = -999.f; usbMIDI.pitchBend((double)0.0, midiChannel);
+                            midiLastPB = -999.f; midiPitchBend((double)0.0, midiChannel);
                         }
 #endif
                         break;
@@ -1239,6 +1292,10 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                 drum2SeqView = !drum2SeqView;
             }
             break;
+        case MODE_I303:
+            if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_SCALE_ARP) s_overlay=OVERLAY_SCALE_ARP; }
+            if (btn==3) noteMap.nextOctave();
+            break;
         case MODE_303S:
             // B1(btn0)=Play handled in btn==0 block above
             if (btn==1) {  // B2: FX overlay
@@ -1423,12 +1480,16 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                 }
             } else {
                 // Normal MIDI play mode
-                if (btn==1) usbMIDI.controlChange(64, pressed ? 127 : 0, midiChannel);
-                if (btn==2 && !pressed && midiOctave>0) { midiOctave--; for(int n=0;n<128;n++) usbMIDI.noteOff((uint8_t)n,0,midiChannel); }
-                if (btn==3 && !pressed && midiOctave<9) { midiOctave++; for(int n=0;n<128;n++) usbMIDI.noteOff((uint8_t)n,0,midiChannel); }
-                if (btn==4 && pressed) { for (int n=0;n<128;n++) usbMIDI.noteOff((uint8_t)n,0,midiChannel); }
+                if (btn==1) midiCC(64, pressed ? 127 : 0, midiChannel);
+                if (btn==2 && !pressed && midiOctave>0) { midiOctave--; midiAllNotesOff(midiChannel); }
+                if (btn==3 && !pressed && midiOctave<9) { midiOctave++; midiAllNotesOff(midiChannel); }
+                if (btn==4 && pressed) { midiAllNotesOff(midiChannel); }
             }
 #endif
+            break;
+        case MODE_ANIM:
+            if (btn==1) animIdx = (uint8_t)((animIdx + 1) % 5);
+            if (btn==3) animIdx = (uint8_t)((animIdx + 4) % 5);
             break;
         default: break;
     }
@@ -2669,8 +2730,7 @@ void drawScreen() {
             // ---- 303S — TB-303 step sequencer ----
             case MODE_303S: {
                 static const char* s3nn[]={"C","c","D","d","E","F","f","G","g","A","a","B"};
-                static const char* s3wn[]={"SIN","SQR","SAW","SUP","TRI","NSE","KS"};
-                const char* s3wname = (t303Wave==T303_NAP_WAVE) ? "NAP" : (t303Wave < 7) ? s3wn[t303Wave] : "---";
+                const char* s3wname = t303WaveName(t303Wave);
                 char s3fxstr[20]="";
                 { static const char* kFTL3[]={"LPF","LaF","HPF","BPF"};
                   uint8_t nfx=0;
@@ -2772,22 +2832,35 @@ void drawScreen() {
                         oled.drawFrame(WX,WY,WW,WH);
                         float p2=pots[1].value;
                         if(t303Wave==PULSE||t303Wave==T303_NAP_WAVE){
-                            float duty=(t303Wave==PULSE)?(0.5f-p2*0.48f):(0.15f-p2*0.14f);
-                            int dw=max(2,min(WW-4,(int)(duty*(WW-2))));
+                            float duty=(t303Wave==PULSE)?(0.5f-p2*0.48f):(0.005f+p2*0.495f);
+                            int dw=max(1,min(WW-4,(int)(duty*(WW-2))));
                             int hy=WY+1, ly=WY+WH-2;
                             oled.drawHLine(WX+1,hy,dw);
                             oled.drawVLine(WX+1+dw,hy,ly-hy+1);
                             oled.drawHLine(WX+2+dw,ly,WW-3-dw);
                         } else {
-                            float g=(p2<0.01f)?1.0f:powf(4.0f,p2);
+                            // Fold display for all non-duty waves
+                            float g=(p2<0.01f)?1.0f:powf(32.0f,p2);
+                            bool posOnly=(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE);
                             int prev=cy;
                             for(int i=0;i<WW-2;i++){
                                 float t=(float)i/(float)(WW-3);
-                                float base=(t303Wave==TRIANGLE)?((t<0.5f)?(4*t-1):(3-4*t)):
-                                           (t303Wave==SAW_UP)?(2*t-1):(1-2*t);
-                                float s=base*g, ph=fmodf(s+1.0f,4.0f);
-                                if(ph<0.0f) ph+=4.0f;
-                                float yv=(ph<2.0f)?(ph-1.0f):(3.0f-ph);
+                                float base;
+                                if(t303Wave==TRIANGLE||t303Wave==T303_TRI2_WAVE)
+                                    base=(t<0.5f)?(4*t-1):(3-4*t);       // triangle
+                                else if(t303Wave==T303_SQ2_WAVE)
+                                    base=sinf(t*6.2832f);                  // SIN: sine base
+                                else if(t303Wave==T303_SAW3_WAVE)
+                                    base=(t<0.5f)?1.0f:-1.0f;             // SQ2: square base
+                                else
+                                    base=1.0f-2.0f*t;                     // SAW/SW3: saw base
+                                float yv;
+                                if(posOnly&&base<0.0f){ yv=base; }
+                                else {
+                                    float s=base*g, ph=fmodf(s+1.0f,4.0f);
+                                    if(ph<0.0f) ph+=4.0f;
+                                    yv=(ph<2.0f)?(ph-1.0f):(3.0f-ph);
+                                }
                                 int py=constrain(cy-(int)(yv*ah+0.5f),WY+1,WY+WH-2);
                                 if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py);
                                 else    oled.drawPixel(WX+1,py);
@@ -2873,22 +2946,35 @@ void drawScreen() {
                         oled.drawFrame(WX,WY,WW,WH);
                         float p2=pots[1].value;
                         if(t303Wave==PULSE||t303Wave==T303_NAP_WAVE){
-                            float duty=(t303Wave==PULSE)?(0.5f-p2*0.48f):(0.15f-p2*0.14f);
-                            int dw=max(2,min(WW-4,(int)(duty*(WW-2))));
+                            float duty=(t303Wave==PULSE)?(0.5f-p2*0.48f):(0.005f+p2*0.495f);
+                            int dw=max(1,min(WW-4,(int)(duty*(WW-2))));
                             int hy=WY+1, ly=WY+WH-2;
                             oled.drawHLine(WX+1,hy,dw);
                             oled.drawVLine(WX+1+dw,hy,ly-hy+1);
                             oled.drawHLine(WX+2+dw,ly,WW-3-dw);
                         } else {
-                            float g=(p2<0.01f)?1.0f:powf(4.0f,p2);
+                            // Fold display for all non-duty waves
+                            float g=(p2<0.01f)?1.0f:powf(32.0f,p2);
+                            bool posOnly=(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE);
                             int prev=cy;
                             for(int i=0;i<WW-2;i++){
                                 float t=(float)i/(float)(WW-3);
-                                float base=(t303Wave==TRIANGLE)?((t<0.5f)?(4*t-1):(3-4*t)):
-                                           (t303Wave==SAW_UP)?(2*t-1):(1-2*t);
-                                float s=base*g, ph=fmodf(s+1.0f,4.0f);
-                                if(ph<0.0f) ph+=4.0f;
-                                float yv=(ph<2.0f)?(ph-1.0f):(3.0f-ph);
+                                float base;
+                                if(t303Wave==TRIANGLE||t303Wave==T303_TRI2_WAVE)
+                                    base=(t<0.5f)?(4*t-1):(3-4*t);       // triangle
+                                else if(t303Wave==T303_SQ2_WAVE)
+                                    base=sinf(t*6.2832f);                  // SIN: sine base
+                                else if(t303Wave==T303_SAW3_WAVE)
+                                    base=(t<0.5f)?1.0f:-1.0f;             // SQ2: square base
+                                else
+                                    base=1.0f-2.0f*t;                     // SAW/SW3: saw base
+                                float yv;
+                                if(posOnly&&base<0.0f){ yv=base; }
+                                else {
+                                    float s=base*g, ph=fmodf(s+1.0f,4.0f);
+                                    if(ph<0.0f) ph+=4.0f;
+                                    yv=(ph<2.0f)?(ph-1.0f):(3.0f-ph);
+                                }
                                 int py=constrain(cy-(int)(yv*ah+0.5f),WY+1,WY+WH-2);
                                 if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py);
                                 else    oled.drawPixel(WX+1,py);
@@ -3032,10 +3118,8 @@ void drawScreen() {
             // ---- 303 — TB-303 emulation ----
             case MODE_303: {
                 oled.setFont(u8g2_font_4x6_tf);
-                { static const char* wn[]={"SIN","SQR","SAW","SUP","TRI","NSE","KS"};
-                  uint8_t wi=(t303Wave<7)?t303Wave:0;
-                  snprintf(buf,sizeof(buf),"303 %s/%s %dBPM%s%s%s",
-                           t303Tones[t303ToneIdx].name, wn[wi], bpm,
+                { snprintf(buf,sizeof(buf),"303 %s/%s %dBPM%s%s%s",
+                           t303Tones[t303ToneIdx].name, t303WaveName(t303Wave), bpm,
                            t303AccentOn?" [A]":"",t303SlideOn?" [S]":"",
                            t303SustainOn?" [Sus]":""); }
                 oled.drawStr(0,0,buf); oled.drawHLine(0,7,128);
@@ -3068,6 +3152,72 @@ void drawScreen() {
                 oled.drawStr(0,101,buf);
                 oled.setFont(u8g2_font_4x6_tf);
                 snprintf(buf,sizeof(buf),"Vol:%.0f%%",pots[0].value*100);
+                oled.drawStr(0,118,buf);
+                break;
+            }
+            // ---- I303 — polyphonic TB-303 ----
+            case MODE_I303: {
+                oled.setFont(u8g2_font_5x7_tf);
+                snprintf(buf,sizeof(buf),"I303  Wv:%-4s Oct:%+d", t303WaveName(t303Wave), t303Oct);
+                oled.drawStr(0,7,buf); oled.drawHLine(0,9,128);
+                oled.setFont(u8g2_font_4x6_tf);
+                snprintf(buf,sizeof(buf),"Oct:%+d  Scl:%-6s  %dBPM", t303Oct, scaleName(noteMap.getScale()), bpm);
+                oled.drawStr(0,19,buf);
+                snprintf(buf,sizeof(buf),"Cut:%4dHz  Res:%.1f",(int)t303Cutoff,t303Reso);
+                oled.drawStr(0,29,buf);
+                snprintf(buf,sizeof(buf),"Mod:%4.1f  Dur:%.0f%%",t303EnvMod,t303Duration*100.0f);
+                oled.drawStr(0,38,buf);
+                oled.drawHLine(0,42,128);
+                oled.drawStr(0,50,"P2=Fold P3=Rs P4=Mod P5=Dur P6=Ct");
+                // Active notes display
+                { int nx=0;
+                  for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
+                      if(activeNotes[r][c]&&nx<8){
+                          static const char* nn[]={"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+                          uint8_t m=activeNotes[r][c];
+                          char nb[5]; snprintf(nb,sizeof(nb),"%s%d",nn[m%12],m/12-1);
+                          oled.drawStr(nx*16,62,nb); nx++;
+                      }
+                  }
+                  if(nx==0) oled.drawStr(0,62,"--");
+                }
+                // Waveform widget (same as 303S)
+                {
+                    const int WX=0,WY=68,WW=128,WH=20,cy=WY+WH/2,ah=WH/2-2;
+                    oled.drawFrame(WX,WY,WW,WH);
+                    float p2=pots[1].value;
+                    if(t303Wave==PULSE||t303Wave==T303_NAP_WAVE){
+                        float duty=(t303Wave==PULSE)?(0.5f-p2*0.48f):(0.005f+p2*0.495f);
+                        int dw=max(1,min(WW-4,(int)(duty*(WW-2))));
+                        int hy=WY+1, ly=WY+WH-2;
+                        oled.drawHLine(WX+1,hy,dw); oled.drawVLine(WX+1+dw,hy,ly-hy+1); oled.drawHLine(WX+2+dw,ly,WW-3-dw);
+                    } else {
+                        float g=(p2<0.01f)?1.0f:powf(32.0f,p2);
+                        bool posOnly=(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE);
+                        int prev=cy;
+                        for(int i=0;i<WW-2;i++){
+                            float t=(float)i/(float)(WW-3);
+                            float base;
+                            if(t303Wave==TRIANGLE||t303Wave==T303_TRI2_WAVE) base=(t<0.5f)?(4*t-1):(3-4*t);
+                            else if(t303Wave==T303_SQ2_WAVE)                 base=sinf(t*6.2832f);
+                            else if(t303Wave==T303_SAW3_WAVE)                base=(t<0.5f)?1.0f:-1.0f;
+                            else                                             base=1.0f-2.0f*t;
+                            float yv;
+                            if(posOnly&&base<0.0f){ yv=base; } else {
+                                float s=base*g, ph=fmodf(s+1.0f,4.0f); if(ph<0.0f) ph+=4.0f;
+                                yv=(ph<2.0f)?(ph-1.0f):(3.0f-ph);
+                            }
+                            int py=constrain(cy-(int)(yv*ah+0.5f),WY+1,WY+WH-2);
+                            if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py); else oled.drawPixel(WX+1,py);
+                            prev=py;
+                        }
+                    }
+                }
+                oled.setFont(u8g2_font_6x10_tf);
+                oled.drawHLine(0,91,128);
+                snprintf(buf,sizeof(buf),"Cut:%-4d  Res:%.1f",(int)t303Cutoff,t303Reso);
+                oled.drawStr(0,104,buf);
+                snprintf(buf,sizeof(buf),"Dur:%.0f%%  Mod:%-4.1f",t303Duration*100.0f,t303EnvMod);
                 oled.drawStr(0,118,buf);
                 break;
             }
@@ -3476,6 +3626,120 @@ void drawScreen() {
                 }
                 break;
             }
+            // ---- ANIM ----
+            case MODE_ANIM: {
+                static const char* kAnimNames[] = {"WAVE","BARS","TECHNO","ACID","8BIT"};
+                uint8_t  ai    = animIdx % 5;
+                float    speed = pots[0].value * 0.8f + 0.2f;   // [0.2, 1.8]
+                float    p2    = pots[1].value;
+                uint32_t now   = millis();
+
+                oled.setFont(u8g2_font_5x7_tf);
+                char hdr[24];
+                snprintf(hdr, sizeof(hdr), "ANIM  %s", kAnimNames[ai]);
+                oled.drawStr(0, 7, hdr);
+                oled.drawHLine(0, 9, 128);
+
+                oled.setFont(u8g2_font_4x6_tf);
+
+                if (ai == 0) {
+                    // WAVE — double sine
+                    float t = now * 0.001f * speed;
+                    int prev = -1;
+                    for (int x = 0; x < 128; x++) {
+                        float ph = x * (6.2832f / 128.0f);
+                        int iy = constrain((int)(68 + 26*sinf(ph*2 + t*2.5f) + p2*22*sinf(ph*3 - t*1.7f)), 11, 126);
+                        if (prev >= 0) oled.drawLine(x-1, prev, x, iy);
+                        prev = iy;
+                    }
+                    for (int x = 0; x < 128; x += 2) {
+                        int iy = constrain((int)(68 + 14*sinf(x*(6.2832f/128.0f)*4 + t*1.5f + 1.2f) * (0.4f + p2*0.6f)), 11, 126);
+                        oled.drawPixel(x, iy);
+                    }
+                } else if (ai == 1) {
+                    // BARS — 16 colonnes VU-meter
+                    static float bH[16] = {}, bT[16] = {};
+                    static uint32_t bUpd = 0;
+                    float maxH = 40.0f + p2 * 76.0f;
+                    if (now - bUpd > (uint32_t)(600.0f / speed)) {
+                        bUpd = now;
+                        for (int i = 0; i < 16; i++) bT[i] = 5.0f + (float)random(0, (int)maxH);
+                    }
+                    float lp = 0.22f * speed;
+                    for (int i = 0; i < 16; i++) {
+                        bH[i] += (bT[i] - bH[i]) * lp;
+                        int h = max(2, (int)bH[i]);
+                        oled.drawBox(i*8, 127 - h, 6, h);
+                    }
+                } else if (ai == 2) {
+                    // TECHNO — radar sweep
+                    int cx = 64, cy = 69;
+                    oled.drawCircle(cx, cy, 18);
+                    oled.drawCircle(cx, cy, 36);
+                    oled.drawCircle(cx, cy, 54);
+                    oled.drawLine(cx-2, cy, cx+2, cy);
+                    oled.drawLine(cx, cy-2, cx, cy+2);
+                    float angle = fmodf(now * 0.001f * speed * 2.094f, 6.2832f);  // 1 tour / 3s à speed=1
+                    for (int tr = 0; tr <= 6; tr++) {
+                        float a = angle - tr * 0.13f;
+                        float r = 56.0f * (1.0f - tr * 0.03f);
+                        int x2 = constrain(cx + (int)(r * cosf(a)), 0, 127);
+                        int y2 = constrain(cy + (int)(r * sinf(a)), 11, 127);
+                        if (tr == 0) oled.drawLine(cx, cy, x2, y2);
+                        else if (tr % 2 == 0) oled.drawLine(cx, cy, (cx+x2)/2, (cy+y2)/2);
+                    }
+                    if (p2 > 0.05f) {
+                        int br = 20 + (int)(p2 * 34);
+                        float ba = angle * 1.7f;
+                        oled.drawBox(constrain(cx+(int)(br*cosf(ba))-2,0,124),
+                                     constrain(cy+(int)(br*sinf(ba))-2,11,124), 4, 4);
+                    }
+                } else if (ai == 3) {
+                    // ACID — Lissajous
+                    float t = now * 0.001f * speed;
+                    float a = 2.0f + p2;   // ratio 2→3
+                    float delta = t * 1.3f;
+                    float r = 52.0f;
+                    int px = -1, py = -1;
+                    for (int i = 0; i <= 256; i++) {
+                        float s = i * (6.2832f / 256.0f);
+                        int x = constrain(64 + (int)(r * sinf(a * s + delta)), 0, 127);
+                        int y = constrain(69 + (int)(r * sinf(3.0f * s)), 11, 127);
+                        if (px >= 0) oled.drawLine(px, py, x, y);
+                        else oled.drawPixel(x, y);
+                        px = x; py = y;
+                    }
+                } else {
+                    // 8BIT — matrix rain
+                    static uint8_t cY[16] = {};
+                    static uint8_t cS[16] = {};
+                    static bool c8Init = false;
+                    static uint32_t c8Upd = 0;
+                    if (!c8Init) {
+                        for (int i = 0; i < 16; i++) { cY[i]=(uint8_t)(11+random(0,110)); cS[i]=(uint8_t)(1+random(0,4)); }
+                        c8Init = true;
+                    }
+                    if (now - c8Upd >= (uint32_t)max(20, (int)(120.0f / speed))) {
+                        c8Upd = now;
+                        for (int i = 0; i < 16; i++) {
+                            cY[i] = (uint8_t)(11 + (cY[i] - 11 + cS[i]) % 116);
+                        }
+                    }
+                    int trail = 3 + (int)(p2 * 14);
+                    for (int i = 0; i < 16; i++) {
+                        int x = i*8 + 3;
+                        oled.drawBox(x-1, cY[i], 3, 4);   // head pixel
+                        for (int t = 1; t <= trail; t++) {
+                            int ty = cY[i] - t*7;
+                            if (ty < 11) ty += 116;
+                            if (ty >= 11 && ty < 124) oled.drawPixel(x, ty);
+                        }
+                    }
+                }
+
+                oled.drawStr(0, 127, "B1=nxt B3=prv P1=spd P2");
+                break;
+            }
             default:
                 oled.drawStr(0,0,menuLabels[currentMode]);
                 oled.drawStr(20,60,"Coming soon...");
@@ -3546,6 +3810,14 @@ static void updateLedsAndShow()
                 for(int i=0;i<NUM_LEDS;i++)
                     if(rippleBrightMap[i]>0)
                         leds[i]=CHSV((uint8_t)(i*17+80),200,rippleBrightMap[i]);
+                break;
+            }
+            case MODE_ANIM: {
+                // Rainbow wave synced to animation speed
+                float aspeed = pots[0].value * 0.8f + 0.2f;
+                uint8_t hoff = (uint8_t)(millis() * aspeed * 0.05f);
+                for (int i = 0; i < NUM_LEDS; i++)
+                    leds[i] = CHSV((uint8_t)(hoff + i * 255 / NUM_LEDS), 200, 60 + animIdx * 18);
                 break;
             }
             case MODE_LIGHT: {
@@ -4060,6 +4332,38 @@ static void kbdEventBridge(uint8_t row, uint8_t col, bool pressed)
 }
 
 // ==================== NOTE KEY AUDIO HANDLER ====================
+// ── MIDI + audio wrappers ─────────────────────────────────────────────────────
+// Replace direct audioNoteOn/Off / audioT303NoteOn/Off / audioDrum2Hit calls
+// with these so all playing modes emit USB MIDI alongside audio output.
+static inline void playNoteOn(uint8_t n, float v) {
+    audioNoteOn(n, v);
+    midiNoteOn(n, (uint8_t)constrain((int)(v * 127), 1, 127), MIDI_CH_SYNTH);
+}
+static inline void playNoteOff(uint8_t n) {
+    audioNoteOff(n);
+    midiNoteOff(n, MIDI_CH_SYNTH);
+}
+static inline void playBassOn(uint8_t n, float v) {
+    audioT303NoteOn(n, v);
+    midiNoteOn(n, (uint8_t)constrain((int)(v * 100), 1, 127), MIDI_CH_BASS);
+}
+static inline void playBassOff(uint8_t n) {
+    audioT303NoteOff(n);
+    midiNoteOff(n, MIDI_CH_BASS);
+}
+static inline void playI303On(uint8_t n, float v) {
+    audioT303NoteOn(n, v);
+    midiNoteOn(n, (uint8_t)constrain((int)(v*127),1,127), MIDI_CH_BASS);
+}
+static inline void playI303Off(uint8_t n) {
+    audioT303NoteOff(n);
+    midiNoteOff(n, MIDI_CH_BASS);
+}
+static inline void playDrum(uint8_t pi, float v, uint8_t pitch, float dec) {
+    audioDrum2Hit(kDrum2Remap[pi], v, pitch, dec);
+    midiDrum(pi, (uint8_t)constrain((int)(v * 127), 1, 127));
+}
+
 // Called from audioHandlerTask (Core 1, priority 22).
 // Running on Core 1 keeps AMY state writes on the same core as before,
 // avoiding races with AMY render (Core 0). Priority 22 beats the main loop (1)
@@ -4084,8 +4388,10 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     int held=0;
                     for(int rr=0;rr<KBD_NOTE_ROWS;rr++) for(int cc=0;cc<KBD_COLS;cc++) if(activeNotes[rr][cc]) held++;
                     float polyScale = 1.0f / sqrtf(fmaxf(1.0f, (float)held));
-                    audioNoteOn(note, constrain((0.8f+jx*0.6f) * polyScale, 0.05f, 1.0f));
-                } else audioNoteOff(note);
+                    float vnote = constrain((0.8f+jx*0.6f) * polyScale, 0.05f, 1.0f);
+                    playNoteOn(note, vnote);
+                    Serial.printf("N+:%d:%d\n", note, (int)(vnote*127));
+                } else { playNoteOff(note); Serial.printf("N-:%d\n", note); }
             } else {
                 // Arp: add/remove from held notes list
                 if(pressed){
@@ -4106,7 +4412,7 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
         case MODE_OMNI:{
             if(pressed){
                 // Release previous chord
-                if(omniRoot!=0xFF) for(int i=0;i<3;i++) audioNoteOff(omniChordNotes[i]);
+                if(omniRoot!=0xFF) for(int i=0;i<3;i++) playNoteOff(omniChordNotes[i]);
                 uint8_t ni, ct; bool valid=true;
                 if(row>=1&&row<=3){
                     ni=(uint8_t)(7-col);   // col0(right)=E(7)..col7(left)=Eb(0)
@@ -4121,7 +4427,7 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     uint8_t base=(uint8_t)(48+omniNoteOff[ni]+noteMap.getOctave()*12);
                     for(int i=0;i<3;i++){
                         omniChordNotes[i]=base+omniChordInt[ct][i];
-                        audioNoteOn(omniChordNotes[i],0.5f);
+                        playNoteOn(omniChordNotes[i],0.5f);
                     }
                 }
             }
@@ -4227,6 +4533,28 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             } else audioNoteOff(note);
             break;
         }
+        case MODE_I303: {
+            uint8_t note;
+            if (kbdLayout == KBD_LAYOUT_PIANO) {
+                note = pianoNote(row, col, (uint8_t)(48 + noteMap.getOctave()*12));
+                if (note == 0xFF) return;
+            } else {
+                note = noteMap.getMidiNote(row, col);
+            }
+            note = (uint8_t)constrain((int)note + t303Oct*12, 0, 127);
+            activeNotes[row][col] = pressed ? note : 0;
+            if (pressed) {
+                float jx = constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                int held=0;
+                for(int rr=0;rr<KBD_NOTE_ROWS;rr++) for(int cc=0;cc<KBD_COLS;cc++) if(activeNotes[rr][cc]) held++;
+                float polyScale=1.0f/sqrtf(fmaxf(1.0f,(float)held));
+                float vel=constrain((0.8f+jx*0.6f)*polyScale,0.05f,1.0f);
+                playI303On(note, vel);
+            } else {
+                playI303Off(note);
+            }
+            break;
+        }
         case MODE_303: {
             uint8_t base;
             if (kbdLayout == KBD_LAYOUT_PIANO) {
@@ -4267,13 +4595,14 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                 }
                 { float jx303=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
                   float vel303=constrain((t303AccentOn?1.2f:0.7f)+jx303*0.4f,0.1f,1.5f);
-                  audioT303NoteOn(note, vel303); }
+                  playBassOn(note, vel303);
+                  Serial.printf("N+:%d:%d\n", note, (int)(vel303*100)); }
                 t303CurrentNote  = note;
                 t303PressedRow   = (int8_t)row;
                 t303PressedCol   = (int8_t)col;
             } else {
                 if ((int8_t)row == t303PressedRow && (int8_t)col == t303PressedCol) {
-                    audioT303NoteOff(note);
+                    playBassOff(note);
                     t303CurrentNote = 0;
                     t303PressedRow  = -1;
                     t303PressedCol  = -1;
@@ -4329,8 +4658,8 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                         stop.velocity = 0.0f;
                         amy_add_event(&stop);
                     }
-                    audioDrum2Hit(kDrum2Remap[padIdx], 0.70f * drum2Volume[padIdx],
-                                  drum2Pitch[padIdx], drum2Decay[padIdx]);
+                    playDrum(padIdx, 0.70f * drum2Volume[padIdx],
+                             drum2Pitch[padIdx], drum2Decay[padIdx]);
                     drum2PadFlashMs[padIdx] = millis();
                 }
             } else {
@@ -4352,7 +4681,7 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     stop.velocity = 0.0f;
                     amy_add_event(&stop);
                 }
-                audioDrum2Hit(kDrum2Remap[padIdx], vel, pitch, dec);
+                playDrum(padIdx, vel, pitch, dec);
                 drum2PadFlashMs[padIdx] = millis();
                 // Quantized recording — stores row so playback matches the live hit
                 if (drum2RecArmed && drum2Playing) {
@@ -4697,6 +5026,9 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             }
             break;
         }
+        case MODE_ANIM:
+            if (pressed) animIdx = (uint8_t)((animIdx + 1) % 5);
+            break;
         case MODE_MIDI: {
 #if CONFIG_TINYUSB_MIDI_ENABLED
             if (midiActive) {
@@ -4710,8 +5042,8 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                         (int)(midiOctave*12) + (KBD_COLS-1-(int)col)*KBD_NOTE_ROWS + (int)row, 0, 127);
                 }
                 uint8_t vel = pressed ? (uint8_t)constrain((int)(volume * 127), 1, 127) : 0;
-                if (pressed) usbMIDI.noteOn(midiNote, vel, midiChannel);
-                else         usbMIDI.noteOff(midiNote, 0, midiChannel);
+                if (pressed) midiNoteOn(midiNote, vel, midiChannel);
+                else         midiNoteOff(midiNote, midiChannel);
             }
 #endif
             break;
@@ -5010,7 +5342,7 @@ void loop() {
     // Doubled-hit deferred fires (from DR2_MOD_DBL steps)
     for(uint8_t pi=0;pi<DRUM2_PADS;pi++){
         if(drum2DblPendingAt[pi] && millis() >= drum2DblPendingAt[pi]){
-            audioDrum2Hit(kDrum2Remap[pi], drum2Volume[pi]*0.65f, drum2DblPitch[pi], drum2Decay[pi]*0.5f);
+            playDrum(pi, drum2Volume[pi]*0.65f, drum2DblPitch[pi], drum2Decay[pi]*0.5f);
             drum2PadFlashMs[pi] = millis();
             drum2DblPendingAt[pi] = 0;
         }
@@ -5027,6 +5359,7 @@ void loop() {
             drum2LastStepMs += waitMs;
             if(millis() - drum2LastStepMs > waitMs) drum2LastStepMs = millis(); // catch-up guard
             drum2Step = (drum2Step + 1) % DR2_STEPS;
+            Serial.printf("S:%d\n", drum2Step);
             for(uint8_t pi=0;pi<DRUM2_PADS;pi++){
                 uint8_t vel8 = drum2SeqVel[pi][drum2Step];
                 if(vel8 == 0) continue;
@@ -5053,21 +5386,22 @@ void loop() {
                 }
                 switch(mod){
                     case 1: // Probabilistic 50%
-                        if(random(2)){ audioDrum2Hit(kDrum2Remap[pi],vel,pitch,dec); drum2PadFlashMs[pi]=millis(); }
+                        if(random(2)){ playDrum(pi,vel,pitch,dec); drum2PadFlashMs[pi]=millis(); }
                         break;
                     case 2: // Random pitch — audible range 36-96 (C2-C7)
                         { uint8_t rp=(uint8_t)constrain(36+(int)random(61),0,127);
-                          audioDrum2Hit(kDrum2Remap[pi],vel,rp,dec); drum2PadFlashMs[pi]=millis(); }
+                          playDrum(pi,vel,rp,dec); drum2PadFlashMs[pi]=millis(); }
                         break;
                     case 3: // Double hit: now + exactly half the current step duration
-                        audioDrum2Hit(kDrum2Remap[pi],vel,pitch,dec);
+                        playDrum(pi,vel,pitch,dec);
                         drum2DblPendingAt[pi] = millis() + waitMs/2;
                         drum2DblPitch[pi] = pitch;
                         drum2PadFlashMs[pi]=millis();
                         break;
                     default: // Normal
-                        audioDrum2Hit(kDrum2Remap[pi],vel,pitch,dec);
+                        playDrum(pi,vel,pitch,dec);
                         drum2PadFlashMs[pi]=millis();
+                        Serial.printf("D:%d:%d\n", pi, (int)(vel*100));
                         break;
                 }
             }
@@ -5077,7 +5411,7 @@ void loop() {
                 for(uint8_t i=0;i<SYSEQ_CHORD;i++) if(syseqNotes[drum2Step][i]) { newHasNotes=true; break; }
                 // FUL: only stop previous notes if new step has notes (sustain through empty steps)
                 if (!syseqActiveIsFull || newHasNotes) {
-                    for(uint8_t i=0;i<syseqActiveCnt;i++) audioNoteOff(syseqActive[i]);
+                    for(uint8_t i=0;i<syseqActiveCnt;i++) { audioNoteOff(syseqActive[i]); midiNoteOff(syseqActive[i], MIDI_CH_SYNTH); }
                     syseqActiveCnt = 0;
                 }
                 if (newHasNotes) {
@@ -5086,7 +5420,7 @@ void loop() {
                         uint8_t note = syseqNotes[drum2Step][i] - 1;
                         float sv = syseqVels[drum2Step][i] / 127.0f;
                         sv = constrain(sv * (1.0f + jy * 0.25f), 0.05f, 1.2f);
-                        audioNoteOn(note, sv);
+                        playNoteOn(note, sv);
                         if(syseqActiveCnt < SYSEQ_CHORD) syseqActive[syseqActiveCnt++] = note;
                     }
                     syseqActiveIsFull = (syseqAlt[drum2Step] == 1);
@@ -5110,17 +5444,17 @@ void loop() {
                         t303SlideTo   = midiNote;
                         t303SlideMs   = millis();
                         t303SlideActive = true;
-                        audioT303NoteOn(midiNote, vel);  // retrigger at new pitch; AMY blends
+                        playBassOn(midiNote, vel);  // retrigger at new pitch; AMY blends
                     } else {
                         t303SlideActive = false;
                         audioT303PitchBend(1.0f);
-                        if (s303CurNote) audioT303NoteOff(s303CurNote);
-                        audioT303NoteOn(midiNote, vel);
+                        if (s303CurNote) playBassOff(s303CurNote);
+                        playBassOn(midiNote, vel);
                     }
                     s303CurNote = midiNote;
                 } else {
                     // Rest: release current note
-                    if (s303CurNote) { audioT303NoteOff(s303CurNote); s303CurNote=0; }
+                    if (s303CurNote) { playBassOff(s303CurNote); s303CurNote=0; }
                     t303SlideActive = false;
                     audioT303PitchBend(1.0f);
                 }
@@ -5289,6 +5623,7 @@ void loop() {
                 bpm=(uint16_t)(40.0f+pots[2].value*pots[2].value*560.0f);  // quadratic: more rotation for low BPM precision
                 if(bpm<40) bpm=40; if(bpm>600) bpm=600;
                 lpBpm=pots[2].value;
+                Serial.printf("B:%d\n", bpm);
                 if(fxList[5].active && audioReady) applyFxEffect(5); // re-sync delay to new BPM
                 if(fxList[8].active && audioReady) applyFxEffect(8); // re-sync resecho to new BPM
             }
@@ -5527,15 +5862,18 @@ void loop() {
                         for (int p = 0; p < 4; p++) lp303[p] = pots[3+p].value;
                         break;
                     }
-                    // P2 = 4-zone waveform morph: SUP(0-0.25) → SAW(0.25-0.5) → TRI(0.5-0.75) → SQR+duty(0.75-1)
+                    // P2 = 3-zone waveform morph: SAW(0-0.33) → TRI(0.33-0.67) → SQR+duty(0.67-1)
                     {
                         static float lp303wf=-1.0f;
                         if(fabsf(pots[1].value-lp303wf)>0.005f){
                             float p2=pots[1].value;
-                            uint8_t nw = (p2<0.25f)?SAW_UP:(p2<0.50f)?SAW_DOWN:(p2<0.75f)?TRIANGLE:PULSE;
-                            if(nw!=t303Wave){ t303Wave=nw; if(audioReady) audioT303Wave(nw); }
+                            uint8_t nw=(p2<0.33f)?SAW_DOWN:(p2<0.67f)?TRIANGLE:PULSE;
+                            if(nw!=t303Wave){
+                                t303Wave=nw;
+                                if(audioReady){ audioT303Wave(nw); audioT303Wavefold(0.0f); audioT303Feedback(0.0f); }
+                            }
                             if(t303Wave==PULSE){
-                                float norm=(p2-0.75f)/0.25f;
+                                float norm=(p2-0.67f)/0.33f;
                                 if(audioReady) audioT303Duty(0.5f-norm*0.48f);
                             }
                             lp303wf=p2;
@@ -5577,7 +5915,7 @@ void loop() {
                         for (int p = 0; p < 4; p++) lp303[p] = pots[3+p].value;
                         break;
                     }
-                    // P2: per-wave modulation — SQR=duty (50→2%), NAP=narrow duty (15→1%), TRI/SUP/SAW=wavefolder
+                    // P2: per-wave texture — SQR=duty, NAP=width, TRI2/SW3=asymFold, all others=symFold
                     {
                         static float lp303swf=-1.0f;
                         if(fabsf(pots[1].value-lp303swf)>0.005f){
@@ -5585,9 +5923,11 @@ void loop() {
                             if(t303Wave==PULSE){
                                 if(audioReady) audioT303Duty(0.5f-p2*0.48f);
                             } else if(t303Wave==T303_NAP_WAVE){
-                                if(audioReady) audioT303Duty(0.15f-p2*0.14f);  // narrow: [0.01, 0.15]
+                                if(audioReady) audioT303Duty(0.005f+p2*0.495f);
+                            } else if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE){
+                                if(audioReady) audioT303WavefoldAsym(p2);  // TRI2/SW3: asymmetric
                             } else {
-                                if(audioReady) audioT303Wavefold(p2);
+                                if(audioReady) audioT303Wavefold(p2);  // TRI/SAW/SQ2/SIN: symmetric
                             }
                             lp303swf=p2;
                         }
@@ -5598,6 +5938,27 @@ void loop() {
                     if(fabsf(pots[5].value-lp303[2])>0.002f){ t303Duration=pots[5].value; lp303[2]=pots[5].value; t303Decay=30.0f*powf(100.0f,t303Duration); audioT303SetSustain(0.0f); ch303s=true; }
                     if(fabsf(pots[6].value-lp303[3])>0.002f){ t303Cutoff=80.0f*powf(25.0f,pots[6].value); lp303[3]=pots[6].value; ch303s=true; }
                     if(ch303s && audioReady) audioT303Params(t303Cutoff,t303Reso,t303EnvMod,t303Decay);
+                    break;
+                }
+                case MODE_I303: {
+                    // P2: same wave texture as 303S
+                    {
+                        static float lpI303wf=-1.0f;
+                        if(fabsf(pots[1].value-lpI303wf)>0.005f){
+                            float p2=pots[1].value;
+                            if(t303Wave==PULSE)                              { if(audioReady) audioT303Duty(0.5f-p2*0.48f); }
+                            else if(t303Wave==T303_NAP_WAVE)                 { if(audioReady) audioT303Duty(0.005f+p2*0.495f); }
+                            else if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE) { if(audioReady) audioT303WavefoldAsym(p2); }
+                            else                                             { if(audioReady) audioT303Wavefold(p2); }
+                            lpI303wf=p2;
+                        }
+                    }
+                    bool chI303=false;
+                    if(fabsf(pots[3].value-lp303[0])>0.002f){ t303Reso=1.0f+pots[3].value*2.0f;           lp303[0]=pots[3].value; chI303=true; }
+                    if(fabsf(pots[4].value-lp303[1])>0.002f){ t303EnvMod=pots[4].value*10.0f;              lp303[1]=pots[4].value; chI303=true; }
+                    if(fabsf(pots[5].value-lp303[2])>0.002f){ t303Duration=pots[5].value; lp303[2]=pots[5].value; t303Decay=30.0f*powf(100.0f,t303Duration); audioT303SetSustain(0.0f); chI303=true; }
+                    if(fabsf(pots[6].value-lp303[3])>0.002f){ t303Cutoff=80.0f*powf(25.0f,pots[6].value); lp303[3]=pots[6].value; chI303=true; }
+                    if(chI303 && audioReady) audioT303Params(t303Cutoff,t303Reso,t303EnvMod,t303Decay);
                     break;
                 }
                 case MODE_SS2: {
@@ -5720,7 +6081,7 @@ void loop() {
                     for (int p = 0; p < 7; p++) {
                         if (midiPotCC[p] > 127) continue;  // 0xFF = disabled
                         if (fabsf(pots[p].value - midiLpPots[p]) > 0.005f) {
-                            usbMIDI.controlChange(midiPotCC[p], (uint8_t)(pots[p].value * 127.f), midiChannel);
+                            midiCC(midiPotCC[p], (uint8_t)(pots[p].value * 127.f), midiChannel);
                             midiLpPots[p] = pots[p].value;
                         }
                     }
@@ -5887,6 +6248,42 @@ void loop() {
             }
         }
 
+        // I303 joystick: X=wave cycle, Y=octave (same as 303S)
+        if (currentMode==MODE_I303 && !menuOpen) {
+            static unsigned long i303jWvMs=0, i303jOctMs=0;
+            static bool i303jWvArm=false, i303jOctArm=false;
+            float jx=cachedJoyX/64.0f, jy=cachedJoyY/64.0f;
+            unsigned long now=millis();
+            bool jxH=(fabsf(jx)>0.45f), jyH=(fabsf(jy)>0.45f);
+            if(!jxH) i303jWvArm=false;
+            if(!jyH) i303jOctArm=false;
+            if(jxH && (!i303jWvArm || now-i303jWvMs>=150)){
+                int8_t dir=(jx>0)?1:-1;
+                static const uint8_t kI303Waves[]={TRIANGLE, T303_TRI2_WAVE, SAW_DOWN, T303_SAW2_WAVE, PULSE, T303_SAW3_WAVE, T303_SQ2_WAVE, T303_NAP_WAVE};
+                uint8_t ci=0;
+                for(uint8_t i=0;i<8;i++) if(kI303Waves[i]==t303Wave){ci=i;break;}
+                ci=(uint8_t)((ci+8+dir)%8);
+                t303Wave=kI303Waves[ci];
+                if(audioReady){
+                    audioT303Wave(t303AmyWave(t303Wave));
+                    audioT303Feedback(0.0f);
+                    float curP2=pots[1].value;
+                    if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE) audioT303WavefoldAsym(curP2);
+                    else if(t303Wave==TRIANGLE||t303Wave==SAW_DOWN||t303Wave==T303_SAW3_WAVE||t303Wave==T303_SQ2_WAVE) audioT303Wavefold(curP2);
+                    else audioT303Wavefold(0.0f);
+                    if(t303Wave==PULSE)          audioT303Duty(0.5f-curP2*0.48f);
+                    if(t303Wave==T303_SAW3_WAVE) audioT303Duty(0.5f);
+                    if(t303Wave==T303_NAP_WAVE)  audioT303Duty(0.005f+curP2*0.495f);
+                }
+                i303jWvMs=now; i303jWvArm=true;
+            }
+            if(jyH && (!i303jOctArm || now-i303jOctMs>=300)){
+                int8_t dir=(jy>0)?-1:1;
+                t303Oct=(int8_t)constrain(t303Oct+dir,-3,3);
+                i303jOctMs=now; i303jOctArm=true;
+            }
+        }
+
         // 303S joystick: X=wave (TRI/SUP/SAW/SQR), Y=octave (debounced, hold-scroll)
         if (currentMode==MODE_303S && !menuOpen) {
             static unsigned long s303jWvMs=0, s303jOctMs=0;
@@ -5898,15 +6295,25 @@ void loop() {
             if(!jyH) s303jOctArm=false;
             if(jxH && (!s303jWvArm || now-s303jWvMs>=150)){
                 int8_t dir=(jx>0)?1:-1;
-                static const uint8_t kT303Waves[]={TRIANGLE, SAW_UP, SAW_DOWN, PULSE, T303_NAP_WAVE};
+                static const uint8_t kT303Waves[]={TRIANGLE, T303_TRI2_WAVE, SAW_DOWN, T303_SAW2_WAVE, PULSE, T303_SAW3_WAVE, T303_SQ2_WAVE, T303_NAP_WAVE};
                 uint8_t ci=0;
-                for(uint8_t i=0;i<5;i++) if(kT303Waves[i]==t303Wave){ci=i;break;}
-                ci=(uint8_t)((ci+5+dir)%5);
+                for(uint8_t i=0;i<8;i++) if(kT303Waves[i]==t303Wave){ci=i;break;}
+                ci=(uint8_t)((ci+8+dir)%8);
                 t303Wave=kT303Waves[ci];
-                uint8_t amyWv=(t303Wave==T303_NAP_WAVE)?PULSE:t303Wave;
-                if(audioReady) audioT303Wave(amyWv);
-                if(t303Wave==PULSE        && audioReady) audioT303Wavefold(0.0f);
-                if(t303Wave==T303_NAP_WAVE && audioReady) { audioT303Wavefold(0.0f); audioT303Duty(0.10f); }
+                if(audioReady){
+                    audioT303Wave(t303AmyWave(t303Wave));
+                    audioT303Feedback(0.0f);
+                    float curP2=pots[1].value;
+                    if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE)
+                        audioT303WavefoldAsym(curP2);  // TRI2/SW3: asymmetric fold
+                    else if(t303Wave==TRIANGLE||t303Wave==SAW_DOWN||t303Wave==T303_SAW3_WAVE||t303Wave==T303_SQ2_WAVE)
+                        audioT303Wavefold(curP2);       // TRI/SAW/SQ2/SIN: symmetric fold
+                    else
+                        audioT303Wavefold(0.0f);        // SQR/NAP: reset fold
+                    if(t303Wave==PULSE)         audioT303Duty(0.5f-curP2*0.48f);
+                    if(t303Wave==T303_SAW3_WAVE) audioT303Duty(0.5f);  // SQ2 base: 50% duty
+                    if(t303Wave==T303_NAP_WAVE) audioT303Duty(0.005f+curP2*0.495f);
+                }
                 s303jWvMs=now; s303jWvArm=true;
             }
             if(jyH && (!s303jOctArm || now-s303jOctMs>=300)){
@@ -5944,13 +6351,13 @@ void loop() {
             // Pitch Bend: Y axis (push down = bend up), ±5% deadzone
             double pb = (fabsf(jy) > 0.05) ? (double)-jy : 0.0;
             if (fabsf((float)pb - midiLastPB) > 0.008f) {
-                usbMIDI.pitchBend(pb, midiChannel);
+                midiPitchBend(pb, midiChannel);
                 midiLastPB = (float)pb;
             }
             // Modulation: X axis, full range — left(-1)=0, center=64, right(+1)=127
             uint8_t mod = (uint8_t)constrain((int)((jx + 1.0f) * 63.5f), 0, 127);
             if (mod != midiLastMod) {
-                usbMIDI.controlChange(1, mod, midiChannel);
+                midiCC(1, mod, midiChannel);
                 midiLastMod = mod;
             }
         }
@@ -6244,7 +6651,7 @@ void loop() {
 #if CONFIG_TINYUSB_MIDI_ENABLED
         if(currentMode==MODE_MIDI && midiActive){
             midiEventPacket_t pkt;
-            while(usbMIDI.readPacket(&pkt)){
+            while(midiReadPacket(&pkt)){
                 uint8_t status = pkt.byte1 & 0xF0;
                 uint8_t note   = pkt.byte2;
                 uint8_t velo   = pkt.byte3;

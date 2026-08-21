@@ -27,6 +27,8 @@ enum AppMode : uint8_t {
     MODE_SYSEQ,     // 16-step polyphonic synth sequencer (up to 4 notes/step)
     MODE_303S,      // 16-step TB-303 step sequencer (note + accent + slide per step)
     MODE_SS2,       // 16-step sample sequencer: 16 slots, per-step alteration, shared clock
+    MODE_ANIM,      // visual animations: wave / bars / techno / acid / 8bit
+    MODE_I303,      // polyphonic TB-303: 6-voice chord/melody with full 303S sound engine
     MODE_COUNT
 };
 
@@ -42,6 +44,8 @@ enum MenuItem : uint8_t {
     MENU_TRACKER, MENU_DRUM2, MENU_SYSEQ,
     MENU_303S,
     MENU_SS2,
+    MENU_ANIM,
+    MENU_I303,
     MENU_ITEM_COUNT
 };
 static const char* menuLabels[] = {
@@ -52,8 +56,8 @@ static const char* menuLabels[] = {
     "SYN2","MOD2","303",
     "GRAN","GR2","MIDI",
     "TRKR","DR2","SSEQ",
-    "303S",
-    "SS2"
+    "303S","SS2","ANIM",
+    "I303"
 };
 #define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
 

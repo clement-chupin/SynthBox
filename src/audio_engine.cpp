@@ -1892,7 +1892,8 @@ void audioSetSampleVolume(float v) {
 // Sustain level and decay applied only at NoteOn to avoid EG restart mid-note.
 static float s_t303Decay   = 500.0f;
 static float s_t303Sustain = 0.0f;  // 0=note decays to silence, 1=held at full amp until note-off
-extern "C" float amy_wavefold_gain;  // defined in amy.c; controls 303 bus-1 wavefolder (1.0=dry)
+extern "C" float amy_wavefold_gain;      // defined in amy.c; controls 303 bus-1 wavefolder (1.0=dry)
+extern "C" float amy_wavefold_pos_only;  // defined in amy.c; >0.5 = fold positive half only (TRI2)
 
 void audioT303Init(float cutoff, float reso, float envMod, float decay, uint8_t amyWave) {
     if (!audioReady) return;
@@ -1991,14 +1992,42 @@ void audioT303Duty(float duty) {
     amy_add_event(&e);
 }
 
-// P2 texture for TRI/SAW/SWU: wavefolder applied to T303 bus 1 in amy_fill_buffer().
-// depth 0→1: 1x drive (dry) → 4x drive (~2 full folds, FM-like overtones).
-// Precomputed gain avoids powf() in the audio thread.
+// Polyphonic 303 (I303 mode): same engine as T303 but 6 voices for chord/melody play.
+void audioI303Init(float cutoff, float reso, float envMod, float decay, uint8_t amyWave) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth          = T303_CH;
+    e.bus            = 1;
+    e.num_voices     = 6;
+    e.oscs_per_voice = 1;
+    e.wave           = amyWave;
+    e.filter_type    = FILTER_LPF24;
+    e.resonance      = reso;
+    e.filter_freq_coefs[COEF_CONST] = cutoff;
+    e.filter_freq_coefs[COEF_EG0]   = envMod;
+    e.eg0_times[0] = 2.0f;   e.eg0_values[0] = 1.0f;
+    e.eg0_times[1] = decay;  e.eg0_values[1] = 0.0f;
+    e.eg0_times[2] = 30.0f;  e.eg0_values[2] = 0.0f;
+    amy_add_event(&e);
+    s_t303Decay = decay;
+}
+
+// Symmetric wavefolder for TRI/SAW2/SQ2: depth 0→1 maps gain 1x→32x (extreme folds).
 void audioT303Wavefold(float depth) {
+    amy_wavefold_pos_only = 0.0f;
     if (depth < 0.01f) {
         amy_wavefold_gain = 1.0f;
     } else {
-        amy_wavefold_gain = powf(4.0f, depth);  // 1→4 as depth 0→1
+        amy_wavefold_gain = powf(32.0f, depth);  // 1→32 as depth 0→1
+    }
+}
+// Asymmetric wavefolder for TRI2/SAW3: folds only positive peaks, bass retained.
+void audioT303WavefoldAsym(float depth) {
+    amy_wavefold_pos_only = 1.0f;
+    if (depth < 0.01f) {
+        amy_wavefold_gain = 1.0f;
+    } else {
+        amy_wavefold_gain = powf(32.0f, depth);  // 1→32 as depth 0→1
     }
 }
 
