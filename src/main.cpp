@@ -522,7 +522,7 @@ struct FxEffect {
 
 FxEffect fxList[] = {
     // FILT: filtre général — Atn=pente (0=12dB, 1=24dB pour LPF), Typ=type (0=LPF,1=HPF,2=BPF)
-    {"FILT",     false, {2000.0f, 1.5f, 0.0f, 0.0f},
+    {"FILT",     false, {2000.0f, 1.5f, 1.0f, 0.0f},
      {"Cut","Res","Atn","Typ"},
      {65.0f,   0.5f, 0.0f, 0.0f},
      {18000.0f, 3.0f, 1.0f, 2.0f}},
@@ -5747,7 +5747,10 @@ void loop() {
                                     float mx=fxList[fxSelected].paramMax[p];
                                     if (fxSelected==0 && p==0)
                                         fxList[0].params[0]=mn*powf(mx/mn, pots[pIdx[0]].value);
-                                    else {
+                                    else if (fxSelected==0 && p==3) {
+                                        fxList[0].params[3]=floorf(pots[pIdx[p]].value*2.9999f);
+                                        s_filtMetaChanged=true;
+                                    } else {
                                         fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
                                         if (fxSelected==0) s_filtMetaChanged=true;
                                     }
@@ -5788,7 +5791,10 @@ void loop() {
                                 // LPF cutoff uses exponential mapping for musical sweep (equal octaves per pot range)
                                 if (fxSelected==0 && p==0)
                                     fxList[0].params[0]=mn*powf(mx/mn, pots[pIdx[0]].value);
-                                else
+                                else if (fxSelected==0 && p==3) {
+                                    fxList[0].params[3]=floorf(pots[pIdx[p]].value*2.9999f);
+                                    s_filtMetaChanged=true;
+                                } else
                                     fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
                                 lpo[p]=pots[pIdx[p]].value;
                                 changed=true;
@@ -5796,6 +5802,7 @@ void loop() {
                         }
                         // LPF changes are applied smoothly by the 10ms tick (anti-zipper)
                         if(changed && fxSelected!=0) applyFxEffect(fxSelected);
+                        else if(changed && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
                     }
                     break;
                 }
@@ -5819,7 +5826,10 @@ void loop() {
                                 // LPF cutoff uses exponential mapping for musical sweep (equal octaves per pot range)
                                 if (fxSelected==0 && p==0)
                                     fxList[0].params[0]=mn*powf(mx/mn, pots[pIdx[0]].value);
-                                else
+                                else if (fxSelected==0 && p==3) {
+                                    fxList[0].params[3]=floorf(pots[pIdx[p]].value*2.9999f);
+                                    s_filtMetaChanged=true;
+                                } else
                                     fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
                                 lp[p]=pots[pIdx[p]].value;
                                 changed=true;
@@ -5827,6 +5837,7 @@ void loop() {
                         }
                         // LPF changes are applied smoothly by the 10ms tick (anti-zipper)
                         if(changed && fxSelected!=0) applyFxEffect(fxSelected);
+                        else if(changed && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
                     }
                     break;
                 }
@@ -5880,7 +5891,12 @@ void loop() {
                             if(fabsf(pots[pIdx[p]].value-lp_fx_s[p])>0.001f){
                                 float mn=fxList[fxSelected].paramMin[p];
                                 float mx=fxList[fxSelected].paramMax[p];
-                                fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
+                                if (fxSelected==0 && p==0)
+                                    fxList[0].params[0]=mn*powf(mx/mn, pots[pIdx[0]].value);
+                                else if (fxSelected==0 && p==3)
+                                    fxList[0].params[3]=floorf(pots[pIdx[p]].value*2.9999f);
+                                else
+                                    fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
                                 lp_fx_s[p]=pots[pIdx[p]].value;
                                 changed=true;
                             }
@@ -5929,7 +5945,10 @@ void loop() {
                                     float mx=fxList[fxSelected].paramMax[p];
                                     if (fxSelected==0 && p==0)
                                         fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
-                                    else {
+                                    else if (fxSelected==0 && p==3) {
+                                        fxList[0].params[3]=floorf(pots[3+p].value*2.9999f);
+                                        s_filtMetaChanged=true;
+                                    } else {
                                         fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
                                         if (fxSelected==0) s_filtMetaChanged=true;
                                     }
@@ -5988,7 +6007,10 @@ void loop() {
                                     float mx=fxList[fxSelected].paramMax[p];
                                     if (fxSelected==0 && p==0)
                                         fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
-                                    else {
+                                    else if (fxSelected==0 && p==3) {
+                                        fxList[0].params[3]=floorf(pots[3+p].value*2.9999f);
+                                        s_filtMetaChanged=true;
+                                    } else {
                                         fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
                                         if (fxSelected==0) s_filtMetaChanged=true;
                                     }
@@ -6071,7 +6093,10 @@ void loop() {
                                     float mx=fxList[fxSelected].paramMax[p];
                                     if (fxSelected==0 && p==0)
                                         fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
-                                    else {
+                                    else if (fxSelected==0 && p==3) {
+                                        fxList[0].params[3]=floorf(pots[3+p].value*2.9999f);
+                                        s_filtMetaChanged=true;
+                                    } else {
                                         fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
                                         if (fxSelected==0) s_filtMetaChanged=true;
                                     }
@@ -6530,7 +6555,10 @@ void loop() {
                             float mx = fxList[fxSelected].paramMax[p];
                             if (fxSelected == 0 && p == 0)
                                 fxList[0].params[0] = mn * powf(mx/mn, pots[3].value);
-                            else {
+                            else if (fxSelected == 0 && p == 3) {
+                                fxList[0].params[3] = floorf(pots[3+p].value * 2.9999f);
+                                s_filtMetaChanged = true;
+                            } else {
                                 fxList[fxSelected].params[p] = mn + (mx - mn) * pots[3+p].value;
                                 if (fxSelected==0) s_filtMetaChanged=true;
                             }
@@ -6632,7 +6660,10 @@ void loop() {
                             float mx = fxList[fxSelected].paramMax[p];
                             if (fxSelected == 0 && p == 0)
                                 fxList[0].params[0] = mn * powf(mx/mn, pots[3].value);
-                            else {
+                            else if (fxSelected == 0 && p == 3) {
+                                fxList[0].params[3] = floorf(pots[3+p].value * 2.9999f);
+                                s_filtMetaChanged = true;
+                            } else {
                                 fxList[fxSelected].params[p] = mn + (mx - mn) * pots[3+p].value;
                                 if (fxSelected==0) s_filtMetaChanged=true;
                             }
