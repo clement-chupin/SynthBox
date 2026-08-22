@@ -131,11 +131,79 @@ static float         t303Reso        = 1.5f;      // resonance 1-3
 static float         t303EnvMod      = 0.0f;      // filter EG depth (0=off, classic plat)
 static float         t303Decay       = 500.0f;    // EG decay ms (fixed — not pot-controlled)
 static uint8_t       t303Wave        = SAW_DOWN;  // AMY wave constant (SAW_DOWN, PULSE, TRIANGLE, SINE…) or T303_NAP_WAVE
-#define T303_NAP_WAVE   200  // narrow pulse: PULSE with genuinely narrow duty [0.005, 0.05]
+#define T303_NAP_WAVE   200  // NAP: PULSE fixed 2% duty (nasal spike) + P2=symmetric wavefold
 #define T303_TRI2_WAVE  201  // TRI + asymmetric fold (fold peaks, retain bass)
 #define T303_SAW2_WAVE  202  // SAW_DOWN + symmetric wavefold
 #define T303_SAW3_WAVE  203  // SAW_DOWN + AMY feedback (progressive harmonics)
 #define T303_SQ2_WAVE   204  // SINE + AMY feedback (pure→complex via FM)
+#define T303_SWF_WAVE   205  // SAW + sous-octaves : base f, f-1 (P2 0→50%), f-2 (P2 50→100%)
+#define T303_SQF_WAVE   206  // SQR + sous-octaves identiques
+#define T303_SNF_WAVE   207  // SIN + sous-octaves identiques
+#define T303_PINK_WAVE  208  // NOISE rose : passe par le filtre résonant 303
+// Vrai si la vague utilise les sous-canaux de sous-octaves (blend via P2)
+static inline bool t303IsSubOctWave(uint8_t w) {
+    return w==T303_SWF_WAVE || w==T303_SQF_WAVE || w==T303_SNF_WAVE;
+}
+
+// Calcule `len` échantillons normalisés [-1,1] représentant 3 cycles de la vague courante.
+// P2 contrôle le fold/duty selon le type de vague.
+static void t303FillWaveform(uint8_t wave, float p2, float* out, int len) {
+    float maxAbs = 1e-4f;
+    // SxF blend coefficients (computed once)
+    float sxf_a = (p2<0.5f) ? p2*2.0f : 1.0f;
+    float sxf_b = (p2<0.5f) ? 0.0f : (p2-0.5f)*2.0f;
+    for (int i = 0; i < len; i++) {
+        float phase = fmodf((float)i * 3.0f / (float)(len - 1), 1.0f);
+        float yv;
+        if (wave==PULSE) {
+            yv = (phase < 0.5f - p2*0.48f) ? 1.0f : -1.0f;
+        } else if (wave==T303_NAP_WAVE) {
+            // Métaphore visuelle : duty 7→50% représente l'enrichissement harmonique du fold
+            yv = (phase < 0.07f + p2*0.43f) ? 1.0f : -1.0f;
+        } else if (wave==T303_PINK_WAVE) {
+            // Pseudo-bruit déterministe : somme de sinusoïdes inharmoniques
+            yv = sinf(i*0.379f)*0.5f + sinf(i*0.923f)*0.3f + sinf(i*2.17f)*0.15f + sinf(i*5.7f)*0.05f;
+        } else if (t303IsSubOctWave(wave)) {
+            // Signal composite : base (3 cycles) + f-1 (1.5 cycles) + f-2 (0.75 cycles)
+            float ph1 = fmodf((float)i * 1.5f  / (float)(len - 1), 1.0f);
+            float ph2 = fmodf((float)i * 0.75f / (float)(len - 1), 1.0f);
+            float bf, bf1, bf2;
+            if (wave==T303_SNF_WAVE) {
+                bf  = sinf(phase * 6.28318f);
+                bf1 = sinf(ph1   * 6.28318f);
+                bf2 = sinf(ph2   * 6.28318f);
+            } else if (wave==T303_SQF_WAVE) {
+                bf  = (phase < 0.5f) ? 1.0f : -1.0f;
+                bf1 = (ph1   < 0.5f) ? 1.0f : -1.0f;
+                bf2 = (ph2   < 0.5f) ? 1.0f : -1.0f;
+            } else {  // SWF (SAW)
+                bf  = 1.0f - 2.0f*phase;
+                bf1 = 1.0f - 2.0f*ph1;
+                bf2 = 1.0f - 2.0f*ph2;
+            }
+            yv = (bf + sxf_a*bf1 + sxf_b*bf2) / (1.0f + sxf_a + sxf_b);
+        } else {
+            float base;
+            if      (wave==TRIANGLE || wave==T303_TRI2_WAVE) base = (phase<0.5f)?(4*phase-1):(3-4*phase);
+            else if (wave==T303_SQ2_WAVE)                    base = sinf(phase * 6.28318f);
+            else if (wave==T303_SAW3_WAVE)                   base = tanhf(8.0f * sinf(phase * 6.28318f));
+            else                                             base = 1.0f - 2.0f*phase;  // SAW
+            float g = (p2<0.01f)?1.0f:powf(32.0f,p2);
+            if (wave==T303_TRI2_WAVE || wave==T303_SAW2_WAVE) {
+                if (base<0.0f) { yv=base; }
+                else { float s=base*g, ph=fmodf(s+1.0f,4.0f); if(ph<0)ph+=4.0f; yv=(ph<2.0f)?(ph-1.0f):(3.0f-ph); }
+            } else {
+                float s=base*g, ph=fmodf(s+1.0f,4.0f); if(ph<0)ph+=4.0f;
+                yv = (ph<2.0f)?(ph-1.0f):(3.0f-ph);
+            }
+        }
+        out[i] = yv;
+        if (fabsf(yv) > maxAbs) maxAbs = fabsf(yv);
+    }
+    float inv = 1.0f / maxAbs;
+    for (int i = 0; i < len; i++) out[i] *= inv;
+}
+
 static int8_t        t303Oct         = 0;         // octave offset -1..+1
 static bool          t303AccentOn    = false;
 static bool          t303SustainOn   = false;     // OFF=pluck (clear decay), ON=held at full amp
@@ -156,6 +224,10 @@ static inline uint8_t t303AmyWave(uint8_t w) {
         case T303_SAW2_WAVE: return SAW_DOWN;   // SW3: SAW + asymmetric fold
         case T303_SAW3_WAVE: return PULSE;       // SQ2: PULSE + symmetric fold
         case T303_SQ2_WAVE:  return SINE;        // SIN: SINE + fold
+        case T303_SWF_WAVE:  return SAW_DOWN;    // SAW + sous-octaves
+        case T303_SQF_WAVE:  return PULSE;       // SQR + sous-octaves
+        case T303_SNF_WAVE:  return SINE;        // SIN + sous-octaves
+        case T303_PINK_WAVE: return NOISE;       // bruit rose
         default:             return w;
     }
 }
@@ -170,6 +242,10 @@ static inline const char* t303WaveName(uint8_t w) {
         case T303_SAW3_WAVE: return "SQ2";   // PULSE + symmetric fold
         case T303_SQ2_WAVE:  return "SIN";   // SINE + fold
         case T303_NAP_WAVE:  return "NAP";
+        case T303_SWF_WAVE:  return "SWF";   // SAW + sous-octaves
+        case T303_SQF_WAVE:  return "SQF";   // SQR + sous-octaves
+        case T303_SNF_WAVE:  return "SNF";   // SIN + sous-octaves
+        case T303_PINK_WAVE: return "PINK";  // bruit rose
         default:             return "---";
     }
 }
@@ -445,11 +521,11 @@ struct FxEffect {
 };
 
 FxEffect fxList[] = {
-    // FILT: general filter — type selected by Typ param (0=LPF,1=LaF/24dB,2=HPF,3=BPF)
+    // FILT: filtre général — Atn=pente (0=12dB, 1=24dB pour LPF), Typ=type (0=LPF,1=HPF,2=BPF)
     {"FILT",     false, {2000.0f, 1.5f, 0.0f, 0.0f},
-     {"Cut","Res","Typ",""},
+     {"Cut","Res","Atn","Typ"},
      {65.0f,   0.5f, 0.0f, 0.0f},
-     {18000.0f, 3.0f, 3.0f, 0.0f}},
+     {18000.0f, 3.0f, 1.0f, 2.0f}},
     // Overdrive: filter resonance saturation
     {"OVERDRIVE",false, {0.6f, 0.0f,  0.0f, 0.0f},
      {"Drv","","",""},
@@ -495,6 +571,12 @@ FxEffect fxList[] = {
 };
 static const uint8_t FX_COUNT = 9;
 
+// Noms des types de filtre FILT — LPF (12dB ou 24dB selon Atn), HPF, BPF
+static const char* kFiltTypN[] = {"LPF","HPF","BPF"};
+static const char* fxFiltTypName() {
+    return kFiltTypN[(uint8_t)constrain((int)roundf(fxList[0].params[3]), 0, 2)];
+}
+
 // Delay subdivisions — param[1] is an index 0..6 into these tables
 static const float kDelaySubdiv[]     = { 0.25f, 0.333f, 0.5f, 0.75f, 1.0f, 1.5f, 2.0f };
 static const char* kDelaySubdivName[] = { "1/16","T1/8","1/8","D1/8","1/4","D1/4","1/2" };
@@ -502,6 +584,7 @@ static const uint8_t DELAY_SUBDIV_COUNT = 7;
 
 uint8_t fxSelected = 0;
 static float lpfSmoothCut = 8000.0f; // anti-zipper: smoothed cutoff applied each 10ms tick
+static bool  s_filtMetaChanged = false; // true when FILT Res/Atn/Typ changed → applyFxEffect(0) needed
 
 // Activation order: fxOrderList[0] was activated first, fxOrderList[fxOrderCount-1] last.
 // Effects applied in this order, so the last activated filter effect wins.
@@ -529,13 +612,19 @@ void applyFxEffect(uint8_t fx) {
         return !fxList[0].active && !fxList[1].active && !fxList[6].active;
     };
     switch (fx) {
-        case 0: {  // FILT — general filter (0=LPF 1=LaF/LPF24 2=HPF 3=BPF)
-            static const uint8_t kFiltAMY[] = {FILTER_LPF, FILTER_LPF24, FILTER_HPF, FILTER_BPF};
-            static const char* kFiltName[]  = {"LPF","LaF","HPF","BPF"};
-            uint8_t ti = (uint8_t)constrain((int)roundf(e.params[2]), 0, 3);
-            Serial.printf("FX0 FILT %s cut=%.0f res=%.2f typ=%s\n",
-                on?"ON":"off", on?e.params[0]:0.0f, on?e.params[1]:1.5f, kFiltName[ti]);
-            audioSetAllFiltersT(on ? e.params[0] : 0.0f, on ? e.params[1] : 1.5f,
+        case 0: {  // FILT — filtre général (params[3]=Typ: 0=LPF,1=HPF,2=BPF ; params[2]=Atn: 0=bypass,1=full)
+            static const uint8_t kFiltAMY[] = {FILTER_LPF, FILTER_HPF, FILTER_BPF};
+            uint8_t ti  = (uint8_t)constrain((int)roundf(e.params[3]), 0, 2);
+            float   atn = e.params[2];
+            float   cut = e.params[0], res = e.params[1];
+            // Atn=0 → filtre transparent ; Atn=1 → effet plein
+            float eff_cut, eff_res;
+            if (ti == 0) { eff_cut = 18000.0f + atn*(cut-18000.0f); eff_res = res; } // LPF: lerp(18k→cut)
+            else if (ti == 1) { eff_cut = 20.0f + atn*(cut-20.0f); eff_res = res; }  // HPF: lerp(20→cut)
+            else { eff_cut = cut; eff_res = 0.5f + atn*(res-0.5f); }                  // BPF: Q lerp(0.5→res)
+            Serial.printf("FX0 FILT %s cut=%.0f(eff=%.0f) res=%.2f typ=%s atn=%.2f\n",
+                on?"ON":"off", cut, on?eff_cut:0.0f, on?eff_res:1.5f, kFiltTypN[ti], atn);
+            audioSetAllFiltersT(on ? eff_cut : 0.0f, on ? eff_res : 1.5f,
                                 on ? kFiltAMY[ti] : FILTER_LPF24);
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
             if (!on && (currentMode == MODE_303 || currentMode == MODE_303S))
@@ -685,6 +774,8 @@ void switchMode(AppMode newMode) {
     if (currentMode==MODE_I303){
         midiAllNotesOff(MIDI_CH_BASS);
     }
+    if ((currentMode==MODE_303S || currentMode==MODE_I303 || currentMode==MODE_303) && audioReady)
+        audioSW2Deactivate();
     if (currentMode==MODE_SS2){
         for(uint8_t r2=0;r2<KBD_NOTE_ROWS;r2++)
             for(uint8_t c2=0;c2<KBD_COLS;c2++)
@@ -758,7 +849,13 @@ void switchMode(AppMode newMode) {
         t303Duration = 0.5f;
         t303Decay = 30.0f * powf(100.0f, 0.5f);
         lp303[2] = pots[5].value;
-        if (audioReady) audioT303Init(t303Cutoff, t303Reso, t303EnvMod, t303Decay, t303AmyWave(t303Wave));
+        if (audioReady) {
+            audioT303Init(t303Cutoff, t303Reso, t303EnvMod, t303Decay, t303AmyWave(t303Wave));
+            if (t303IsSubOctWave(t303Wave)) {
+                audioSW2Init(t303Cutoff, t303Reso, t303Decay, 1, t303AmyWave(t303Wave));
+                audioSW2SetBlend(pots[1].value);
+            }
+        }
         // Shared clock continues if already playing
     }
     if (newMode==MODE_I303) {
@@ -768,11 +865,18 @@ void switchMode(AppMode newMode) {
         if (audioReady) {
             audioI303Init(t303Cutoff, t303Reso, t303EnvMod, t303Decay, t303AmyWave(t303Wave));
             float curP2=pots[1].value;
-            if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE) audioT303WavefoldAsym(curP2);
-            else if(t303Wave==PULSE)         audioT303Duty(0.5f-curP2*0.48f);
-            else if(t303Wave==T303_NAP_WAVE) audioT303Duty(0.005f+curP2*0.495f);
-            else if(t303Wave==T303_SAW3_WAVE){ audioT303Duty(0.5f); audioT303Wavefold(curP2); }
-            else                             audioT303Wavefold(curP2);
+            if(t303IsSubOctWave(t303Wave)){
+                audioSW2Init(t303Cutoff, t303Reso, t303Decay, 6, t303AmyWave(t303Wave));
+                audioSW2SetBlend(curP2);
+            } else if(t303Wave==T303_PINK_WAVE){
+                audioT303Wavefold(0.0f);
+            } else {
+                if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE) audioT303WavefoldAsym(curP2);
+                else if(t303Wave==PULSE)         audioT303Duty(0.5f-curP2*0.48f);
+                else if(t303Wave==T303_NAP_WAVE) { audioT303Duty(0.02f); audioT303Wavefold(curP2); }
+                else if(t303Wave==T303_SAW3_WAVE){ audioT303Duty(0.5f); audioT303Wavefold(curP2); }
+                else                             audioT303Wavefold(curP2);
+            }
         }
     }
     if (newMode==MODE_SS2) {
@@ -946,6 +1050,11 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
                     audioT303SetAmpEnv((float)envTable[currentEnv].atk,
                                        envTable[currentEnv].sus,
                                        (float)envTable[currentEnv].rel);
+                if (currentMode == MODE_I303 && audioReady)
+                    audioI303SetAmpEnv((float)envTable[currentEnv].atk,
+                                       envTable[currentEnv].sus,
+                                       (float)envTable[currentEnv].dec,
+                                       (float)envTable[currentEnv].rel);
             } else if (opt >= 12 && opt < 16) {
                 noteMap.setOctave(kOctOpts[opt-12]);
             }
@@ -1074,7 +1183,8 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                 if (menuOpen) menuOpen=false;
                 else switch(currentMode) {
                     case MODE_SYNTH:
-                    case MODE_303: {
+                    case MODE_303:
+                    case MODE_I303: {
                         OverlayType old = s_overlay; s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
                         if (old != OVERLAY_FX) s_overlay = OVERLAY_FX;
                         break;
@@ -1294,6 +1404,7 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             break;
         case MODE_I303:
             if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_SCALE_ARP) s_overlay=OVERLAY_SCALE_ARP; }
+            if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_ENV) s_overlay=OVERLAY_ENV; }
             if (btn==3) noteMap.nextOctave();
             break;
         case MODE_303S:
@@ -1559,12 +1670,21 @@ void drawScreen() {
             case OVERLAY_FX:
                 for (int i = 0; i < (int)FX_COUNT; i++) {
                     OvBox &b = bx[i]; b.avail = true; b.sel = fxList[i].active;
-                    strncpy(b.l1, fxList[i].name, sizeof(b.l1)-1);
+                    strncpy(b.l1, (i==0) ? fxFiltTypName() : fxList[i].name, sizeof(b.l1)-1);
                     const FxEffect &fx = fxList[i];
                     // Collect indices of visible params (non-empty name)
                     int vp[4]; int vpc = 0;
                     for (int p = 0; p < 4; p++) if (fx.paramNames[p][0]) vp[vpc++] = p;
                     if (vpc == 0) continue;
+                    // Special case: FILT — Cut:Res sur l2, Atn:Typ(string) sur l3
+                    if (i == 0) {
+                        char cv[8]; fmtFloat(cv, sizeof(cv), fx.params[0]);
+                        char rv[8]; fmtFloat(rv, sizeof(rv), fx.params[1]);
+                        snprintf(b.l2, sizeof(b.l2), "Cu:%s Re:%s", cv, rv);
+                        char av[8]; fmtFloat(av, sizeof(av), fx.params[2]);
+                        snprintf(b.l3, sizeof(b.l3), "At:%s %s", av, fxFiltTypName());
+                        continue;
+                    }
                     // Special case: Delay shows level + BPM-synced time hint
                     if (i == 5) {
                         char v[8]; fmtFloat(v, sizeof(v), fx.params[vp[0]]);
@@ -1733,13 +1853,11 @@ void drawScreen() {
                 // col7 (bx 0-3): FX 0-3   col6 (bx 4-7): FX 4-7
                 // col5 (bx 8-11): FX 8 + octave (bx9-11)
                 // col4 (bx 12-15): mode preset (shape/wave)
-                static const char* kFiltTypAbbr[] = {"LPF","LaF","HPF","BPF"};
                 for (int i = 0; i < (int)FX_COUNT; i++) {
                     bx[i].avail = true;
                     bx[i].sel   = fxList[i].active;
-                    if (i == 0 && fxList[0].active) {
-                        uint8_t ti = (uint8_t)constrain((int)(fxList[0].params[2] * 3.999f), 0, 3);
-                        strncpy(bx[i].l1, kFiltTypAbbr[ti], sizeof(bx[i].l1)-1);
+                    if (i == 0) {
+                        strncpy(bx[i].l1, fxFiltTypName(), sizeof(bx[i].l1)-1);
                     } else {
                         char a[4]; strncpy(a, fxList[i].name, 3); a[3]='\0';
                         strncpy(bx[i].l1, a, sizeof(bx[i].l1)-1);
@@ -1863,14 +1981,15 @@ void drawScreen() {
                 // Show last selected FX + its first 2 params if active
                 {
                     const FxEffect &fx=fxList[fxSelected];
+                    const char* fxdname = (fxSelected==0) ? fxFiltTypName() : fx.name;
                     if(fx.active){
                         snprintf(buf,sizeof(buf),"FX:%s %s:%.1f %s:%.1f",
-                                 fx.name,
+                                 fxdname,
                                  fx.paramNames[0],fx.params[0],
                                  fx.paramNames[1][0]?fx.paramNames[1]:"",
                                  fx.paramNames[1][0]?fx.params[1]:0.0f);
                     } else {
-                        snprintf(buf,sizeof(buf),"FX:%s [OFF]",fx.name);
+                        snprintf(buf,sizeof(buf),"FX:%s [OFF]",fxdname);
                     }
                     oled.drawStr(0,92,buf);
                 }
@@ -1902,7 +2021,7 @@ void drawScreen() {
                         int w=(i==(int)FX_COUNT-1)?(128-x):(slotW-1);
                         bool active=fxList[i].active;
                         bool sel=(i==(int)fxSelected);
-                        char nm[4]; strncpy(nm, fxList[i].name, 3); nm[3]='\0';
+                        char nm[4]; strncpy(nm, (i==0)?fxFiltTypName():fxList[i].name, 3); nm[3]='\0';
                         int tw=oled.getStrWidth(nm);
                         if(sel){
                             oled.drawRBox(x,16,w,8,1);
@@ -1924,7 +2043,9 @@ void drawScreen() {
                         int pc=0;
                         for(int p=0;p<4;p++){
                             if(!af.paramNames[p][0]) continue;
-                            char fv[6]; fmtFloat(fv, sizeof(fv), af.params[p]);
+                            char fv[6];
+                            if(fxSelected==0&&p==3) strncpy(fv,fxFiltTypName(),sizeof(fv)-1);
+                            else fmtFloat(fv,sizeof(fv),af.params[p]);
                             char ent[14];
                             snprintf(ent,sizeof(ent),"%s%.3s:%s",pc?" ":"",af.paramNames[p],fv);
                             strncat(line,ent,sizeof(line)-strlen(line)-1);
@@ -2052,15 +2173,20 @@ void drawScreen() {
                     } else {
                         const FxEffect& selFx = fxList[fxSelected];
                         if(selFx.active){
-                            char fxLine[33]; snprintf(fxLine, sizeof(fxLine), "[%.3s]", selFx.name);
+                            {
+                            const char* sfxdn = (fxSelected==0) ? fxFiltTypName() : selFx.name;
+                            char fxLine[33]; snprintf(fxLine, sizeof(fxLine), "[%.3s]", sfxdn);
                             for(int p = 0; p < 4; p++){
                                 if(!selFx.paramNames[p][0]) continue;
-                                char fv[6]; fmtFloat(fv, sizeof(fv), selFx.params[p]);
+                                char fv[6];
+                                if(fxSelected==0&&p==3) strncpy(fv,fxFiltTypName(),sizeof(fv)-1);
+                                else fmtFloat(fv,sizeof(fv),selFx.params[p]);
                                 char ent[9]; snprintf(ent, sizeof(ent), " %.2s:%.4s", selFx.paramNames[p], fv);
                                 if(strlen(fxLine) + strlen(ent) < sizeof(fxLine) - 1)
                                     strcat(fxLine, ent);
                             }
                             oled.drawStr(0, 111, fxLine);
+                            } // end FILT block
                         } else {
                             if(sdCursor < sdFileCount && !sdFileIsDir[sdCursor])
                                 oled.drawStr(0, 111, "Key=asgn B2=map Clk=dir");
@@ -2072,13 +2198,12 @@ void drawScreen() {
                     oled.drawStr(0, 119, buf);
                     // Active FX abbreviations + BPM on last line (FILT shows type)
                     {
-                        static const char* kFTLf[]={"LPF","LaF","HPF","BPF"};
                         char fxstr[20] = ""; uint8_t nfx = 0;
                         for(uint8_t fi = 0; fi < FX_COUNT; fi++){
                             if(!fxList[fi].active) continue;
                             if(nfx++) strncat(fxstr, " ", sizeof(fxstr) - strlen(fxstr) - 1);
                             char a[4];
-                            if(fi==0){ strncpy(a,kFTLf[(uint8_t)constrain((int)fxList[0].params[2],0,3)],4); }
+                            if(fi==0){ strncpy(a, fxFiltTypName(), sizeof(a)-1); a[3]='\0'; }
                             else{ strncpy(a, fxList[fi].name, 3); a[3] = '\0'; }
                             strncat(fxstr, a, sizeof(fxstr) - strlen(fxstr) - 1);
                         }
@@ -2169,7 +2294,7 @@ void drawScreen() {
 
                     snprintf(buf, sizeof(buf), "%s%s %s",
                              order ? ">" : " ",
-                             fxList[i].name,
+                             (i==0) ? fxFiltTypName() : fxList[i].name,
                              fxList[i].active ? "ON" : "--");
                     oled.drawStr(2, vy + 10, buf);
                     if (order) {
@@ -2186,13 +2311,11 @@ void drawScreen() {
                 // Params for selected (if active)
                 if (fxList[fxSelected].active) {
                     oled.setFont(u8g2_font_4x6_tf);
-                    static const char* kFiltTypLabel[] = {"LPF","LaF","HPF","BPF"};
                     char pb[40]; int ppos = 0;
                     for (int p = 0; p < 4; p++) {
                         if (!fxList[fxSelected].paramNames[p][0]) continue;
-                        if (fxSelected == 0 && p == 2) {
-                            uint8_t ti = (uint8_t)constrain((int)roundf(fxList[0].params[2]), 0, 3);
-                            ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "Typ:%s ", kFiltTypLabel[ti]);
+                        if (fxSelected == 0 && p == 3) {
+                            ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "Typ:%s ", fxFiltTypName());
                         } else {
                             ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "%s:%.1f ",
                                              fxList[fxSelected].paramNames[p], fxList[fxSelected].params[p]);
@@ -2396,13 +2519,12 @@ void drawScreen() {
             // ---- DRUM2 (TR-808 style + sequencer) ----
             case MODE_DRUM2: {
                 // Active FX string (3-char abbrevs; FILT shows type: LPF/LaF/HPF/BPF)
-                static const char* kFTL[]={"LPF","LaF","HPF","BPF"};
                 char fxstr[32]="";
                 for(uint8_t fi=0;fi<FX_COUNT;fi++){
                     if(!fxList[fi].active) continue;
                     if(fxstr[0]) strncat(fxstr," ",sizeof(fxstr)-strlen(fxstr)-1);
                     char a[4];
-                    if(fi==0){ strncpy(a,kFTL[(uint8_t)constrain((int)fxList[0].params[2],0,3)],4); }
+                    if(fi==0){ strncpy(a, fxFiltTypName(), sizeof(a)-1); a[3]='\0'; }
                     else{ strncpy(a,fxList[fi].name,3); a[3]='\0'; }
                     strncat(fxstr,a,sizeof(fxstr)-strlen(fxstr)-1);
                 }
@@ -2566,13 +2688,12 @@ void drawScreen() {
             // ---- SYSEQ — 16-step polyphonic synth sequencer ----
             case MODE_SYSEQ: {
                 // Active FX string (FILT shows type: LPF/LaF/HPF/BPF)
-                static const char* kFTLs[]={"LPF","LaF","HPF","BPF"};
                 char fxstr[32]="";
                 for(uint8_t fi=0;fi<FX_COUNT;fi++){
                     if(!fxList[fi].active) continue;
                     if(fxstr[0]) strncat(fxstr," ",sizeof(fxstr)-strlen(fxstr)-1);
                     char a[4];
-                    if(fi==0){ strncpy(a,kFTLs[(uint8_t)constrain((int)fxList[0].params[2],0,3)],4); }
+                    if(fi==0){ strncpy(a, fxFiltTypName(), sizeof(a)-1); a[3]='\0'; }
                     else{ strncpy(a,fxList[fi].name,3); a[3]='\0'; }
                     strncat(fxstr,a,sizeof(fxstr)-strlen(fxstr)-1);
                 }
@@ -2732,13 +2853,12 @@ void drawScreen() {
                 static const char* s3nn[]={"C","c","D","d","E","F","f","G","g","A","a","B"};
                 const char* s3wname = t303WaveName(t303Wave);
                 char s3fxstr[20]="";
-                { static const char* kFTL3[]={"LPF","LaF","HPF","BPF"};
-                  uint8_t nfx=0;
+                { uint8_t nfx=0;
                   for(uint8_t fi=0;fi<FX_COUNT;fi++){
                       if(!fxList[fi].active) continue;
                       if(nfx++) strncat(s3fxstr," ",sizeof(s3fxstr)-strlen(s3fxstr)-1);
                       char a[4];
-                      if(fi==0){ strncpy(a,kFTL3[(uint8_t)constrain((int)fxList[0].params[2],0,3)],4); }
+                      if(fi==0){ strncpy(a, fxFiltTypName(), sizeof(a)-1); a[3]='\0'; }
                       else{ strncpy(a,fxList[fi].name,3); a[3]='\0'; }
                       strncat(s3fxstr,a,sizeof(s3fxstr)-strlen(s3fxstr)-1);
                   }
@@ -2831,41 +2951,13 @@ void drawScreen() {
                         oled.setFont(u8g2_font_4x6_tf);
                         oled.drawFrame(WX,WY,WW,WH);
                         float p2=pots[1].value;
-                        if(t303Wave==PULSE||t303Wave==T303_NAP_WAVE){
-                            float duty=(t303Wave==PULSE)?(0.5f-p2*0.48f):(0.005f+p2*0.495f);
-                            int dw=max(1,min(WW-4,(int)(duty*(WW-2))));
-                            int hy=WY+1, ly=WY+WH-2;
-                            oled.drawHLine(WX+1,hy,dw);
-                            oled.drawVLine(WX+1+dw,hy,ly-hy+1);
-                            oled.drawHLine(WX+2+dw,ly,WW-3-dw);
-                        } else {
-                            // Fold display for all non-duty waves
-                            float g=(p2<0.01f)?1.0f:powf(32.0f,p2);
-                            bool posOnly=(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE);
-                            int prev=cy;
-                            for(int i=0;i<WW-2;i++){
-                                float t=(float)i/(float)(WW-3);
-                                float base;
-                                if(t303Wave==TRIANGLE||t303Wave==T303_TRI2_WAVE)
-                                    base=(t<0.5f)?(4*t-1):(3-4*t);       // triangle
-                                else if(t303Wave==T303_SQ2_WAVE)
-                                    base=sinf(t*6.2832f);                  // SIN: sine base
-                                else if(t303Wave==T303_SAW3_WAVE)
-                                    base=(t<0.5f)?1.0f:-1.0f;             // SQ2: square base
-                                else
-                                    base=1.0f-2.0f*t;                     // SAW/SW3: saw base
-                                float yv;
-                                if(posOnly&&base<0.0f){ yv=base; }
-                                else {
-                                    float s=base*g, ph=fmodf(s+1.0f,4.0f);
-                                    if(ph<0.0f) ph+=4.0f;
-                                    yv=(ph<2.0f)?(ph-1.0f):(3.0f-ph);
-                                }
-                                int py=constrain(cy-(int)(yv*ah+0.5f),WY+1,WY+WH-2);
-                                if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py);
-                                else    oled.drawPixel(WX+1,py);
-                                prev=py;
-                            }
+                        { float wfBuf[126]; t303FillWaveform(t303Wave,p2,wfBuf,WW-2);
+                          int prev=cy;
+                          for(int i=0;i<WW-2;i++){
+                              int py=constrain(cy-(int)(wfBuf[i]*ah+0.5f),WY+1,WY+WH-2);
+                              if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py); else oled.drawPixel(WX+1,py);
+                              prev=py;
+                          }
                         }
                     }
                 } else {
@@ -2945,41 +3037,13 @@ void drawScreen() {
                         oled.setFont(u8g2_font_4x6_tf);
                         oled.drawFrame(WX,WY,WW,WH);
                         float p2=pots[1].value;
-                        if(t303Wave==PULSE||t303Wave==T303_NAP_WAVE){
-                            float duty=(t303Wave==PULSE)?(0.5f-p2*0.48f):(0.005f+p2*0.495f);
-                            int dw=max(1,min(WW-4,(int)(duty*(WW-2))));
-                            int hy=WY+1, ly=WY+WH-2;
-                            oled.drawHLine(WX+1,hy,dw);
-                            oled.drawVLine(WX+1+dw,hy,ly-hy+1);
-                            oled.drawHLine(WX+2+dw,ly,WW-3-dw);
-                        } else {
-                            // Fold display for all non-duty waves
-                            float g=(p2<0.01f)?1.0f:powf(32.0f,p2);
-                            bool posOnly=(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE);
-                            int prev=cy;
-                            for(int i=0;i<WW-2;i++){
-                                float t=(float)i/(float)(WW-3);
-                                float base;
-                                if(t303Wave==TRIANGLE||t303Wave==T303_TRI2_WAVE)
-                                    base=(t<0.5f)?(4*t-1):(3-4*t);       // triangle
-                                else if(t303Wave==T303_SQ2_WAVE)
-                                    base=sinf(t*6.2832f);                  // SIN: sine base
-                                else if(t303Wave==T303_SAW3_WAVE)
-                                    base=(t<0.5f)?1.0f:-1.0f;             // SQ2: square base
-                                else
-                                    base=1.0f-2.0f*t;                     // SAW/SW3: saw base
-                                float yv;
-                                if(posOnly&&base<0.0f){ yv=base; }
-                                else {
-                                    float s=base*g, ph=fmodf(s+1.0f,4.0f);
-                                    if(ph<0.0f) ph+=4.0f;
-                                    yv=(ph<2.0f)?(ph-1.0f):(3.0f-ph);
-                                }
-                                int py=constrain(cy-(int)(yv*ah+0.5f),WY+1,WY+WH-2);
-                                if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py);
-                                else    oled.drawPixel(WX+1,py);
-                                prev=py;
-                            }
+                        { float wfBuf[126]; t303FillWaveform(t303Wave,p2,wfBuf,WW-2);
+                          int prev=cy;
+                          for(int i=0;i<WW-2;i++){
+                              int py=constrain(cy-(int)(wfBuf[i]*ah+0.5f),WY+1,WY+WH-2);
+                              if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py); else oled.drawPixel(WX+1,py);
+                              prev=py;
+                          }
                         }
                     }
                 }
@@ -3142,16 +3206,24 @@ void drawScreen() {
                     oled.drawStr(0,55,buf);
                 }
                 oled.drawHLine(0,62,128);
-                oled.drawStr(0,71,"P2=Wv P3=Rs P4=Mod P5=Dur P6=Ct B3=Tn");
-                // ── Pot params in bigger font ────────────────────────
+                {
+                    const int WX=0,WY=64,WW=128,WH=20,cy=WY+WH/2,ah=WH/2-2;
+                    oled.drawFrame(WX,WY,WW,WH);
+                    float p2=pots[1].value;
+                    { float wfBuf[126]; t303FillWaveform(t303Wave,p2,wfBuf,WW-2);
+                      int prev=cy;
+                      for(int i=0;i<WW-2;i++){
+                          int py=constrain(cy-(int)(wfBuf[i]*ah+0.5f),WY+1,WY+WH-2);
+                          if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py); else oled.drawPixel(WX+1,py);
+                          prev=py;
+                      }
+                    }
+                }
                 oled.setFont(u8g2_font_6x10_tf);
-                oled.drawHLine(0,74,128);
+                oled.drawHLine(0,87,128);
                 snprintf(buf,sizeof(buf),"Cut:%-4d  Res:%.1f",(int)t303Cutoff,t303Reso);
-                oled.drawStr(0,87,buf);
-                snprintf(buf,sizeof(buf),"Dur:%.0f%%  Mod:%-4.1f",t303Duration*100.0f,t303EnvMod);
                 oled.drawStr(0,101,buf);
-                oled.setFont(u8g2_font_4x6_tf);
-                snprintf(buf,sizeof(buf),"Vol:%.0f%%",pots[0].value*100);
+                snprintf(buf,sizeof(buf),"Dur:%.0f%%  Mod:%-4.1f",t303Duration*100.0f,t303EnvMod);
                 oled.drawStr(0,118,buf);
                 break;
             }
@@ -3186,31 +3258,13 @@ void drawScreen() {
                     const int WX=0,WY=68,WW=128,WH=20,cy=WY+WH/2,ah=WH/2-2;
                     oled.drawFrame(WX,WY,WW,WH);
                     float p2=pots[1].value;
-                    if(t303Wave==PULSE||t303Wave==T303_NAP_WAVE){
-                        float duty=(t303Wave==PULSE)?(0.5f-p2*0.48f):(0.005f+p2*0.495f);
-                        int dw=max(1,min(WW-4,(int)(duty*(WW-2))));
-                        int hy=WY+1, ly=WY+WH-2;
-                        oled.drawHLine(WX+1,hy,dw); oled.drawVLine(WX+1+dw,hy,ly-hy+1); oled.drawHLine(WX+2+dw,ly,WW-3-dw);
-                    } else {
-                        float g=(p2<0.01f)?1.0f:powf(32.0f,p2);
-                        bool posOnly=(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE);
-                        int prev=cy;
-                        for(int i=0;i<WW-2;i++){
-                            float t=(float)i/(float)(WW-3);
-                            float base;
-                            if(t303Wave==TRIANGLE||t303Wave==T303_TRI2_WAVE) base=(t<0.5f)?(4*t-1):(3-4*t);
-                            else if(t303Wave==T303_SQ2_WAVE)                 base=sinf(t*6.2832f);
-                            else if(t303Wave==T303_SAW3_WAVE)                base=(t<0.5f)?1.0f:-1.0f;
-                            else                                             base=1.0f-2.0f*t;
-                            float yv;
-                            if(posOnly&&base<0.0f){ yv=base; } else {
-                                float s=base*g, ph=fmodf(s+1.0f,4.0f); if(ph<0.0f) ph+=4.0f;
-                                yv=(ph<2.0f)?(ph-1.0f):(3.0f-ph);
-                            }
-                            int py=constrain(cy-(int)(yv*ah+0.5f),WY+1,WY+WH-2);
-                            if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py); else oled.drawPixel(WX+1,py);
-                            prev=py;
-                        }
+                    { float wfBuf[126]; t303FillWaveform(t303Wave,p2,wfBuf,WW-2);
+                      int prev=cy;
+                      for(int i=0;i<WW-2;i++){
+                          int py=constrain(cy-(int)(wfBuf[i]*ah+0.5f),WY+1,WY+WH-2);
+                          if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py); else oled.drawPixel(WX+1,py);
+                          prev=py;
+                      }
                     }
                 }
                 oled.setFont(u8g2_font_6x10_tf);
@@ -3457,15 +3511,20 @@ void drawScreen() {
                         struct { const char* name; char val[8]; } pp[4]; int np = 0;
                         for (int p = 0; p < 4; p++) {
                             if (!fx.paramNames[p][0]) continue;
-                            float v = fx.params[p];
-                            if      (v >= 1000.f) snprintf(pp[np].val, 8, "%.0fk", v / 1000.f);
-                            else if (v >= 10.f)   snprintf(pp[np].val, 8, "%.0f",  v);
-                            else                  snprintf(pp[np].val, 8, "%.2f",  v);
+                            if (fxSelected == 0 && p == 3) {
+                                strncpy(pp[np].val, fxFiltTypName(), sizeof(pp[np].val)-1);
+                            } else {
+                                float v = fx.params[p];
+                                if      (v >= 1000.f) snprintf(pp[np].val, 8, "%.0fk", v / 1000.f);
+                                else if (v >= 10.f)   snprintf(pp[np].val, 8, "%.0f",  v);
+                                else                  snprintf(pp[np].val, 8, "%.2f",  v);
+                            }
                             pp[np].name = fx.paramNames[p]; np++;
                         }
                         // Line 1 (y=111): FX name + first 2 params
                         char l1[32] = {}, l2[32] = {};
-                        int o1 = snprintf(l1, sizeof(l1), "%s%s:", fx.active ? "*" : "-", fx.name);
+                        const char* fxdn = (fxSelected==0) ? fxFiltTypName() : fx.name;
+                        int o1 = snprintf(l1, sizeof(l1), "%s%s:", fx.active ? "*" : "-", fxdn);
                         for (int i = 0; i < np && i < 2; i++)
                             o1 += snprintf(l1 + o1, sizeof(l1) - o1, " %.3s=%s", pp[i].name, pp[i].val);
                         oled.drawStr(0, 111, l1);
@@ -4543,15 +4602,29 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             }
             note = (uint8_t)constrain((int)note + t303Oct*12, 0, 127);
             activeNotes[row][col] = pressed ? note : 0;
-            if (pressed) {
-                float jx = constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                int held=0;
-                for(int rr=0;rr<KBD_NOTE_ROWS;rr++) for(int cc=0;cc<KBD_COLS;cc++) if(activeNotes[rr][cc]) held++;
-                float polyScale=1.0f/sqrtf(fmaxf(1.0f,(float)held));
-                float vel=constrain((0.8f+jx*0.6f)*polyScale,0.05f,1.0f);
-                playI303On(note, vel);
+            if (arpMode != 0) {
+                if (pressed) {
+                    bool found=false;
+                    for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){found=true;break;}
+                    if(!found&&arpNoteCount<32) arpNotes[arpNoteCount++]=note;
+                } else {
+                    for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){
+                        memmove(&arpNotes[i],&arpNotes[i+1],(arpNoteCount-i-1));
+                        arpNoteCount--; break;
+                    }
+                    if(arpNoteCount==0&&arpCurrent!=0){playI303Off(arpCurrent);arpCurrent=0;}
+                }
             } else {
-                playI303Off(note);
+                if (pressed) {
+                    float jx = constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                    int held=0;
+                    for(int rr=0;rr<KBD_NOTE_ROWS;rr++) for(int cc=0;cc<KBD_COLS;cc++) if(activeNotes[rr][cc]) held++;
+                    float polyScale=1.0f/sqrtf(fmaxf(1.0f,(float)held));
+                    float vel=constrain((0.8f+jx*0.6f)*polyScale,0.05f,1.0f);
+                    playI303On(note, vel);
+                } else {
+                    playI303Off(note);
+                }
             }
             break;
         }
@@ -5528,7 +5601,7 @@ void loop() {
     }
 
     // ---- ARPEGGIATOR (MODE_SYNTH + MODE_303, speed = BPM 16th notes) ----
-    bool arpActive = (currentMode==MODE_SYNTH || currentMode==MODE_303) && arpMode!=0 && !menuOpen;
+    bool arpActive = (currentMode==MODE_SYNTH || currentMode==MODE_303 || currentMode==MODE_I303) && arpMode!=0 && !menuOpen;
     if(arpActive){
         static unsigned long lastArp=0;
         unsigned long ARP_MS = max(10UL, 60000UL / (unsigned long)bpm / 4); // 16th note
@@ -5550,7 +5623,11 @@ void loop() {
                 }
                 case 4: noteToPlay=sorted[random(cnt)]; break;
             }
-            if (currentMode==MODE_303) {
+            if (currentMode==MODE_I303) {
+                if(arpCurrent!=0) playI303Off(arpCurrent);
+                float vel303=constrain(0.75f+(cachedJoyX/64.0f)*0.4f,0.1f,1.5f);
+                playI303On(noteToPlay, vel303);
+            } else if (currentMode==MODE_303) {
                 if(arpCurrent!=0) audioT303NoteOff(arpCurrent);
                 float vel303=constrain((t303AccentOn?1.2f:0.7f)+(cachedJoyX/64.0f)*0.4f,0.1f,1.5f);
                 audioT303NoteOn(noteToPlay, vel303);
@@ -5560,7 +5637,8 @@ void loop() {
             }
             arpCurrent=noteToPlay;
         } else if(arpNoteCount==0&&arpCurrent!=0){
-            if(currentMode==MODE_303) audioT303NoteOff(arpCurrent);
+            if(currentMode==MODE_I303) playI303Off(arpCurrent);
+            else if(currentMode==MODE_303) audioT303NoteOff(arpCurrent);
             else audioNoteOff(arpCurrent);
             arpCurrent=0;
         }
@@ -5669,13 +5747,16 @@ void loop() {
                                     float mx=fxList[fxSelected].paramMax[p];
                                     if (fxSelected==0 && p==0)
                                         fxList[0].params[0]=mn*powf(mx/mn, pots[pIdx[0]].value);
-                                    else
+                                    else {
                                         fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
+                                        if (fxSelected==0) s_filtMetaChanged=true;
+                                    }
                                     lp_fx[p]=pots[pIdx[p]].value;
                                     changed=true;
                                 }
                             }
                             if(changed && fxSelected!=0) applyFxEffect(fxSelected);
+                            else if(changed && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
                         }
                     }
                     break;
@@ -5848,13 +5929,16 @@ void loop() {
                                     float mx=fxList[fxSelected].paramMax[p];
                                     if (fxSelected==0 && p==0)
                                         fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
-                                    else
+                                    else {
                                         fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
+                                        if (fxSelected==0) s_filtMetaChanged=true;
+                                    }
                                     lp303fx[p]=pots[3+p].value;
                                     fxChanged=true;
                                 }
                             }
                             if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
+                            else if (fxChanged && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
                         }
                         // Keep 303 pot baselines in sync with current pot positions so closing
                         // the FX overlay doesn't cause phantom 303 param jumps (e.g. resonance
@@ -5904,30 +5988,37 @@ void loop() {
                                     float mx=fxList[fxSelected].paramMax[p];
                                     if (fxSelected==0 && p==0)
                                         fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
-                                    else
+                                    else {
                                         fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
+                                        if (fxSelected==0) s_filtMetaChanged=true;
+                                    }
                                     lp303sfx[p]=pots[3+p].value;
                                     fxChanged=true;
                                 }
                             }
                             if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
+                            else if (fxChanged && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
                         }
                         for (int p = 0; p < 4; p++) lp303[p] = pots[3+p].value;
                         break;
                     }
-                    // P2: per-wave texture — SQR=duty, NAP=width, TRI2/SW3=asymFold, all others=symFold
+                    // P2: per-wave texture — SQR=duty, NAP=width, TRI2/SW3=asymFold, SW2=blend, PINK=none
                     {
                         static float lp303swf=-1.0f;
                         if(fabsf(pots[1].value-lp303swf)>0.005f){
                             float p2=pots[1].value;
-                            if(t303Wave==PULSE){
+                            if(t303IsSubOctWave(t303Wave)){
+                                if(audioReady) audioSW2SetBlend(p2);
+                            } else if(t303Wave==T303_PINK_WAVE){
+                                // P2 sans effet sur le bruit rose (le filtre 303 façonne le son)
+                            } else if(t303Wave==PULSE){
                                 if(audioReady) audioT303Duty(0.5f-p2*0.48f);
                             } else if(t303Wave==T303_NAP_WAVE){
-                                if(audioReady) audioT303Duty(0.005f+p2*0.495f);
+                                if(audioReady) audioT303Wavefold(p2);
                             } else if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE){
-                                if(audioReady) audioT303WavefoldAsym(p2);  // TRI2/SW3: asymmetric
+                                if(audioReady) audioT303WavefoldAsym(p2);
                             } else {
-                                if(audioReady) audioT303Wavefold(p2);  // TRI/SAW/SQ2/SIN: symmetric
+                                if(audioReady) audioT303Wavefold(p2);
                             }
                             lp303swf=p2;
                         }
@@ -5941,13 +6032,15 @@ void loop() {
                     break;
                 }
                 case MODE_I303: {
-                    // P2: same wave texture as 303S
+                    // P2: same wave texture as 303S (PINK: no effect)
                     {
                         static float lpI303wf=-1.0f;
                         if(fabsf(pots[1].value-lpI303wf)>0.005f){
                             float p2=pots[1].value;
-                            if(t303Wave==PULSE)                              { if(audioReady) audioT303Duty(0.5f-p2*0.48f); }
-                            else if(t303Wave==T303_NAP_WAVE)                 { if(audioReady) audioT303Duty(0.005f+p2*0.495f); }
+                            if(t303IsSubOctWave(t303Wave))                      { if(audioReady) audioSW2SetBlend(p2); }
+                            else if(t303Wave==T303_PINK_WAVE)                {}  // PINK: filtre 303 suffit
+                            else if(t303Wave==PULSE)                         { if(audioReady) audioT303Duty(0.5f-p2*0.48f); }
+                            else if(t303Wave==T303_NAP_WAVE)                 { if(audioReady) audioT303Wavefold(p2); }
                             else if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE) { if(audioReady) audioT303WavefoldAsym(p2); }
                             else                                             { if(audioReady) audioT303Wavefold(p2); }
                             lpI303wf=p2;
@@ -5956,7 +6049,7 @@ void loop() {
                     bool chI303=false;
                     if(fabsf(pots[3].value-lp303[0])>0.002f){ t303Reso=1.0f+pots[3].value*2.0f;           lp303[0]=pots[3].value; chI303=true; }
                     if(fabsf(pots[4].value-lp303[1])>0.002f){ t303EnvMod=pots[4].value*10.0f;              lp303[1]=pots[4].value; chI303=true; }
-                    if(fabsf(pots[5].value-lp303[2])>0.002f){ t303Duration=pots[5].value; lp303[2]=pots[5].value; t303Decay=30.0f*powf(100.0f,t303Duration); audioT303SetSustain(0.0f); chI303=true; }
+                    if(fabsf(pots[5].value-lp303[2])>0.002f){ t303Duration=pots[5].value; lp303[2]=pots[5].value; audioT303SetSustain(1.0f); chI303=true; }  // I303: sustain while held, Dur unused
                     if(fabsf(pots[6].value-lp303[3])>0.002f){ t303Cutoff=80.0f*powf(25.0f,pots[6].value); lp303[3]=pots[6].value; chI303=true; }
                     if(chI303 && audioReady) audioT303Params(t303Cutoff,t303Reso,t303EnvMod,t303Decay);
                     break;
@@ -5978,12 +6071,15 @@ void loop() {
                                     float mx=fxList[fxSelected].paramMax[p];
                                     if (fxSelected==0 && p==0)
                                         fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
-                                    else
+                                    else {
                                         fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
+                                        if (fxSelected==0) s_filtMetaChanged=true;
+                                    }
                                     lpSS2fx[p]=pots[3+p].value; fxChanged=true;
                                 }
                             }
                             if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
+                            else if (fxChanged && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
                         }
                         break;
                     }
@@ -6111,35 +6207,34 @@ void loop() {
             audioSetAllFilters(cut, baseRes);
         }
 
-        // Detect FILT type change (params[2]); re-apply immediately (biquad reset on type change is expected).
-        if (fxList[0].active && audioReady) {
-            static const uint8_t kFiltAMY2[] = {FILTER_LPF, FILTER_LPF24, FILTER_HPF, FILTER_BPF};
-            static uint8_t s_fxFiltTypeApplied = 0xFF;
-            uint8_t ti = (uint8_t)constrain((int)roundf(fxList[0].params[2]), 0, 3);
-            if (ti != s_fxFiltTypeApplied) { s_fxFiltTypeApplied = ti; applyFxEffect(0); }
-        }
 
         // Smooth FILT cutoff application — anti-zipper when turning the cutoff encoder.
         // Use audioSetFilterFreq (no filter_type field) to avoid AMY biquad state resets
         // that cause an audible pop/click on each value change.
         if (fxList[0].active && !fxList[6].active && audioReady) {
-            float target = fxList[0].params[0];
+            // Converge raw cutoff (anti-zipper)
             float prevCut = lpfSmoothCut;
-            lpfSmoothCut += (target - lpfSmoothCut) * 0.5f; // faster convergence (~30ms to 90%)
-            audioSetFilterFreq(lpfSmoothCut, fxList[0].params[1]);
-            // audioSetFilterFreq targets SYNTH_CH only — T303_CH needs its own event.
+            lpfSmoothCut += (fxList[0].params[0] - lpfSmoothCut) * 0.5f;
+            // Atn: 0=bypass (eff_cut→open), 1=full (eff_cut=raw)
+            uint8_t fti = (uint8_t)constrain((int)roundf(fxList[0].params[3]), 0, 2);
+            float   atn = fxList[0].params[2];
+            float   rawRes = fxList[0].params[1];
+            float   effCut = (fti==0) ? (18000.0f + atn*(lpfSmoothCut-18000.0f)) :
+                             (fti==1) ? (20.0f    + atn*(lpfSmoothCut-20.0f))    :
+                                         lpfSmoothCut;
+            float   effRes = (fti==2) ? (0.5f + atn*(rawRes-0.5f)) : rawRes;
+            audioSetFilterFreq(effCut, effRes);
+            // T303_CH needs its own event
             if (currentMode == MODE_303) {
                 amy_event t3e = amy_default_event();
                 t3e.synth = T303_CH;
-                t3e.filter_freq_coefs[COEF_CONST] = lpfSmoothCut;
+                t3e.filter_freq_coefs[COEF_CONST] = effCut;
                 t3e.filter_freq_coefs[COEF_EG0]   = t303EnvMod;
-                t3e.resonance = fxList[0].params[1];
+                t3e.resonance = effRes;
                 amy_add_event(&t3e);
             }
-            // Keep GR2 oscillators in sync while the cutoff is actively converging.
-            // Only fires during the ~10 ticks after a cutoff change (when fabsf delta > 1 Hz).
             if (fabsf(lpfSmoothCut - prevCut) > 1.0f)
-                audioSetGranular2FilterFreq(lpfSmoothCut, fxList[0].params[1]);
+                audioSetGranular2FilterFreq(effCut, effRes);
         }
 
         // MODULAR: joystick Y pitch bend + LFO vibrato (10ms tick)
@@ -6259,21 +6354,31 @@ void loop() {
             if(!jyH) i303jOctArm=false;
             if(jxH && (!i303jWvArm || now-i303jWvMs>=150)){
                 int8_t dir=(jx>0)?1:-1;
-                static const uint8_t kI303Waves[]={TRIANGLE, T303_TRI2_WAVE, SAW_DOWN, T303_SAW2_WAVE, PULSE, T303_SAW3_WAVE, T303_SQ2_WAVE, T303_NAP_WAVE};
+                static const uint8_t kI303Waves[]={TRIANGLE, T303_TRI2_WAVE, SAW_DOWN, T303_SAW2_WAVE, PULSE, T303_SAW3_WAVE, T303_SQ2_WAVE, T303_NAP_WAVE, T303_SWF_WAVE, T303_SQF_WAVE, T303_SNF_WAVE, T303_PINK_WAVE};
+                static const uint8_t kI303WaveCnt=12;
                 uint8_t ci=0;
-                for(uint8_t i=0;i<8;i++) if(kI303Waves[i]==t303Wave){ci=i;break;}
-                ci=(uint8_t)((ci+8+dir)%8);
+                for(uint8_t i=0;i<kI303WaveCnt;i++) if(kI303Waves[i]==t303Wave){ci=i;break;}
+                uint8_t prevWave=t303Wave;
+                ci=(uint8_t)((ci+kI303WaveCnt+dir)%kI303WaveCnt);
                 t303Wave=kI303Waves[ci];
                 if(audioReady){
+                    if(t303IsSubOctWave(prevWave) && !t303IsSubOctWave(t303Wave)) audioSW2Deactivate();
                     audioT303Wave(t303AmyWave(t303Wave));
                     audioT303Feedback(0.0f);
                     float curP2=pots[1].value;
-                    if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE) audioT303WavefoldAsym(curP2);
-                    else if(t303Wave==TRIANGLE||t303Wave==SAW_DOWN||t303Wave==T303_SAW3_WAVE||t303Wave==T303_SQ2_WAVE) audioT303Wavefold(curP2);
-                    else audioT303Wavefold(0.0f);
-                    if(t303Wave==PULSE)          audioT303Duty(0.5f-curP2*0.48f);
-                    if(t303Wave==T303_SAW3_WAVE) audioT303Duty(0.5f);
-                    if(t303Wave==T303_NAP_WAVE)  audioT303Duty(0.005f+curP2*0.495f);
+                    if(t303IsSubOctWave(t303Wave)){
+                        audioSW2Init(t303Cutoff, t303Reso, t303Decay, 6, t303AmyWave(t303Wave));
+                        audioSW2SetBlend(curP2);
+                    } else if(t303Wave==T303_PINK_WAVE){
+                        audioT303Wavefold(0.0f);
+                    } else {
+                        if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE) audioT303WavefoldAsym(curP2);
+                        else if(t303Wave==PULSE) audioT303Wavefold(0.0f);
+                        else audioT303Wavefold(curP2);
+                        if(t303Wave==PULSE)          audioT303Duty(0.5f-curP2*0.48f);
+                        if(t303Wave==T303_SAW3_WAVE) audioT303Duty(0.5f);
+                        if(t303Wave==T303_NAP_WAVE)  audioT303Duty(0.02f);
+                    }
                 }
                 i303jWvMs=now; i303jWvArm=true;
             }
@@ -6295,24 +6400,34 @@ void loop() {
             if(!jyH) s303jOctArm=false;
             if(jxH && (!s303jWvArm || now-s303jWvMs>=150)){
                 int8_t dir=(jx>0)?1:-1;
-                static const uint8_t kT303Waves[]={TRIANGLE, T303_TRI2_WAVE, SAW_DOWN, T303_SAW2_WAVE, PULSE, T303_SAW3_WAVE, T303_SQ2_WAVE, T303_NAP_WAVE};
+                static const uint8_t kT303Waves[]={TRIANGLE, T303_TRI2_WAVE, SAW_DOWN, T303_SAW2_WAVE, PULSE, T303_SAW3_WAVE, T303_SQ2_WAVE, T303_NAP_WAVE, T303_SWF_WAVE, T303_SQF_WAVE, T303_SNF_WAVE, T303_PINK_WAVE};
+                static const uint8_t kT303WaveCnt=12;
                 uint8_t ci=0;
-                for(uint8_t i=0;i<8;i++) if(kT303Waves[i]==t303Wave){ci=i;break;}
-                ci=(uint8_t)((ci+8+dir)%8);
+                for(uint8_t i=0;i<kT303WaveCnt;i++) if(kT303Waves[i]==t303Wave){ci=i;break;}
+                uint8_t prevWave=t303Wave;
+                ci=(uint8_t)((ci+kT303WaveCnt+dir)%kT303WaveCnt);
                 t303Wave=kT303Waves[ci];
                 if(audioReady){
+                    if(t303IsSubOctWave(prevWave) && !t303IsSubOctWave(t303Wave)) audioSW2Deactivate();
                     audioT303Wave(t303AmyWave(t303Wave));
                     audioT303Feedback(0.0f);
                     float curP2=pots[1].value;
-                    if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE)
-                        audioT303WavefoldAsym(curP2);  // TRI2/SW3: asymmetric fold
-                    else if(t303Wave==TRIANGLE||t303Wave==SAW_DOWN||t303Wave==T303_SAW3_WAVE||t303Wave==T303_SQ2_WAVE)
-                        audioT303Wavefold(curP2);       // TRI/SAW/SQ2/SIN: symmetric fold
-                    else
-                        audioT303Wavefold(0.0f);        // SQR/NAP: reset fold
-                    if(t303Wave==PULSE)         audioT303Duty(0.5f-curP2*0.48f);
-                    if(t303Wave==T303_SAW3_WAVE) audioT303Duty(0.5f);  // SQ2 base: 50% duty
-                    if(t303Wave==T303_NAP_WAVE) audioT303Duty(0.005f+curP2*0.495f);
+                    if(t303IsSubOctWave(t303Wave)){
+                        audioSW2Init(t303Cutoff, t303Reso, t303Decay, 1, t303AmyWave(t303Wave));
+                        audioSW2SetBlend(curP2);
+                    } else if(t303Wave==T303_PINK_WAVE){
+                        audioT303Wavefold(0.0f);
+                    } else {
+                        if(t303Wave==T303_TRI2_WAVE||t303Wave==T303_SAW2_WAVE)
+                            audioT303WavefoldAsym(curP2);
+                        else if(t303Wave==PULSE)
+                            audioT303Wavefold(0.0f);
+                        else
+                            audioT303Wavefold(curP2);
+                        if(t303Wave==PULSE)          audioT303Duty(0.5f-curP2*0.48f);
+                        if(t303Wave==T303_SAW3_WAVE) audioT303Duty(0.5f);
+                        if(t303Wave==T303_NAP_WAVE)  audioT303Duty(0.02f);
+                    }
                 }
                 s303jWvMs=now; s303jWvArm=true;
             }
@@ -6415,13 +6530,16 @@ void loop() {
                             float mx = fxList[fxSelected].paramMax[p];
                             if (fxSelected == 0 && p == 0)
                                 fxList[0].params[0] = mn * powf(mx/mn, pots[3].value);
-                            else
+                            else {
                                 fxList[fxSelected].params[p] = mn + (mx - mn) * pots[3+p].value;
+                                if (fxSelected==0) s_filtMetaChanged=true;
+                            }
                             lpGranFx[p] = pots[3+p].value;
                             fxChanged = true;
                         }
                     }
                     if (fxChanged && fxSelected != 0) applyFxEffect(fxSelected);
+                    else if (fxChanged && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
                 }
                 lastPA = pots[3].value; lastPB = pots[4].value;
             } else if (granPlayingSlice >= 0 && granPlayingSlice < granSliceCount) {
@@ -6514,8 +6632,10 @@ void loop() {
                             float mx = fxList[fxSelected].paramMax[p];
                             if (fxSelected == 0 && p == 0)
                                 fxList[0].params[0] = mn * powf(mx/mn, pots[3].value);
-                            else
+                            else {
                                 fxList[fxSelected].params[p] = mn + (mx - mn) * pots[3+p].value;
+                                if (fxSelected==0) s_filtMetaChanged=true;
+                            }
                             lpGr2Fx[p] = pots[3+p].value;
                             fxChanged = true;
                         }

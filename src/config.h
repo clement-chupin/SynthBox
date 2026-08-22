@@ -65,6 +65,7 @@ static const char* menuLabels[] = {
 enum SynthShape : uint8_t {
     SHAPE_SAW = 0, SHAPE_SAW_FM, SHAPE_SQUARE, SHAPE_SINE, SHAPE_SUPERSAW,
     SHAPE_ACID, SHAPE_BASS, SHAPE_PLUCK,
+    SHAPE_NOISE_WHITE, SHAPE_NOISE_PINK, SHAPE_NOISE_BROWN,
     SHAPE_JUNO_BRASS, SHAPE_JUNO_STRINGS, SHAPE_JUNO_PIANO,
     SHAPE_JUNO_ORGAN, SHAPE_JUNO_CHOIR,
     SHAPE_DX7_EP, SHAPE_DX7_BELLS, SHAPE_DX7_BASS,
@@ -87,6 +88,7 @@ enum SynthShape : uint8_t {
 
 static const char* shapeNames[] = {
     "SAW","SAWFM","SQR","SIN","SSAW","ACID","BASS","PLCK",
+    "WHT","PINK","BRWN",
     "J:BRS","J:STR","J:PNO","J:ORG","J:CHR",
     "D:EP","D:BEL","D:BAS","D:BRS","D:STR","D:ORG","D:VOC",
     "T:LED","T:BAS","HOVR","STAB",
@@ -97,6 +99,7 @@ static const char* shapeNames[] = {
 // Patch numbers for preset shapes (-1 = custom wave, -2 = ALGO FM)
 static const int16_t shapePatch[] = {
     -1,-2,-1,-1,-1,-1,-1,-1,   // custom waves (SAW, SAW_FM, SQR, SIN, SSAW, ACID, BASS, PLCK)
+    -1,-1,-1,                   // noise: WHITE, PINK, BROWN
     0,21,7,8,6,                 // Juno patches
     138,153,142,128,131,144,157,// DX7 patches (128+offset)
     -1,-1,-1,-1,                // Techno: TECHNO_LEAD, RAVE_BASS, HOOVER, TECHNO_STAB
@@ -147,6 +150,8 @@ static const char* fxNames[] = {"LPF","DRIVE","DELAY","REVERB"};
 // ==================== AUDIO ====================
 #define SYNTH_CH 1
 #define T303_CH  2
+#define SW2_CH_BASE  10   // AMY synth channels 10-13 for SW2 ±1/±2 semitone layers
+#define SW2_VOICES    4   // polyphony per SW2 sub-channel
 #define NUM_SYNTH_VOICES 8
 #define OSCS_PER_VOICE 2
 #define AMY_OSC_STRUM 50

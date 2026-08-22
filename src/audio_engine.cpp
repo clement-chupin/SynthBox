@@ -71,8 +71,9 @@ static volatile uint8_t  s_keyError[SAMPLE_KEY_COUNT]     = {}; // KEY_ERR_* per
 static bool              s_keyHasRev[SAMPLE_KEY_COUNT]    = {}; // true if reversed preset registered (SS2 slots 0-15)
 static uint8_t           s_loadError                      = KEY_ERR_NONE; // set by loaders before return false
 static float s_sampleVolume  = 1.0f;  // 0.0–2.0; applied to vel on sample playback
-static float s_pcmLPFCutoff  = 0.0f;  // 0 = no filter applied to PCM oscillators
-static float s_pcmLPFReso    = 1.5f;
+static float   s_pcmLPFCutoff = 0.0f;  // 0 = no filter applied to PCM oscillators
+static float   s_pcmLPFReso   = 1.5f;
+static uint8_t s_pcmLPFType   = FILTER_NONE;  // type actif : LPF/HPF/BPF/NONE
 static volatile bool s_granularLoaded = false;  // set when GRANULAR_SOURCE_PRESET load completes
 static uint8_t s_granLastSliceCount = 0;  // stored by audioComputeGranularSlices
 
@@ -172,17 +173,24 @@ void audioSetEq(float low, float mid, float high) {
     config_eq(0, F2S(low), F2S(mid), F2S(high));
 }
 
+static bool s_noiseShape  = false;  // true when current synth shape is a noise type (pitch-independent)
+static bool s_t303Noise   = false;  // true when T303_CH is set to NOISE wave
+
 void audioNoteOn(uint8_t note, float velocity) {
     if (!audioReady) return;
     amy_event e = amy_default_event();
-    e.synth = SYNTH_CH; e.midi_note = note; e.velocity = velocity;
+    e.synth = SYNTH_CH;
+    e.midi_note = s_noiseShape ? 60 : note;  // noise: fixed pitch so spectrum stays constant
+    e.velocity = velocity;
     amy_add_event(&e);
 }
 
 void audioNoteOff(uint8_t note) {
     if (!audioReady) return;
     amy_event e = amy_default_event();
-    e.synth = SYNTH_CH; e.midi_note = note; e.velocity = 0;
+    e.synth = SYNTH_CH;
+    e.midi_note = s_noiseShape ? 60 : note;
+    e.velocity = 0;
     amy_add_event(&e);
 }
 
@@ -217,6 +225,7 @@ void audioSetAllFilters(float cutoffHz, float resonance) {
     amy_add_event(&e);
     s_pcmLPFCutoff = bypass ? 0.0f : cutoffHz;
     s_pcmLPFReso   = bypass ? 1.5f : resonance;
+    s_pcmLPFType   = bypass ? (uint8_t)FILTER_NONE : (uint8_t)FILTER_LPF24;
     // GR2 oscillators are individually controlled (not part of SYNTH_CH); apply filter to any active ones.
     if (s_gran2ActiveOscMask) {
         amy_event ge = amy_default_event();
@@ -251,6 +260,7 @@ void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType) {
     amy_add_event(&e);
     s_pcmLPFCutoff = bypass ? 0.0f : cutoffHz;
     s_pcmLPFReso   = bypass ? 1.5f : resonance;
+    s_pcmLPFType   = bypass ? (uint8_t)FILTER_NONE : filterType;
     if (s_gran2ActiveOscMask) {
         amy_event ge = amy_default_event();
         ge.filter_type = bypass ? FILTER_NONE : filterType;
@@ -320,6 +330,9 @@ static const ShapeFilterSave kShapeFilter[] = {
     { FILTER_LPF,   700,      0,      0,      14   }, // ACID
     { FILTER_LPF,   1200,     0,      0,      3    }, // BASS
     { FILTER_NONE,  18000,    0,      0,      1    }, // PLUCK (KS)
+    { FILTER_NONE,  18000,    0,      0,      1    }, // NOISE_WHITE
+    { FILTER_LPF,   2000,     0,      0,      1    }, // NOISE_PINK  (gentle rolloff)
+    { FILTER_LPF,   400,      0,      0,      0.7f }, // NOISE_BROWN (deep rolloff)
     { FILTER_NONE,  18000,    0,      0,      1    }, // JUNO_BRASS
     { FILTER_NONE,  18000,    0,      0,      1    }, // JUNO_STRINGS
     { FILTER_NONE,  18000,    0,      0,      1    }, // JUNO_PIANO
@@ -372,6 +385,8 @@ void audioSetPitchBend(float ratio) {
 
 void audioSetShapeOnSynth(SynthShape shape, uint8_t synthCh) {
     if (!audioReady) return;
+    if (synthCh == SYNTH_CH)
+        s_noiseShape = (shape==SHAPE_NOISE_WHITE || shape==SHAPE_NOISE_PINK || shape==SHAPE_NOISE_BROWN);
     int16_t patch = shapePatch[shape];
     amy_event e = amy_default_event();
     e.synth = synthCh;
@@ -393,10 +408,23 @@ void audioSetShapeOnSynth(SynthShape shape, uint8_t synthCh) {
         e.num_voices = NUM_SYNTH_VOICES;
         e.oscs_per_voice = OSCS_PER_VOICE;
         switch (shape) {
-            case SHAPE_SAW:    e.wave = SAW_DOWN; break;
-            case SHAPE_SQUARE: e.wave = PULSE;    break;
-            case SHAPE_SINE:   e.wave = SINE;     break;
-            case SHAPE_PLUCK:  e.wave = KS;       break;
+            case SHAPE_SAW:          e.wave = SAW_DOWN; break;
+            case SHAPE_SQUARE:       e.wave = PULSE;    break;
+            case SHAPE_SINE:         e.wave = SINE;     break;
+            case SHAPE_PLUCK:        e.wave = KS;       break;
+            case SHAPE_NOISE_WHITE:  e.wave = NOISE;    break;
+            case SHAPE_NOISE_PINK:
+                e.wave = NOISE;
+                e.filter_type = FILTER_LPF;
+                e.filter_freq_coefs[COEF_CONST] = 2000.0f;
+                e.resonance = 1.0f;
+                break;
+            case SHAPE_NOISE_BROWN:
+                e.wave = NOISE;
+                e.filter_type = FILTER_LPF;
+                e.filter_freq_coefs[COEF_CONST] = 400.0f;
+                e.resonance = 0.7f;
+                break;
             case SHAPE_ACID:
                 // TB-303 style: sawtooth + resonant LPF + fast envelope
                 e.wave = SAW_DOWN;
@@ -833,7 +861,7 @@ static void amyPlayPcm(uint8_t osc, uint16_t preset, float vel) {
     // feedback=0 prevents PCM loop (AMY uses feedback flag to signal looping)
     e.feedback = 0.0f;
     if (s_pcmLPFCutoff > 10.0f) {
-        e.filter_type = FILTER_LPF24;
+        e.filter_type = s_pcmLPFType;
         e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
         e.resonance = s_pcmLPFReso;
     }
@@ -1781,7 +1809,7 @@ void audioPlayKey(uint8_t keyIdx, float vel) {
     // feedback=0 prevents PCM loop (AMY uses feedback flag to gate looping in pcm_note_on)
     e.feedback = 0.0f;
     if (s_pcmLPFCutoff > 10.0f) {
-        e.filter_type = FILTER_LPF24;
+        e.filter_type = s_pcmLPFType;
         e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
         e.resonance = s_pcmLPFReso;
     } else {
@@ -1807,7 +1835,7 @@ void audioPlayKeyRev(uint8_t keyIdx, float vel) {
     e.eg0_times[2] = 40;  e.eg0_values[2] = 0.0f;
     e.feedback = 0.0f;
     if (s_pcmLPFCutoff > 10.0f) {
-        e.filter_type = FILTER_LPF24;
+        e.filter_type = s_pcmLPFType;
         e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
         e.resonance = s_pcmLPFReso;
     } else {
@@ -1883,6 +1911,10 @@ void audioSetSampleVolume(float v) {
     s_sampleVolume = v;
 }
 
+// Forward declarations for SW2 (defined later; called from T303NoteOn/Off)
+void audioSW2NoteOn(uint8_t note, float vel);
+void audioSW2NoteOff(uint8_t note);
+
 // ==================== TB-303 ENGINE ====================
 // Monophonic synth on T303_CH: SAW or SQUARE, resonant 4-pole LPF,
 // amp envelope (EG0) + filter envelope (EG1 via COEF_EG1), portamento via pitch_bend.
@@ -1890,8 +1922,11 @@ void audioSetSampleVolume(float v) {
 // Single EG (EG0) controls both amp AND filter (like the real 303).
 // Decay = P5 (50ms tight pluck → 3000ms long sustained bass).
 // Sustain level and decay applied only at NoteOn to avoid EG restart mid-note.
+static float s_t303Attack  = 2.0f;
 static float s_t303Decay   = 500.0f;
 static float s_t303Sustain = 0.0f;  // 0=note decays to silence, 1=held at full amp until note-off
+static float s_t303Release = 30.0f;
+static bool  s_sw2Active   = false;  // true when T303_SW2_WAVE is selected
 extern "C" float amy_wavefold_gain;      // defined in amy.c; controls 303 bus-1 wavefolder (1.0=dry)
 extern "C" float amy_wavefold_pos_only;  // defined in amy.c; >0.5 = fold positive half only (TRI2)
 
@@ -1911,7 +1946,9 @@ void audioT303Init(float cutoff, float reso, float envMod, float decay, uint8_t 
     e.eg0_times[1] = decay;  e.eg0_values[1] = s_t303Sustain;
     e.eg0_times[2] = 30.0f;  e.eg0_values[2] = 0.0f;
     amy_add_event(&e);
-    s_t303Decay = decay;
+    s_t303Attack  = 2.0f;
+    s_t303Decay   = decay;
+    s_t303Release = 30.0f;
 }
 
 void audioT303NoteOn(uint8_t midiNote, float vel) {
@@ -1921,25 +1958,27 @@ void audioT303NoteOn(uint8_t midiNote, float vel) {
     // sending only index 1 silently skips the entire breakpoint update.
     { amy_event e = amy_default_event();
       e.synth = T303_CH;
-      e.eg0_times[0]  = 2;              e.eg0_values[0] = 1.0f;
-      e.eg0_times[1]  = (uint32_t)s_t303Decay;  e.eg0_values[1] = s_t303Sustain;
-      e.eg0_times[2]  = 30;             e.eg0_values[2] = 0.0f;
+      e.eg0_times[0]  = s_t303Attack;              e.eg0_values[0] = 1.0f;
+      e.eg0_times[1]  = (uint32_t)s_t303Decay;   e.eg0_values[1] = s_t303Sustain;
+      e.eg0_times[2]  = s_t303Release;            e.eg0_values[2] = 0.0f;
       amy_add_event(&e); }
     { amy_event e = amy_default_event();
       e.synth     = T303_CH;
-      e.midi_note = midiNote;
+      e.midi_note = s_t303Noise ? 60 : midiNote;
       e.velocity  = vel;
       amy_add_event(&e); }
     // Wavefolding applied per-bus in amy_fill_buffer() — no extra oscillators needed.
+    if (s_sw2Active) audioSW2NoteOn(midiNote, vel);
 }
 
 void audioT303NoteOff(uint8_t midiNote) {
     if (!audioReady) return;
     amy_event e = amy_default_event();
     e.synth     = T303_CH;
-    e.midi_note = midiNote;
+    e.midi_note = s_t303Noise ? 60 : midiNote;
     e.velocity  = 0.0f;
     amy_add_event(&e);
+    if (s_sw2Active) audioSW2NoteOff(midiNote);
 }
 
 void audioT303Params(float cutoff, float reso, float envMod, float decay) {
@@ -1966,11 +2005,115 @@ void audioT303PitchBend(float ratio) {
 }
 
 void audioT303SetAmpEnv(float /*atkMs*/, float /*sus*/, float /*relMs*/) {
-    // No-op: 303 uses its own single EG (decay+sustain via audioT303SetSustain + pot).
+    // No-op: monophonic 303 uses its own single EG (decay+sustain via audioT303SetSustain + pot).
+}
+
+void audioI303SetAmpEnv(float atkMs, float sus, float decMs, float relMs) {
+    s_t303Attack  = atkMs;
+    s_t303Decay   = decMs;
+    s_t303Sustain = sus;
+    s_t303Release = relMs;
+}
+
+// ==================== SxF (sous-octaves : T303_CH base + f-1 + f-2) ====================
+// SWF/SQF/SNF sont des types de vague dans 303S/I303.
+// T303_CH joue la note de base ; sous-canaux SW2_CH_BASE+0 (f-1) et +1 (f-2) ajoutent
+// des copies à -12 et -24 demi-tons (octave en dessous, puis deux octaves).
+// audioT303NoteOn/Off déclenche automatiquement audioSW2NoteOn/Off si s_sw2Active==true.
+static const int8_t s_sw2_offsets[2] = {-12, -24};  // f-1 et f-2 (sous-octaves)
+
+void audioSW2Init(float cutoff, float reso, float decay, uint8_t numVoices, uint8_t wave) {
+    if (!audioReady) return;
+    // Init 2 sous-canaux : même vague que la base, filtre LP statique pour l'épaisseur
+    for (uint8_t i = 0; i < 2; i++) {
+        amy_event e = amy_default_event();
+        e.synth = SW2_CH_BASE + i;
+        e.num_voices = numVoices;
+        e.oscs_per_voice = 1;
+        e.wave = wave;
+        e.bus = 0;  // bus dry — pas de wavefolder sur les sous-octaves
+        e.filter_type = FILTER_LPF24;
+        e.resonance = reso * 0.5f;  // réso plus douce pour éviter la dureté
+        e.filter_freq_coefs[COEF_CONST] = cutoff;
+        e.eg0_times[0] = (uint32_t)s_t303Attack; e.eg0_values[0] = 1.0f;
+        e.eg0_times[1] = (uint32_t)decay;        e.eg0_values[1] = s_t303Sustain;
+        e.eg0_times[2] = (uint32_t)s_t303Release; e.eg0_values[2] = 0.0f;
+        e.amp_coefs[COEF_CONST] = 0.0f;  // silencieux jusqu'à blend
+        amy_add_event(&e);
+    }
+    s_sw2Active = true;
+}
+
+void audioSW2Deactivate() {
+    if (!audioReady) return;
+    s_sw2Active = false;
+    for (uint8_t i = 0; i < 2; i++) {
+        amy_event e = amy_default_event();
+        e.synth = SW2_CH_BASE + i; e.amp_coefs[COEF_CONST] = 0.0f;
+        amy_add_event(&e);
+    }
+    for (uint8_t n = 0; n <= 127; n++) {
+        for (uint8_t ch = 0; ch < 2; ch++) {
+            amy_event e = amy_default_event();
+            e.synth = SW2_CH_BASE + ch; e.midi_note = n; e.velocity = 0.0f;
+            amy_add_event(&e);
+        }
+    }
+    { amy_event e = amy_default_event(); e.synth = T303_CH; e.amp_coefs[COEF_CONST] = 1.0f; amy_add_event(&e); }
+}
+
+void audioSW2SetBlend(float p2) {
+    if (!audioReady) return;
+    float a = (p2 < 0.5f) ? p2 * 2.0f : 1.0f;   // f-1 : active 0→50%
+    float b = (p2 < 0.5f) ? 0.0f : (p2 - 0.5f) * 2.0f;  // f-2 : active 50→100%
+    float total = 1.0f + a + b;
+    { amy_event e = amy_default_event(); e.synth = T303_CH;        e.amp_coefs[COEF_CONST] = 1.0f/total; amy_add_event(&e); }
+    { amy_event e = amy_default_event(); e.synth = SW2_CH_BASE+0;  e.amp_coefs[COEF_CONST] = a/total;    amy_add_event(&e); }
+    { amy_event e = amy_default_event(); e.synth = SW2_CH_BASE+1;  e.amp_coefs[COEF_CONST] = b/total;    amy_add_event(&e); }
+}
+
+void audioSW2NoteOn(uint8_t note, float vel) {
+    if (!audioReady || !s_sw2Active) return;
+    for (uint8_t i = 0; i < 2; i++) {
+        int n = (int)note + s_sw2_offsets[i];  // f-1 = note-12, f-2 = note-24
+        if (n < 0 || n > 127) continue;
+        { amy_event e = amy_default_event();
+          e.synth = SW2_CH_BASE + i;
+          e.eg0_times[0] = (uint32_t)s_t303Attack; e.eg0_values[0] = 1.0f;
+          e.eg0_times[1] = (uint32_t)s_t303Decay;  e.eg0_values[1] = s_t303Sustain;
+          e.eg0_times[2] = (uint32_t)s_t303Release; e.eg0_values[2] = 0.0f;
+          amy_add_event(&e); }
+        { amy_event e = amy_default_event();
+          e.synth = SW2_CH_BASE + i; e.midi_note = (uint8_t)n; e.velocity = vel;
+          amy_add_event(&e); }
+    }
+}
+
+void audioSW2NoteOff(uint8_t note) {
+    if (!audioReady || !s_sw2Active) return;
+    for (uint8_t i = 0; i < 2; i++) {
+        int n = (int)note + s_sw2_offsets[i];
+        if (n < 0 || n > 127) continue;
+        amy_event e = amy_default_event();
+        e.synth = SW2_CH_BASE + i; e.midi_note = (uint8_t)n; e.velocity = 0.0f;
+        amy_add_event(&e);
+    }
+}
+
+void audioSW2AllNotesOff() {
+    if (!audioReady) return;
+    for (uint8_t n = 0; n <= 127; n++) {
+        for (uint8_t ch = 0; ch < 2; ch++) {
+            amy_event e = amy_default_event();
+            e.synth = SW2_CH_BASE + ch; e.midi_note = n; e.velocity = 0.0f;
+            amy_add_event(&e);
+        }
+    }
 }
 
 void audioT303Wave(uint8_t amyWave) {
     if (!audioReady) return;
+    s_t303Noise = (amyWave == NOISE);
     amy_event e = amy_default_event();
     e.synth = T303_CH;
     e.wave  = amyWave;
@@ -2005,11 +2148,14 @@ void audioI303Init(float cutoff, float reso, float envMod, float decay, uint8_t 
     e.resonance      = reso;
     e.filter_freq_coefs[COEF_CONST] = cutoff;
     e.filter_freq_coefs[COEF_EG0]   = envMod;
-    e.eg0_times[0] = 2.0f;   e.eg0_values[0] = 1.0f;
-    e.eg0_times[1] = decay;  e.eg0_values[1] = 0.0f;
-    e.eg0_times[2] = 30.0f;  e.eg0_values[2] = 0.0f;
+    e.eg0_times[0] = 2.0f;      e.eg0_values[0] = 1.0f;
+    e.eg0_times[1] = 30000.0f; e.eg0_values[1] = 1.0f;  // hold at full amp until note-off
+    e.eg0_times[2] = 80.0f;    e.eg0_values[2] = 0.0f;  // 80ms release
     amy_add_event(&e);
-    s_t303Decay = decay;
+    s_t303Attack  = 2.0f;
+    s_t303Decay   = 30000.0f;
+    s_t303Sustain = 1.0f;
+    s_t303Release = 80.0f;
 }
 
 // Symmetric wavefolder for TRI/SAW2/SQ2: depth 0→1 maps gain 1x→32x (extreme folds).
@@ -2047,7 +2193,7 @@ void audioDrum2Hit(uint8_t padIdx, float vel, uint8_t midiNote, float decayMs) {
         e.eg0_times[2]  = 5.0f;   e.eg0_values[2] = 0.0f;
     }
     if (s_pcmLPFCutoff > 10.0f) {
-        e.filter_type = FILTER_LPF24;
+        e.filter_type = s_pcmLPFType;
         e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
         e.resonance = s_pcmLPFReso;
     } else {
@@ -2452,7 +2598,7 @@ void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, boo
     e.eg0_values[1] = 1.0f;
     e.eg0_times[2] = 10;    e.eg0_values[2] = 0.0f;  // 10ms release on note-off
     if (s_pcmLPFCutoff > 10.0f) {
-        e.filter_type = FILTER_LPF24;
+        e.filter_type = s_pcmLPFType;
         e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
         e.resonance = s_pcmLPFReso;
     }
@@ -2497,7 +2643,7 @@ void audioPlayGranular2Ful(uint8_t oscIdx, uint8_t sampleIdx, bool reverse, floa
     e.eg0_times[1] = 30000; e.eg0_values[1] = 1.0f;
     e.eg0_times[2] = 10;    e.eg0_values[2] = 0.0f;
     if (s_pcmLPFCutoff > 10.0f) {
-        e.filter_type = FILTER_LPF24;
+        e.filter_type = s_pcmLPFType;
         e.filter_freq_coefs[COEF_CONST] = s_pcmLPFCutoff;
         e.resonance = s_pcmLPFReso;
     }

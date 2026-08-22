@@ -128,7 +128,8 @@ void audioT303Init(float cutoff, float reso, float envMod, float decay, uint8_t 
 void audioT303NoteOn(uint8_t midiNote, float vel);
 void audioT303NoteOff(uint8_t midiNote);
 void audioT303Params(float cutoff, float reso, float envMod, float decay);  // update synth params live
-void audioT303SetAmpEnv(float atkMs, float sus, float relMs);               // no-op for 303 (uses single EG)
+void audioT303SetAmpEnv(float atkMs, float sus, float relMs);               // no-op for monophonic 303 (uses single EG)
+void audioI303SetAmpEnv(float atkMs, float sus, float decMs, float relMs);  // apply amp EG0 to polyphonic I303 voices
 void audioT303SetSustain(float sustain);                                    // 0.0=pluck, 1.0=full sustain
 void audioT303PitchBend(float ratio);
 void audioT303Wave(uint8_t amyWave);                                        // any AMY wave constant
@@ -137,6 +138,17 @@ void audioT303Feedback(float fb);                                           // n
 void audioT303Duty(float duty);                                             // PULSE duty 0.5→0.01 for continuous wave morphing
 void audioT303Wavefold(float depth);                                        // wavefolder depth 0→1 symmetric — drives signal into triangle fold (1x→8x)
 void audioT303WavefoldAsym(float depth);                                    // wavefolder depth 0→1 positive-only (TRI2: fold peaks, preserve bass)
+
+// ==================== SxF (sous-octaves : SWF/SQF/SNF, wave types pour 303S/I303) ====================
+// Base sur T303_CH ; sous-canaux SW2_CH_BASE+0 (f-1, -12 demi-tons) et +1 (f-2, -24 demi-tons).
+// P2 0→0.5: a=P2*2 (0→1), b=0  — ajoute f-1
+// P2 0.5→1: a=1.0,  b=(P2-0.5)*2 — ajoute f-2 en gardant f-1 à plein
+void audioSW2Init(float cutoff, float reso, float decay, uint8_t numVoices, uint8_t wave); // init sous-canaux
+void audioSW2Deactivate();                               // all-notes-off + restore T303_CH amp
+void audioSW2SetBlend(float p2);                         // update a/b from P2
+void audioSW2NoteOn(uint8_t note, float vel);            // trigger sub-channels only
+void audioSW2NoteOff(uint8_t note);                      // release sub-channels only
+void audioSW2AllNotesOff();                              // flush all sub-channel notes
 
 // ==================== DRUM2 (TR-808 style per-pad control) ====================
 // Like audioPlayDrumPad but with per-pad pitch (midiNote) and optional EG decay override.

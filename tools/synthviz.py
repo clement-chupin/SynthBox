@@ -259,6 +259,8 @@ class Kaleidoscope(Anim):
     name="KALEIDO"; NSYM=8
     def __init__(self):
         self.shapes=[]; self.angle=0.0; self.hue=0.0; self.bs=1.0; self._spawn(20)
+        self.tunnel=pygame.Surface((W,H)); self.tunnel.fill((0,0,0))
+        self._fade=pygame.Surface((W,H)); self._fade.fill((0,0,0)); self._fade.set_alpha(12)
     def _spawn(self,n=6):
         R=min(CX,CY)
         for _ in range(n):
@@ -285,31 +287,28 @@ class Kaleidoscope(Anim):
         if len(self.shapes)<10: self._spawn(10)
         if len(self.shapes)>55: self.shapes=self.shapes[-55:]
     def draw(self,surf):
-        surf.fill((0,0,0))
-        # tunnel zoom: 6 rings continuously drifting from center to edge
-        t_now=time.time()*self.speed*0.20
-        N_RINGS=6
-        phases=[((i/N_RINGS)+t_now)%1.0 for i in range(N_RINGS)]
-        order=sorted(range(N_RINGS),key=lambda i:-phases[i])  # far first
-        for i in order:
-            phase=phases[i]
-            scale=0.15*(7.0**phase)  # exponential growth center→edge
-            alpha=min(1.0,phase/0.10)*max(0.0,1.0-(phase-0.78)/0.22)
-            if alpha<=0: continue
-            lag=phase*TAU*0.18
-            for s in self.shapes:
-                col=hsv(s['h'],1.0,min(1.0,(s['life']+0.2)*alpha))
-                for sym in range(self.NSYM):
-                    a=s['a']+sym*TAU/self.NSYM+self.angle-lag; r=s['r']*self.bs*scale
-                    x,y=int(CX+math.cos(a)*r),int(CY+math.sin(a)*r); sz=max(1,int(s['sz']*min(1.0,scale)))
-                    if s['kind']=='circle' and 0<=x<W and 0<=y<H: pygame.draw.circle(surf,col,(x,y),sz)
-                    elif s['kind']=='line':
-                        x2,y2=int(CX+math.cos(a+0.35)*r*1.25),int(CY+math.sin(a+0.35)*r*1.25)
-                        pygame.draw.line(surf,col,(x,y),(x2,y2),max(1,sz//4))
-                    elif s['kind']=='tri':
-                        pts=[(int(x+math.cos(a+i*TAU/3)*sz),int(y+math.sin(a+i*TAU/3)*sz)) for i in range(3)]
-                        pygame.draw.polygon(surf,col,pts)
-                    elif s['kind']=='rect': pygame.draw.rect(surf,col,(x-sz//2,y-sz//2,sz,sz))
+        # ── zoom-blur tunnel: expand persistent surface outward each frame ──
+        zoom=1.0+0.022*self.speed
+        w2,h2=int(W*zoom),int(H*zoom)
+        zoomed=pygame.transform.scale(self.tunnel,(w2,h2))
+        self.tunnel.blit(zoomed,(-(w2-W)//2,-(h2-H)//2))
+        self.tunnel.blit(self._fade,(0,0))          # slow fade toward black
+        # draw fresh kaleidoscope content onto persistent surface
+        for s in self.shapes:
+            col=hsv(s['h'],1.0,min(1.0,s['life']+0.2))
+            for sym in range(self.NSYM):
+                a=s['a']+sym*TAU/self.NSYM+self.angle; r=s['r']*self.bs
+                x,y=int(CX+math.cos(a)*r),int(CY+math.sin(a)*r); sz=s['sz']
+                if s['kind']=='circle' and 0<=x<W and 0<=y<H: pygame.draw.circle(self.tunnel,col,(x,y),sz)
+                elif s['kind']=='line':
+                    x2,y2=int(CX+math.cos(a+0.35)*r*1.25),int(CY+math.sin(a+0.35)*r*1.25)
+                    pygame.draw.line(self.tunnel,col,(x,y),(x2,y2),max(1,sz//4))
+                elif s['kind']=='tri':
+                    pts=[(int(x+math.cos(a+i*TAU/3)*sz),int(y+math.sin(a+i*TAU/3)*sz)) for i in range(3)]
+                    pygame.draw.polygon(self.tunnel,col,pts)
+                elif s['kind']=='rect': pygame.draw.rect(self.tunnel,col,(x-sz//2,y-sz//2,sz,sz))
+        pygame.draw.circle(self.tunnel,(0,0,0),(CX,CY),45)  # tunnel void (dark center)
+        surf.blit(self.tunnel,(0,0))
 
 
 # ── 8. MATRIX RAIN ────────────────────────────────────────────────────────────
@@ -353,46 +352,44 @@ class MatrixRain(Anim):
 # ── 9. RADAR ──────────────────────────────────────────────────────────────────
 class Radar(Anim):
     name="RADAR"; R=min(CX,CY)-30
-    def __init__(self): self.angle=0.0; self.blips=[]; self.beat=0.0
+    def __init__(self):
+        self.angle=0.0; self.blips=[]; self.beat=0.0
+        self.tunnel=pygame.Surface((W,H)); self.tunnel.fill((0,0,0))
+        self._fade=pygame.Surface((W,H)); self._fade.fill((0,0,0)); self._fade.set_alpha(14)
     def on_note_on(self,note,vel,ch):
-        # Distribute notes across full circle (not just one quadrant)
-        a=(note/127.0)*TAU
-        r=self.R*(0.25+0.75*vel/127.0)
-        self.blips.append({'a':a,'r':r,'life':1.0,'col':hsv(note_hue(note,ch)),'sz':max(3,vel//15)})
+        # Pitch class (0-11) → angle evenly spread, octave → radius band
+        pitch=note%12; octave=note//12
+        a=pitch/12.0*TAU + octave*0.22  # 12 evenly-spaced positions, slight octave twist
+        r=self.R*(0.18+0.10*(octave-3)+0.45*vel/127.0)
+        r=max(self.R*0.12, min(self.R*0.92, r))
+        self.blips.append({'a':a%TAU,'r':r,'life':1.0,'decay':0.25,'col':hsv(note_hue(note,ch)),'sz':max(3,vel//15)})
     def on_beat(self): self.beat=1.0
     def update(self,dt,t):
         self.angle=(self.angle+dt*self.speed*1.4)%TAU
-        for b in self.blips: b['life']=max(0.0,1.0-((self.angle-b['a'])%TAU)/TAU)
+        for b in self.blips: b['life']=max(0.0,b['life']-dt*b['decay'])
         self.blips=[b for b in self.blips if b['life']>0.02]
         self.beat=max(0,self.beat-dt*2.5)
     def draw(self,surf):
-        surf.fill((0,0,0))
-        # tunnel rings expanding from center
-        t_now=time.time()*self.speed*0.45
-        for ti in range(7):
-            phase=((ti/7)+t_now)%1.0
-            r_draw=int(self.R*phase)
-            if r_draw<2: continue
-            br=int(max(0,(1.0-max(0,(phase-0.72)/0.28))*60))
-            if br>0: pygame.draw.circle(surf,(0,br,int(br*0.3)),(CX,CY),r_draw,1)
-        for i in range(1,5): pygame.draw.circle(surf,(0,40+i*8,0),(CX,CY),self.R*i//4,1)
-        pygame.draw.line(surf,(0,28,0),(CX-self.R,CY),(CX+self.R,CY),1)
-        pygame.draw.line(surf,(0,28,0),(CX,CY-self.R),(CX,CY+self.R),1)
-        N_ARMS=3
-        for arm_k in range(N_ARMS):
-            arm_a=self.angle-arm_k*(TAU/3); arm_fade=1.0-arm_k*0.35
-            for k in range(45):
-                a=arm_a-k/45*(TAU/4); al=int((1-k/45)*55*arm_fade)
-                pygame.draw.line(surf,(0,al,int(al*0.25)),(CX,CY),(int(CX+math.cos(a)*self.R),int(CY+math.sin(a)*self.R)),2)
-            pygame.draw.line(surf,(0,int(255*arm_fade),int(80*arm_fade)),(CX,CY),(int(CX+math.cos(arm_a)*self.R),int(CY+math.sin(arm_a)*self.R)),2)
+        # ── zoom-blur tunnel ──
+        zoom=1.0+0.018*self.speed
+        w2,h2=int(W*zoom),int(H*zoom)
+        zoomed=pygame.transform.scale(self.tunnel,(w2,h2))
+        self.tunnel.blit(zoomed,(-(w2-W)//2,-(h2-H)//2))
+        self.tunnel.blit(self._fade,(0,0))
+        # draw fresh radar sweep + blips onto persistent surface
+        for k in range(30):
+            a=self.angle-k/30*(TAU/5); al=int((1-k/30)*70)
+            pygame.draw.line(self.tunnel,(0,al,int(al*0.25)),(CX,CY),(int(CX+math.cos(a)*self.R),int(CY+math.sin(a)*self.R)),2)
+        pygame.draw.line(self.tunnel,(0,220,70),(CX,CY),(int(CX+math.cos(self.angle)*self.R),int(CY+math.sin(self.angle)*self.R)),2)
         for b in self.blips:
             x,y=int(CX+math.cos(b['a'])*b['r']),int(CY+math.sin(b['a'])*b['r'])
             col=tuple(max(0,min(255,int(c*b['life']))) for c in b['col'])
-            pygame.draw.circle(surf,col,(x,y),b['sz'])
-            if b['life']>0.3: pygame.draw.circle(surf,col,(x,y),b['sz']+4,1)
+            pygame.draw.circle(self.tunnel,col,(x,y),b['sz'])
+        pygame.draw.circle(self.tunnel,(0,0,0),(CX,CY),38)   # tunnel void
+        surf.blit(self.tunnel,(0,0))
+        pygame.draw.circle(surf,(0,180,55),(CX,CY),5)        # center dot (not zoomed)
         if self.beat>0.05:
             s=pygame.Surface((W,H),pygame.SRCALPHA); s.fill((0,255,80,int(self.beat*35))); surf.blit(s,(0,0))
-        pygame.draw.circle(surf,(0,200,60),(CX,CY),5)
 
 
 # ── 10. MANDALA ───────────────────────────────────────────────────────────────
@@ -407,6 +404,8 @@ class Mandala(Anim):
                 's2':random.uniform(0.9,3.5)*random.choice([1,-1]),
                 'p1':random.uniform(0,TAU),'p2':random.uniform(0,TAU),
                 'h':random.random(),'sz':random.randint(1,3)})
+        self.tunnel=pygame.Surface((W,H)); self.tunnel.fill((0,0,8))
+        self._fade=pygame.Surface((W,H)); self._fade.fill((0,0,8)); self._fade.set_alpha(9)
     def on_note_on(self,note,vel,ch):
         self.hue=note_hue(note,ch)
         for arm in self.arms:
@@ -418,32 +417,31 @@ class Mandala(Anim):
         self.bs=lerp(self.bs,1.0,dt*3.5)
         for arm in self.arms: arm['p1']+=arm['s1']*dt; arm['p2']+=arm['s2']*dt
     def draw(self,surf):
-        surf.fill((0,0,8)); R=(min(CX,CY)-20)*self.bs
+        # ── zoom-blur tunnel ──
+        zoom=1.0+0.020*self.speed
+        w2,h2=int(W*zoom),int(H*zoom)
+        zoomed=pygame.transform.scale(self.tunnel,(w2,h2))
+        self.tunnel.blit(zoomed,(-(w2-W)//2,-(h2-H)//2))
+        self.tunnel.blit(self._fade,(0,0))
+        # draw fresh mandala content onto persistent surface
+        R=(min(CX,CY)-20)*self.bs
         for k in range(self.NSYM*2):
             a=k/(self.NSYM*2)*TAU+self.angle
-            pygame.draw.line(surf,hsv((self.hue+k/(self.NSYM*2)*0.35)%1.0,0.7,0.35),
+            pygame.draw.line(self.tunnel,hsv((self.hue+k/(self.NSYM*2)*0.35)%1.0,0.7,0.35),
                              (CX,CY),(int(CX+math.cos(a)*R),int(CY+math.sin(a)*R)),1)
-        # tunnel zoom: 5 copies of each arm spiraling from center to edge
-        t_now=time.time()*self.speed*0.15
-        N_RINGS=5
-        phases=[((i/N_RINGS)+t_now)%1.0 for i in range(N_RINGS)]
-        order=sorted(range(N_RINGS),key=lambda i:-phases[i])
-        for i in order:
-            phase=phases[i]
-            rscale=0.18*(5.5**phase)
-            alpha=min(1.0,phase/0.10)*max(0.0,1.0-(phase-0.78)/0.22)*0.90
-            if alpha<=0: continue
-            lag=phase*0.85; N=100
-            for arm in self.arms:
-                pts_b=[]
-                for j in range(N):
-                    p=j/N*TAU; r1=arm['r1']*self.bs*rscale; r2=arm['r2']*rscale
-                    pts_b.append((r1*math.cos(arm['s1']*p+arm['p1']-lag)+r2*math.cos(arm['s2']*p+arm['p2']-lag),
-                                   r1*math.sin(arm['s1']*p+arm['p1']-lag)+r2*math.sin(arm['s2']*p+arm['p2']-lag)))
-                for sym in range(self.NSYM):
-                    ao=sym*TAU/self.NSYM+self.angle-lag*0.5; ca,sa=math.cos(ao),math.sin(ao)
-                    rot=[(int(CX+dx*ca-dy*sa),int(CY+dx*sa+dy*ca)) for dx,dy in pts_b]
-                    if len(rot)>1: pygame.draw.lines(surf,hsv((arm['h']+sym/self.NSYM*0.28+phase*0.2)%1.0,0.95,alpha),True,rot,arm['sz'])
+        N=120
+        for arm in self.arms:
+            pts_b=[]
+            for i in range(N):
+                p=i/N*TAU; r1=arm['r1']*self.bs; r2=arm['r2']
+                pts_b.append((r1*math.cos(arm['s1']*p+arm['p1'])+r2*math.cos(arm['s2']*p+arm['p2']),
+                               r1*math.sin(arm['s1']*p+arm['p1'])+r2*math.sin(arm['s2']*p+arm['p2'])))
+            for sym in range(self.NSYM):
+                ao=sym*TAU/self.NSYM+self.angle; ca,sa=math.cos(ao),math.sin(ao)
+                rot=[(int(CX+dx*ca-dy*sa),int(CY+dx*sa+dy*ca)) for dx,dy in pts_b]
+                if len(rot)>1: pygame.draw.lines(self.tunnel,hsv((arm['h']+sym/self.NSYM*0.28)%1.0,0.95,0.85),True,rot,arm['sz'])
+        pygame.draw.circle(self.tunnel,(0,0,8),(CX,CY),48)  # tunnel void
+        surf.blit(self.tunnel,(0,0))
 
 
 # ═══════════════════════════ MAIN APP ═════════════════════════════════════════
