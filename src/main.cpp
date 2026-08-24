@@ -13,11 +13,6 @@
 #include "config.h"
 #include "audio_engine.h"
 #include "midi_usb.h"
-// Patch names from Diapasonix (258 Juno+DX7 presets) — wrapped to avoid ODR conflict
-namespace { // anonymous namespace: translation-unit local
-#include "../../other_projects/Diapasonix/display/patch_names.h"
-}
-#define SYNTH2_PATCH_COUNT 258
 
 // ==================== GLOBALS ====================
 CRGB leds[NUM_LEDS];
@@ -106,9 +101,8 @@ static float    modReso      = 1.5f;
 static float    modLfoRate   = 2.0f;
 static float    modLfoDepth  = 0.0f;
 
-// SYNTH2 state — Diapasonix full patch browser
-static uint16_t s2PatchIdx   = 0;       // 0-257 (0-127=Juno, 128-257=DX7)
-static float    s2Cutoff     = 8000.0f; // LPF cutoff Hz (pot3, power-law 80→8000)
+// Smoothed battery voltage (EMA updated every 10ms tick)
+static float s_battVSmooth = 8.0f;
 
 // MOD2 state — PolyAnalog-inspired analog poly synth
 static uint8_t  mod2ShapeIdx  = 0;       // index into mod2ShapeSteps[]
@@ -500,6 +494,26 @@ static inline uint8_t pianoNote(uint8_t row, uint8_t col, uint8_t baseNote) {
 // Menu
 bool    menuOpen       = false;
 uint8_t menuRow        = 0, menuCol = 0;
+uint8_t menuCategory   = 0;    // active tab: 0=INSTR, 1=SEQNC, 2=AUTRE
+bool    menuOnTabBar   = true;  // true=cursor on tab bar, false=cursor in item grid
+
+// Tab/sub-menu category definitions
+static const char* kMenuCatNames[] = { "INSTR", "SEQNC", "AUTRE" };
+static const MenuItem kMenuCatInstr[] = {
+    MENU_SYNTH, MENU_OMNI, MENU_SAMPLE,
+    MENU_HYBRID, MENU_MODULAR, MENU_MOD2,
+    MENU_303, MENU_I303, MENU_GRANULAR,
+    MENU_GRANULAR2, MENU_MIDI
+};
+static const MenuItem kMenuCatSeq[] = {
+    MENU_SEQ, MENU_303S, MENU_TRACKER,
+    MENU_DRUM2, MENU_SYSEQ, MENU_SS2
+};
+static const MenuItem kMenuCatAut[] = {
+    MENU_LIGHT, MENU_LIGHTPLAY, MENU_ABOUT, MENU_SD, MENU_ANIM
+};
+static const MenuItem* kMenuCatItems[] = { kMenuCatInstr, kMenuCatSeq, kMenuCatAut };
+static const uint8_t kMenuCatSizes[] = { 11, 6, 5 };
 bool    lastClick      = false;
 uint32_t joyClickMs   = 0;    // millis() when joystick click started (0=not pressed)
 bool    joyLongFired  = false; // long-click action already triggered this press
@@ -735,7 +749,7 @@ void switchMode(AppMode newMode) {
         audioStopAllSamples();
     if (currentMode==MODE_SEQ) {
         // Keep SEQ playing only when entering utility/FX modes; kill it for any instrument mode
-        bool seqContinues = (newMode==MODE_FX||newMode==MODE_LIGHT||
+        bool seqContinues = (newMode==MODE_LIGHT||
                              newMode==MODE_LIGHTPLAY||newMode==MODE_BATTERY||newMode==MODE_SYSINFO||
                              newMode==MODE_ANIM);
         if (!seqContinues) { audioStopAllSamples(); seqPlaying=false; }
@@ -801,6 +815,9 @@ void switchMode(AppMode newMode) {
             }
         }
     }
+    if (currentMode==MODE_OMNI) {
+        if (omniRoot!=0xFF) for(int i=0;i<3;i++) audioNoteOff(omniChordNotes[i]);
+    }
     audioAllNotesOff();
     omniRoot=0xFF; omniStrumPos=-1; omniLastJoyY=0.0f;
     memset(activeNotes,0,sizeof(activeNotes));
@@ -808,19 +825,13 @@ void switchMode(AppMode newMode) {
     s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
     currentMode=newMode;
     { static const char* kVizMode[MODE_COUNT]={
-          "SYNTH","OMNI","DRUMS","SAMPLE","FX","LIGHT","SEQ","LPLY",
-          "BATT","SYS","HYBRD","MODUL","SYN2","MOD2","303","GRAN",
-          "GR2","MIDI","TRKR","DR2","SSEQ","303S","SS2","ANIM","I303"};
+          "SYNTH","OMNI","SAMPL","LIGHT","SEQ","LPLY",
+          "BATT","DIAG","HYBRD","MODUL","MOD2","303","GRAN",
+          "GR2","MIDI","TRKR","DRUMS","SSEQ","303S","SS2","ANIM","I303"};
       Serial.printf("M:%s\n", newMode<MODE_COUNT?kVizMode[newMode]:"?"); }
     if (newMode==MODE_SEQ&&sdReady) sdListDir("/");
     if (newMode==MODE_LIGHTPLAY) memset(rippleBrightMap,0,sizeof(rippleBrightMap));
     if (newMode==MODE_HYBRID&&sdReady) sdListDir("/");
-    if (newMode==MODE_SYNTH2 && audioReady) {
-        amy_event e = amy_default_event();
-        e.synth = SYNTH_CH; e.patch_number = s2PatchIdx;
-        amy_add_event(&e);
-        audioSetFilter(s2Cutoff, 1.5f);
-    }
     if (newMode==MODE_MOD2 && audioReady) {
         audioSetShape(mod2ShapeSteps[mod2ShapeIdx]);
         audioSetFilter(mod2Cutoff, mod2Reso);
@@ -941,16 +952,13 @@ void triggerDrumSound(uint8_t idx) {
 }
 
 // ==================== MENU ====================
-void selectMenuItem() {
-    uint8_t sel = menuRow*MENU_COLS + menuCol;
-    if (sel>=MENU_ITEM_COUNT) { menuOpen=false; return; }
-    menuOpen=false;
-    switch (sel) {
+static void dispatchMenuItem(MenuItem item) {
+    menuOpen = false;
+    menuOnTabBar = true;
+    switch (item) {
         case MENU_SYNTH:     switchMode(MODE_SYNTH);     break;
         case MENU_OMNI:      switchMode(MODE_OMNI);      break;
-        case MENU_DRUMS:     switchMode(MODE_DRUMS);     break;
         case MENU_SAMPLE:    switchMode(MODE_SAMPLE);    if(sdReady) sdListDir("/"); break;
-        case MENU_FX:        switchMode(MODE_FX);        break;
         case MENU_LIGHT:     switchMode(MODE_LIGHT);     break;
         case MENU_SEQ:       switchMode(MODE_SEQ);       break;
         case MENU_LIGHTPLAY: switchMode(MODE_LIGHTPLAY); break;
@@ -958,7 +966,6 @@ void selectMenuItem() {
         case MENU_ABOUT:     switchMode(MODE_BATTERY);   break;
         case MENU_HYBRID:    switchMode(MODE_HYBRID);    if(sdReady) sdListDir("/"); break;
         case MENU_MODULAR:   switchMode(MODE_MODULAR);   break;
-        case MENU_SYNTH2:    switchMode(MODE_SYNTH2);    break;
         case MENU_MOD2:      switchMode(MODE_MOD2);      break;
         case MENU_303:       switchMode(MODE_303);        break;
         case MENU_GRANULAR:  switchMode(MODE_GRANULAR);   break;
@@ -973,6 +980,18 @@ void selectMenuItem() {
         case MENU_ANIM:      switchMode(MODE_ANIM); break;
         default: break;
     }
+}
+
+void selectMenuItem() {
+    if (menuOnTabBar) {
+        // Enter the items of the current tab
+        menuOnTabBar = false; menuRow = 0; menuCol = 0;
+        return;
+    }
+    // In items: dispatch the selected item
+    uint8_t idx = menuRow * MENU_COLS + menuCol;
+    if (idx >= kMenuCatSizes[menuCategory]) return;
+    dispatchMenuItem(kMenuCatItems[menuCategory][idx]);
 }
 
 // ==================== OVERLAY KEY HANDLER ====================
@@ -1180,7 +1199,10 @@ void handleButton(uint8_t rawBtn, bool pressed) {
         if (pressed) { btn1PressTime=millis(); btn1Handled=false; }
         else {
             if (!btn1Handled && (millis()-btn1PressTime<600)) {
-                if (menuOpen) menuOpen=false;
+                if (menuOpen) {
+                    if (!menuOnTabBar) { menuOnTabBar = true; menuRow = 0; menuCol = 0; }
+                    else { menuOpen = false; }
+                }
                 else switch(currentMode) {
                     case MODE_SYNTH:
                     case MODE_303:
@@ -1200,33 +1222,10 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                         }
 #endif
                         break;
-                    case MODE_DRUMS:  drumPlaying=!drumPlaying; drumStep=0; break;
                     case MODE_SEQ:   seqPlaying=!seqPlaying; if(!seqPlaying) seqStep=0; break;
-                    case MODE_FX:
-                        fxList[fxSelected].active = !fxList[fxSelected].active;
-                        if (fxList[fxSelected].active) { fxOrderAdd(fxSelected); fxPotNeedSync = true; }
-                        else                           fxOrderRemove(fxSelected);
-                        if (fxSelected == 6) {
-                            // LFO: applyFxEffect is a no-op; avoid blasting all config calls.
-                            // If LFO just deactivated and LPF is also off → restore filter to neutral.
-                            if (!fxList[6].active) {
-                                if (fxList[0].active) applyFxEffect(0);
-                                else if (fxList[1].active) applyFxEffect(1);
-                                else { audioSetAllFilters(0.0f, 1.0f); audioRestoreShapeFilter(currentShape); }
-                            }
-                        } else {
-                            // Only apply/reset the effect that just toggled — don't blast
-                            // all other effects (would reset delay buffers, reverb tails, etc.)
-                            applyFxEffect(fxSelected);
-                            // Sync smooth tracker so the first 10ms tick starts from the right cutoff
-                            if (fxSelected == 0 && fxList[0].active)
-                                lpfSmoothCut = fxList[0].params[0];
-                        }
-                        Serial.printf("FX %s %s order=%d\n", fxList[fxSelected].name, fxList[fxSelected].active?"ON":"OFF", fxOrderCount);
-                        break;
                     case MODE_SAMPLE:
                         // Back / go up one directory; at root → open main menu
-                        if (sdPath == "/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; }
+                        if (sdPath == "/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true; }
                         else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1)); }
                         break;
                     case MODE_TRACKER:
@@ -1352,14 +1351,6 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             }
             if (btn==3) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_SAMP_OPT) s_overlay=OVERLAY_SAMP_OPT; }
             break;
-        case MODE_DRUMS:
-            if (btn==1) { drumPlaying=!drumPlaying; if(drumPlaying)drumStep=0; }
-            if (btn==2) { memset(drumPattern,0,sizeof(drumPattern)); drumStep=0; }
-            if (btn==3) drumBank=(drumBank+1)%3;
-            break;
-        case MODE_FX:
-            // btn 1-3 free (toggle is on btn 0 short press)
-            break;
         case MODE_SEQ:
             if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_FX) s_overlay=OVERLAY_FX; }
             if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_SEQ_OPT) s_overlay=OVERLAY_SEQ_OPT; }
@@ -1368,21 +1359,6 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                 seqPage=1-seqPage;
                 seqTrackSel=0;
             }
-            break;
-        case MODE_SYNTH2:
-            if (btn==1 && s2PatchIdx>0) {
-                s2PatchIdx--;
-                amy_event e = amy_default_event();
-                e.synth = SYNTH_CH; e.patch_number = s2PatchIdx;
-                amy_add_event(&e);
-            }
-            if (btn==2 && s2PatchIdx<SYNTH2_PATCH_COUNT-1) {
-                s2PatchIdx++;
-                amy_event e = amy_default_event();
-                e.synth = SYNTH_CH; e.patch_number = s2PatchIdx;
-                amy_add_event(&e);
-            }
-            if (btn==3) noteMap.nextOctave();
             break;
         case MODE_303:
             if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_303)            s_overlay=OVERLAY_303;            }
@@ -1929,23 +1905,49 @@ void drawScreen() {
     char buf[40];
 
     if (menuOpen) {
-        oled.drawStr(40,0,"MENU"); oled.drawHLine(0,9,128);
-        const uint8_t CW=42,CH=28,MY=14,visRows=4;
-        uint8_t scroll=(menuRow>=visRows)?menuRow-visRows+1:0;
+        // ---- Tab bar (always visible) ----
+        const uint8_t TW=42, TH=10;
+        for (uint8_t t=0;t<3;t++) {
+            uint8_t x=t*TW;
+            bool active=(menuCategory==t);
+            if (active && menuOnTabBar) {
+                // Cursor is on this tab: invert
+                oled.drawBox(x,0,TW,TH-1);
+                oled.setDrawColor(0);
+                int tw=oled.getStrWidth(kMenuCatNames[t]);
+                oled.drawStr(x+(TW-tw)/2,TH-2,kMenuCatNames[t]);
+                oled.setDrawColor(1);
+            } else if (active) {
+                // Active tab, cursor in items: underline
+                oled.drawHLine(x,TH-1,TW);
+                int tw=oled.getStrWidth(kMenuCatNames[t]);
+                oled.drawStr(x+(TW-tw)/2,TH-2,kMenuCatNames[t]);
+            } else {
+                int tw=oled.getStrWidth(kMenuCatNames[t]);
+                oled.drawStr(x+(TW-tw)/2,TH-2,kMenuCatNames[t]);
+            }
+        }
+        oled.drawHLine(0,TH,128);
+        // ---- Items grid ----
+        const uint8_t CW=42,CH=26,MY=TH+2,visRows=4;
+        uint8_t catSize=kMenuCatSizes[menuCategory];
+        uint8_t catRows=(catSize+MENU_COLS-1)/MENU_COLS;
+        uint8_t scroll=(!menuOnTabBar&&menuRow>=visRows)?menuRow-visRows+1:0;
         for (uint8_t vr=0;vr<visRows;vr++) {
-            uint8_t r=scroll+vr; if(r>=MENU_ROWS) break;
+            uint8_t r=scroll+vr; if(r>=catRows) break;
             for (uint8_t c=0;c<MENU_COLS;c++) {
-                uint8_t idx=r*MENU_COLS+c; if(idx>=MENU_ITEM_COUNT) continue;
+                uint8_t idx=r*MENU_COLS+c; if(idx>=catSize) continue;
+                MenuItem item=kMenuCatItems[menuCategory][idx];
                 uint8_t x=c*CW+1,y=MY+vr*CH;
-                bool cur=(r==menuRow&&c==menuCol);
+                bool cur=(!menuOnTabBar&&r==menuRow&&c==menuCol);
                 if(cur){oled.drawRFrame(x,y,CW-2,CH-2,3);oled.drawFrame(x+2,y+2,CW-6,CH-6);}
                 else oled.drawFrame(x,y,CW-2,CH-2);
-                int tw=oled.getStrWidth(menuLabels[idx]);
-                oled.drawStr(x+(CW-2-tw)/2,y+(CH-2)/2,menuLabels[idx]);
+                int tw=oled.getStrWidth(menuLabels[item]);
+                oled.drawStr(x+(CW-2-tw)/2,y+(CH-2)/2,menuLabels[item]);
             }
         }
     } else {
-        float battV=muxCache[1]/4095.0f*10.4f;
+        float battV=s_battVSmooth;
         snprintf(buf,sizeof(buf),"%.1fV",battV);
         oled.drawStr(108,0,buf); oled.drawHLine(0,9,128);
 
@@ -2086,31 +2088,6 @@ void drawScreen() {
                     if(act) oled.setDrawColor(1);
                 }
                 oled.setFont(u8g2_font_5x7_tf);
-                break;
-            }
-            // ---- DRUMS ----
-            case MODE_DRUMS: {
-                oled.drawStr(0,0,"DRUMS");
-                oled.drawHLine(0,9,128);
-                // 4-row × 8-col pad grid. padIdx = row*8+col (row0=bottom, col0=right).
-                // Display: col0(right) → screen x=112, col7(left) → x=0.
-                //          row0(bottom) → screen y=89, row3(top) → y=11.
-                oled.setFont(u8g2_font_4x6_tf);
-                for(int r=0;r<4;r++) for(int c=0;c<8;c++){
-                    uint8_t padIdx=(uint8_t)(r*8+c);
-                    int cx=(7-c)*16;
-                    int cy=11+(3-r)*26;
-                    bool hit=keyState[r][c];
-                    if(hit){oled.drawBox(cx,cy,15,25);oled.setDrawColor(0);}
-                    else oled.drawFrame(cx,cy,15,25);
-                    const char* lbl=audioDrumPadLabel(padIdx);
-                    int sw=oled.getStrWidth(lbl);
-                    oled.drawStr(cx+(15-sw)/2,cy+14,lbl);
-                    if(hit) oled.setDrawColor(1);
-                }
-                oled.setFont(u8g2_font_5x7_tf);
-                snprintf(buf,sizeof(buf),"Vol:%.0f%%",pots[0].value*100);
-                oled.drawStr(0,122,buf);
                 break;
             }
             // ---- SAMPLE ----
@@ -2272,69 +2249,6 @@ void drawScreen() {
                 oled.drawStr(0,122,buf);
                 break;
             }
-            // ---- FX ----
-            case MODE_FX: {
-                oled.drawStr(0,0,"FX"); oled.drawHLine(0,9,128);
-
-                const int VIS = 5, EH = 19, LY = 12;
-                // Center selected in viewport
-                int top = (int)fxSelected - VIS/2;
-                if (top < 0) top = 0;
-                if (top + VIS > (int)FX_COUNT) top = max(0, (int)FX_COUNT - VIS);
-
-                for (int i = top; i < top + VIS && i < (int)FX_COUNT; i++) {
-                    int vy = LY + (i - top) * EH;
-                    bool sel = (i == (int)fxSelected);
-                    if (sel) { oled.drawRBox(0, vy-1, 120, EH-2, 2); oled.setDrawColor(0); }
-
-                    // Find activation order (1-indexed)
-                    uint8_t order = 0;
-                    for (uint8_t k = 0; k < fxOrderCount; k++)
-                        if (fxOrderList[k] == (uint8_t)i) { order = k+1; break; }
-
-                    snprintf(buf, sizeof(buf), "%s%s %s",
-                             order ? ">" : " ",
-                             (i==0) ? fxFiltTypName() : fxList[i].name,
-                             fxList[i].active ? "ON" : "--");
-                    oled.drawStr(2, vy + 10, buf);
-                    if (order) {
-                        char ob[3]; snprintf(ob, sizeof(ob), "%d", order);
-                        oled.drawStr(113, vy + 10, ob);
-                    }
-                    oled.setDrawColor(1);
-                }
-
-                // Scroll arrows
-                if (top > 0) oled.drawStr(122, LY + 6, "^");
-                if (top + VIS < (int)FX_COUNT) oled.drawStr(122, LY + VIS*EH - 2, "v");
-
-                // Params for selected (if active)
-                if (fxList[fxSelected].active) {
-                    oled.setFont(u8g2_font_4x6_tf);
-                    char pb[40]; int ppos = 0;
-                    for (int p = 0; p < 4; p++) {
-                        if (!fxList[fxSelected].paramNames[p][0]) continue;
-                        if (fxSelected == 0 && p == 3) {
-                            ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "Typ:%s ", fxFiltTypName());
-                        } else {
-                            ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "%s:%.1f ",
-                                             fxList[fxSelected].paramNames[p], fxList[fxSelected].params[p]);
-                        }
-                    }
-                    // ResEcho: append BPM-synced subdivision info (params[3] is internal, not named)
-                    if (fxSelected == 8) {
-                        uint8_t si = (uint8_t)constrain((int)roundf(fxList[8].params[3]), 0, DELAY_SUBDIV_COUNT-1);
-                        float dms  = constrain(60000.0f/(float)bpm*kDelaySubdiv[si], 30.0f, 700.0f);
-                        ppos += snprintf(pb+ppos, sizeof(pb)-ppos, "%s(%.0fms)", kDelaySubdivName[si], dms);
-                    }
-                    pb[39] = '\0';
-                    oled.drawStr(0, LY + VIS*EH + 4, pb);
-                    oled.setFont(u8g2_font_5x7_tf);
-                }
-
-                oled.drawStr(0, 122, "Btn0=ON/OFF Joy=sel");
-                break;
-            }
             // ---- SEQUENCER ----
             case MODE_SEQ: {
                 oled.setFont(u8g2_font_4x6_tf);
@@ -2407,7 +2321,7 @@ void drawScreen() {
             // ---- BATTERY ----
             case MODE_BATTERY: {
                 oled.drawStr(0,0,"BATTERIE"); oled.drawHLine(0,9,128);
-                float battV = muxCache[1] / 4095.0f * 10.4f;
+                float battV = s_battVSmooth;
                 float pct = constrain((battV - 6.0f) / 2.4f * 100.0f, 0.0f, 100.0f);
                 oled.setFont(u8g2_font_9x18_tf);
                 snprintf(buf, sizeof(buf), "%.2f V", battV);
@@ -2433,37 +2347,43 @@ void drawScreen() {
                 oled.drawStr(20,122,"Click = menu");
                 break;
             }
-            // ---- SYSINFO / HUD ----
+            // ---- DIAG — system diagnostics ----
             case MODE_SYSINFO: {
-                float battV2 = muxCache[1] / 4095.0f * 10.4f;
+                float battV2 = s_battVSmooth;
                 float pct2   = constrain((battV2 - 6.0f) / 2.4f * 100.0f, 0.0f, 100.0f);
                 oled.setFont(u8g2_font_4x6_tf);
-                static uint8_t scanY=0;
-                static uint32_t lastScan=0;
-                if(millis()-lastScan>=50){scanY=(uint8_t)((scanY+1)%128);lastScan=millis();}
-                oled.drawHLine(0,scanY,128);
-                oled.drawStr(0,0, "[ GrvEP v2 // SYSTEM ]");
+                oled.drawStr(0,0, "[ GrvEP v2 // DIAG   ]");
                 oled.drawStr(0,8, "======================");
                 snprintf(buf,sizeof(buf),"BATT: %.2fV %3.0f%% [%s]",
                          battV2,pct2,battV2>8.0f?"FULL":pct2>60.0f?"OK":pct2>25.0f?"LOW":"!!!!");
                 oled.drawStr(0,16,buf);
                 {
-                    uint32_t psram=(uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);
-                    uint32_t heap=(uint32_t)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024);
+                    uint32_t psramFree=(uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)/1024);
                     uint32_t psramTotal=(uint32_t)(ESP.getPsramSize()/1024);
-                    snprintf(buf,sizeof(buf),"PSRAM:%lu/%lukB HEAP:%lukB",psram,psramTotal,heap);
+                    uint32_t heapFree=(uint32_t)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)/1024);
+                    snprintf(buf,sizeof(buf),"RAM:%lu/%lukB  HEAP:%lukB",psramFree,psramTotal,heapFree);
                     oled.drawStr(0,24,buf);
                 }
-                snprintf(buf,sizeof(buf),"BPM:%d  SHAPE:%s",bpm,shapeNames[currentShape]);
-                oled.drawStr(0,32,buf);
-                snprintf(buf,sizeof(buf),"FX on:%d/%d  Vol:%.0f%%",fxOrderCount,(int)FX_COUNT,volume*100);
+                {
+                    uint32_t cpuMHz = (uint32_t)ESP.getCpuFreqMHz();
+                    snprintf(buf,sizeof(buf),"CPU:%luMHz  BPM:%d",cpuMHz,bpm);
+                    oled.drawStr(0,32,buf);
+                }
+                if (sdReady) {
+                    uint32_t sdTotalMB = (uint32_t)(SD.totalBytes() / (1024*1024));
+                    uint32_t sdUsedMB  = (uint32_t)(SD.usedBytes()  / (1024*1024));
+                    snprintf(buf,sizeof(buf),"SD:%luMB  used:%luMB",sdTotalMB,sdUsedMB);
+                } else {
+                    snprintf(buf,sizeof(buf),"SD: not mounted");
+                }
                 oled.drawStr(0,40,buf);
-                oled.drawStr(0,48,"======================");
+                snprintf(buf,sizeof(buf),"FX:%d/%d  Vol:%.0f%%  %s",
+                         fxOrderCount,(int)FX_COUNT,volume*100,shapeNames[currentShape]);
+                oled.drawStr(0,48,buf);
+                oled.drawStr(0,56,"======================");
                 static bool blink2=false; static uint32_t lastBlink2=0;
                 if(millis()-lastBlink2>500){blink2=!blink2;lastBlink2=millis();}
-                snprintf(buf,sizeof(buf),"> READY%s",blink2?"_":"");
-                oled.drawStr(0,56,buf);
-                snprintf(buf,sizeof(buf),"SD:%s  raw:%d",sdReady?"OK":"--",(int)muxCache[1]);
+                snprintf(buf,sizeof(buf),"> UP:%lus%s",(unsigned long)(millis()/1000),blink2?" _":"");
                 oled.drawStr(0,64,buf);
                 oled.setFont(u8g2_font_5x7_tf);
                 oled.drawStr(20,127,"Click = menu");
@@ -2488,32 +2408,6 @@ void drawScreen() {
                 if (lbri > 10) oled.drawBox(90, 20, 30, 60);
                 else           oled.drawFrame(90, 20, 30, 60);
                 oled.drawStr(0,122,"3=N 4=Spd 5=Hue 6=Bri");
-                break;
-            }
-            // ---- SYNTH2 — Diapasonix patch browser ----
-            case MODE_SYNTH2: {
-                oled.drawStr(0,0,"SYNTH2"); oled.drawHLine(0,9,128);
-                oled.setFont(u8g2_font_4x6_tf);
-                // Patch number + bank indicator
-                const char* bank = (s2PatchIdx < 128) ? "JUNO" : "DX7 ";
-                snprintf(buf,sizeof(buf),"[%s] #%03d", bank, s2PatchIdx);
-                oled.drawStr(0,20,buf);
-                // Full patch name (may be long — truncate to 25 chars)
-                char pname[26]; strncpy(pname, patch_names[s2PatchIdx], 25); pname[25]='\0';
-                oled.drawStr(0,29,pname);
-                // Cutoff + navigation hints
-                snprintf(buf,sizeof(buf),"Cut:%4dHz  Oct:%d",(int)s2Cutoff,noteMap.getOctave());
-                oled.drawStr(0,40,buf);
-                // Progress bar
-                oled.drawFrame(0,45,128,5);
-                int barW2 = (int)((float)s2PatchIdx / (SYNTH2_PATCH_COUNT-1) * 128.0f);
-                if(barW2>0) oled.drawBox(0,45,barW2,5);
-                // Prev/Next patch names
-                if(s2PatchIdx>0){ char pn[20]; strncpy(pn,patch_names[s2PatchIdx-1],19); pn[19]='\0'; snprintf(buf,sizeof(buf),"< %s",pn); oled.drawStr(0,53,buf); }
-                if(s2PatchIdx<SYNTH2_PATCH_COUNT-1){ char pn[20]; strncpy(pn,patch_names[s2PatchIdx+1],19); pn[19]='\0'; snprintf(buf,sizeof(buf),"> %s",pn); oled.drawStr(0,61,buf); }
-                oled.setFont(u8g2_font_5x7_tf);
-                snprintf(buf,sizeof(buf),"Vol:%.0f%%  JY=scroll",pots[0].value*100);
-                oled.drawStr(0,122,buf);
                 break;
             }
             // ---- DRUM2 (TR-808 style + sequencer) ----
@@ -3819,13 +3713,6 @@ static void updateLedsAndShow()
     for(int i=0;i<NUM_LEDS;i++) leds[i]=CRGB::Black;
     if(!menuOpen){
         switch(currentMode){
-            case MODE_FX:
-                // Active effects as colored LEDs, ordered by activation sequence
-                for(uint8_t k=0;k<fxOrderCount;k++){
-                    uint8_t i=fxOrderList[k];
-                    int li=crdToIdx(i*2,0); if(li>=0&&li<NUM_LEDS) leds[li]=CHSV(i*60,255,255);
-                }
-                break;
             case MODE_SEQ: {
                 // Same coordinate transform as all other modes:
                 // track t = physical row t → gr = KBD_ROWS-1-t = 4-t
@@ -4492,10 +4379,6 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             }
             break;
         }
-        case MODE_DRUMS:{
-            if(pressed) audioPlayDrumPad((uint8_t)(row*8+col), volume);
-            break;
-        }
         case MODE_SAMPLE:{
             uint8_t kidx=(uint8_t)(row*8+col);
             if(pressed){
@@ -4581,15 +4464,6 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             } else {
                 audioNoteOff(noteMap.getMidiNote(row,col));
             }
-            break;
-        }
-        case MODE_SYNTH2:{
-            uint8_t note=noteMap.getMidiNote(row,col);
-            activeNotes[row][col]=pressed?note:0;
-            if(pressed){
-                float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                audioNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f));
-            } else audioNoteOff(note);
             break;
         }
         case MODE_I303: {
@@ -5210,8 +5084,8 @@ void loop() {
             midiPotSel = (midiPotSel < 0) ? 0 : -1;  // toggle pot config mode
         } else {
 #endif
-            menuOpen=!menuOpen;
-            if(menuOpen){audioAllNotesOff();omniRoot=0xFF;menuRow=0;menuCol=0;}
+            menuOpen = !menuOpen;
+            if(menuOpen){audioAllNotesOff();omniRoot=0xFF;menuRow=0;menuCol=0;menuOnTabBar=true;}
 #if CONFIG_TINYUSB_MIDI_ENABLED
         }
 #endif
@@ -5235,7 +5109,7 @@ void loop() {
              currentMode==MODE_SAMPLE || currentMode==MODE_SEQ ||
              currentMode==MODE_GRANULAR || currentMode==MODE_GRANULAR2);
         if (isBrowserMode) {
-            if (sdPath == "/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; }
+            if (sdPath == "/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true; }
             else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1)); sdScroll=0; sdCursor=0; }
         }
     }
@@ -5319,7 +5193,7 @@ void loop() {
         } else if (currentMode==MODE_SS2 && sdReady) {
             if (sdCursor < sdFileCount) {
                 if (sdFiles[sdCursor]=="..") {
-                    if (sdPath=="/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; }
+                    if (sdPath=="/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true; }
                     else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1)); sdScroll=0; sdCursor=0; }
                 } else if (sdFileIsDir[sdCursor]) {
                     if(!sdPath.endsWith("/")) sdPath+="/"; sdPath+=sdFiles[sdCursor]; sdPath+="/";
@@ -5336,7 +5210,7 @@ void loop() {
             }
         } else {
             audioAllNotesOff(); omniRoot=0xFF; omniStrumPos=-1;
-            menuOpen=true; menuRow=0; menuCol=0;
+            menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true;
         }
         // A short-click was handled — prevent the long-click from also firing for this same press.
         // Without this, holding the joystick >600ms after a folder entry would trigger the
@@ -5566,17 +5440,6 @@ void loop() {
         }
     }
 
-    // ---- DRUM SEQUENCER ----
-    if(currentMode==MODE_DRUMS&&drumPlaying){
-        static unsigned long lastStep=0;
-        unsigned long stepMs=60000/bpm/4;
-        if(millis()-lastStep>=stepMs){
-            lastStep=millis(); drumStep=(drumStep+1)%DRUM_MAX_STEPS;
-            // rows 0-3 → KK1(0), SN1(2), HH1(5), KK2(1)
-            static const uint8_t seqPad[] = {0, 2, 5, 1};
-            for(int r=0;r<DRUM_ROWS;r++) if(drumPattern[r][drumStep]) audioPlayDrumPad(seqPad[r], volume);
-        }
-    }
 
     // ---- SAMPLE SEQUENCER ----
     if(seqPlaying){
@@ -5644,15 +5507,6 @@ void loop() {
         }
     }
 
-    // ---- FX MODE: navigate effects with joystick ----
-    if(currentMode==MODE_FX&&!menuOpen){
-        static unsigned long lastFxNav=0;
-        float ny=cachedJoyY/64.0f;
-        if(millis()-lastFxNav>=250){
-            if(ny<-0.3f&&fxSelected>0){fxSelected--;lastFxNav=millis();}
-            if(ny>0.3f&&fxSelected<FX_COUNT-1){fxSelected++;lastFxNav=millis();}
-        }
-    }
 
     // ---- SS2: poll audioKeyLoaded for each slot ----
     if (currentMode==MODE_SS2) {
@@ -5683,6 +5537,7 @@ void loop() {
         for(int i=0;i<16;i++) muxCache[i]=mux.getValue(i);
         cachedJoyX=getJoyX(); cachedJoyY=getJoyY();
         readPots();
+        s_battVSmooth += (muxCache[1] / 4095.0f * 10.4f - s_battVSmooth) * 0.05f;
 
         // Pot 0 = Volume (always)
         static float lv=-1;
@@ -5806,41 +5661,6 @@ void loop() {
                     }
                     break;
                 }
-                case MODE_FX: {
-                    // Pots 3-6 → params 0-3 of the selected active effect
-                    if(fxList[fxSelected].active){
-                        static float lp[4]={-1,-1,-1,-1};
-                        static uint8_t lpFxSel=0xFF;
-                        // Re-sync tracking when FX selection changes or FX was just activated
-                        if(lpFxSel!=fxSelected||fxPotNeedSync){
-                            for(int p=0;p<4;p++) lp[p]=pots[3+p].value;
-                            lpFxSel=fxSelected; fxPotNeedSync=false;
-                        }
-                        int pIdx[4]={3,4,5,6};
-                        bool changed=false;
-                        for(int p=0;p<4;p++){
-                            if(fxList[fxSelected].paramNames[p][0]=='\0') continue;
-                            if(fabsf(pots[pIdx[p]].value-lp[p])>0.001f){
-                                float mn=fxList[fxSelected].paramMin[p];
-                                float mx=fxList[fxSelected].paramMax[p];
-                                // LPF cutoff uses exponential mapping for musical sweep (equal octaves per pot range)
-                                if (fxSelected==0 && p==0)
-                                    fxList[0].params[0]=mn*powf(mx/mn, pots[pIdx[0]].value);
-                                else if (fxSelected==0 && p==3) {
-                                    fxList[0].params[3]=floorf(pots[pIdx[p]].value*2.9999f);
-                                    s_filtMetaChanged=true;
-                                } else
-                                    fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
-                                lp[p]=pots[pIdx[p]].value;
-                                changed=true;
-                            }
-                        }
-                        // LPF changes are applied smoothly by the 10ms tick (anti-zipper)
-                        if(changed && fxSelected!=0) applyFxEffect(fxSelected);
-                        else if(changed && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
-                    }
-                    break;
-                }
                 case MODE_LIGHT: {
                     // Pots 3-6: N, speed, hue, intensity — read directly in LED tick
                     // Nothing to do here; values used in LED rendering section.
@@ -5902,28 +5722,6 @@ void loop() {
                             }
                         }
                         if(changed) applyAllFx();
-                    }
-                    break;
-                }
-                case MODE_SYNTH2: {
-                    static float lp_s2=-1.0f, lp_s2cut=-1.0f;
-                    // P1 = patch scroll (quantized 0-257)
-                    if(fabsf(pots[1].value-lp_s2)>0.003f){
-                        uint16_t np=(uint16_t)(pots[1].value*((float)SYNTH2_PATCH_COUNT-0.01f));
-                        if(np!=s2PatchIdx && audioReady){
-                            s2PatchIdx=np;
-                            amy_event e=amy_default_event();
-                            e.synth=SYNTH_CH; e.patch_number=s2PatchIdx;
-                            amy_add_event(&e);
-                            audioSetFilter(s2Cutoff, 1.5f); // re-apply LPF after patch change
-                        }
-                        lp_s2=pots[1].value;
-                    }
-                    // P3 = LPF cutoff — 80→8000 Hz power-law
-                    if(fabsf(pots[3].value-lp_s2cut)>0.005f){
-                        s2Cutoff=80.0f*powf(100.0f, pots[3].value);
-                        if(audioReady) audioSetFilter(s2Cutoff, 1.5f);
-                        lp_s2cut=pots[3].value;
                     }
                     break;
                 }
@@ -6503,24 +6301,6 @@ void loop() {
         }
 #endif
 
-        // SYNTH2: joystick Y scrolls patches (150ms debounce)
-        if(currentMode==MODE_SYNTH2&&!menuOpen&&audioReady){
-            static unsigned long lastS2Nav=0;
-            float ny2=cachedJoyY/64.0f;
-            if(millis()-lastS2Nav>=150){
-                if(ny2<-0.3f&&s2PatchIdx>0){
-                    s2PatchIdx--;
-                    amy_event e=amy_default_event(); e.synth=SYNTH_CH; e.patch_number=s2PatchIdx; amy_add_event(&e);
-                    lastS2Nav=millis();
-                }
-                if(ny2>0.3f&&s2PatchIdx<SYNTH2_PATCH_COUNT-1){
-                    s2PatchIdx++;
-                    amy_event e=amy_default_event(); e.synth=SYNTH_CH; e.patch_number=s2PatchIdx; amy_add_event(&e);
-                    lastS2Nav=millis();
-                }
-            }
-        }
-
         // GRANULAR pots: frame-by-frame delta — no jump on slice change, fully bidirectional.
         // Pot A (pots[3]) → sx or window start.  Pot B (pots[4]) → sx+1 or window end.
         // Split control: pure delta — the pot's movement (not position) is applied to the
@@ -6736,8 +6516,8 @@ void loop() {
             }
         }
 
-        // Global pitch bend via JY — SYNTH / SYNTH2 / HYBRID (MODULAR/MOD2 handle it themselves)
-        if((currentMode==MODE_SYNTH||currentMode==MODE_SYNTH2||currentMode==MODE_HYBRID)&&!menuOpen&&audioReady){
+        // Global pitch bend via JY — SYNTH / HYBRID (MODULAR/MOD2 handle it themselves)
+        if((currentMode==MODE_SYNTH||currentMode==MODE_HYBRID)&&!menuOpen&&audioReady){
             float jy=cachedJoyY/64.0f;
             float bend=(fabsf(jy)<0.15f)?0.0f:-jy*2.0f;  // ±2 semitones, centre deadzone
             audioSetPitchBend(powf(2.0f,bend/12.0f));
@@ -6817,15 +6597,27 @@ void loop() {
         }
 #endif
 
-        // Menu joystick navigation
+        // Menu joystick navigation (tab bar + item grid)
         if(menuOpen){
             static unsigned long lastNav=0;
             float nx=cachedJoyX/64.0f,ny=cachedJoyY/64.0f;
             if(millis()-lastNav>=200){bool m=false;
-                if(ny<-0.3f&&menuRow>0){menuRow--;m=true;}
-                if(ny>0.3f&&menuRow<MENU_ROWS-1){menuRow++;m=true;}
-                if(nx<-0.3f&&menuCol>0){menuCol--;m=true;}
-                if(nx>0.3f&&menuCol<MENU_COLS-1){menuCol++;m=true;}
+                if (menuOnTabBar) {
+                    // On tab bar: X switches tab, Y down enters items
+                    if(nx<-0.3f&&menuCategory>0){menuCategory--;menuRow=0;menuCol=0;m=true;}
+                    if(nx>0.3f&&menuCategory<2){menuCategory++;menuRow=0;menuCol=0;m=true;}
+                    if(ny>0.3f){menuOnTabBar=false;menuRow=0;menuCol=0;m=true;}
+                } else {
+                    // In items: X navigates columns, Y navigates rows (Y up at row 0 → tab bar)
+                    uint8_t catRows=(kMenuCatSizes[menuCategory]+MENU_COLS-1)/MENU_COLS;
+                    if(ny<-0.3f){
+                        if(menuRow>0){menuRow--;m=true;}
+                        else{menuOnTabBar=true;m=true;}
+                    }
+                    if(ny>0.3f&&menuRow<catRows-1){menuRow++;m=true;}
+                    if(nx<-0.3f&&menuCol>0){menuCol--;m=true;}
+                    if(nx>0.3f&&menuCol<MENU_COLS-1){menuCol++;m=true;}
+                }
                 if(m)lastNav=millis();
             }
         }

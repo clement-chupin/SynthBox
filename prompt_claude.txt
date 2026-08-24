@@ -110,15 +110,42 @@ ou acides, mais peut aussi devenir sombre et liquide en
 https://www.sud-claviers.com/synthetiseur-comprendre-les-elements-cles/
 
 
-
-
-
-
-
-
-
-
 B1 = BTN raw=3 mapped=0
 B4 = BTN raw=2 mapped=1
 B4 = BTN raw=1 mapped=2
 B4 = BTN raw=0 mapped=3
+
+
+Le mode Omni joue mal les arpèges d'accord via le joystick, et le son d'accord reste actif, même quand on sort du mode, alors qu'il devrait s'arrêter
+retire le mode drums, renome DR2 par drums, ce sera le mode de drums principal dans le claviers
+retire le mode général FX, les FX se gère de la même manière pour chaque mode disponible sur le clavier, c'est à dire un bouton qui permet d'accéder aux sous menu, la liste des effets avec leurs parramètres correctement affiché, la possibilité d'activé / desactivé les effets via les touches
+
+mode SD : renomme par DIAG, retiré les lignes qui défiles, afficher toutes les infos du clavié, c'est à dire batterie, ram, cpu, taille sd branché, tout ce qui est necessaire pour nous donner l'état du clavier
+pour le mode batterie, je veux lisser le signal affin d'avoir une lecture stable de la tension de la batterie
+supprime le mode SYN2, le mode synth fait très bien ce travail
+regrouper Modul et Mod2
+Regrouper Granular et GR2, c'est à dire faire un mode granular basé sur GR2, mais si on charge 1-2 samples, les découpé en 8 tempo pour avoir des lignes de jeux normal et en mode reverse (comme pour GR2), et pour 3-4 samples chargé, faire exactement comme GR2. En résumé, je veux une gestion dynamique du nombre de découpe sur les samples et des touches assignées en fonctions du nombre chargé
+certain instruments de synth changent leurs rendu si j'ajoute puis retire des effets, comme le J:PNO qui devient beaucoup plus saw, il faut que je change d'instrument pour résoudre ce bug
+les instruments de synth peuvent avoir des volumes très inégaux
+pour la 303, les instruments où on ajoute des harmoniques f-1 / f-2 baissent en volume, comme si le son etait normalisé, et donc, un signal avec plus d'amplitude se retrouve écrasé
+
+en menu global, j'aimerais un système de sous menu, c'est à dire de menu principaux où il faut cliquer pour accéder aux sous mode :
+INSTRUMENT : regroupe tous les mode permettant de joué des notes avec le clavier (synth, I303, Granular, omni...)
+SEQUENCEUR : regroupe tous les séquenceurs, et notament ceux synchronisé entre eux
+AUTRES : le light show, le batterie et diagnostic
+
+
+supprime le mode SEQ, 
+pour SSEQ, le système de placement des notes est pas ergonomique, je doit maintenir une note avant de la placer sur un tempo. 
+J'aimerais comme pour les drums, faire un système note first, je joue une note, et sans forcément la maintenir, je peux la placer sur les tempos que je veux.
+renome SSEQ par SYNS pour synth SEQUENCEUR
+renome SS2 par SAMPS pour sample sequenceur, et je n'arrive pas à modifié les paramètres des FX une fois le sous menu FX refermé dans ce mode
+pour le mode Synth, je veux que le sous menu de sélectionn d'instruments via BTN3 ouvre un navigateur d'instruments, classé par catégorie d'instruments, où je peut naviguer dans ce menu avec le joystick, quand quand j'appuie sur les touches, ça joue les notes de l'instrument actuellement sélectionné, et que soit via le clic du joystick, soit l'appuie d'un BTN0-3 pour sortir du mode avec l'instrument sélectionné
+change le FX overdrive par une distortion, avec 2-3 paramètres
+
+
+
+
+
+
+

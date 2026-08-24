@@ -74,6 +74,7 @@ static float s_sampleVolume  = 1.0f;  // 0.0–2.0; applied to vel on sample pla
 static float   s_pcmLPFCutoff = 0.0f;  // 0 = no filter applied to PCM oscillators
 static float   s_pcmLPFReso   = 1.5f;
 static uint8_t s_pcmLPFType   = FILTER_NONE;  // type actif : LPF/HPF/BPF/NONE
+static bool    s_synthChIsPatch = false; // true when SYNTH_CH has an AMY preset patch (Juno/DX7)
 static volatile bool s_granularLoaded = false;  // set when GRANULAR_SOURCE_PRESET load completes
 static uint8_t s_granLastSliceCount = 0;  // stored by audioComputeGranularSlices
 
@@ -140,7 +141,7 @@ void audioAllNotesOff() {
         e.synth = SYNTH_CH; e.midi_note = n; e.velocity = 0;
         amy_add_event(&e);
     }
-    for (int o = AMY_OSC_STRUM; o < AMY_OSC_STRUM + 5; o++) {
+    for (int o = AMY_OSC_STRUM; o < AMY_OSC_STRUM + 8; o++) {
         amy_event e = amy_default_event();
         e.osc = o; e.velocity = 0;
         amy_add_event(&e);
@@ -212,12 +213,12 @@ void audioSetFilter(float cutoffHz, float resonance) {
 // cannot fight the FX cutoff. audioRestoreShapeFilter() reverts this when the FX turns off.
 void audioSetAllFilters(float cutoffHz, float resonance) {
     if (!audioReady) return;
-    bool bypass = (cutoffHz <= 10.0f);
+    bool bypass = (cutoffHz <= 10.0f || cutoffHz >= 18000.0f);
     amy_event e = amy_default_event();
     e.synth = SYNTH_CH;
     e.filter_type = bypass ? FILTER_NONE : FILTER_LPF24;
     e.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
-    if (!bypass) {
+    if (!bypass && !s_synthChIsPatch) {
         e.filter_freq_coefs[COEF_EG0] = 0.0f;
         e.filter_freq_coefs[COEF_EG1] = 0.0f;
     }
@@ -247,14 +248,21 @@ void audioSetAllFilters(float cutoffHz, float resonance) {
 // Use for FX FILT effect when the user selects a different filter topology.
 void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType) {
     if (!audioReady) return;
-    bool bypass = (cutoffHz <= 10.0f);
+    // Bypass when turned off (≤10 Hz) OR when cutoff is fully open (≥18000 Hz = paramMax).
+    // A LPF24 at 18 kHz still colours the signal (phase shift + resonance peak) — treat as bypass.
+    bool bypass = (cutoffHz <= 10.0f || cutoffHz >= 18000.0f);
     amy_event e = amy_default_event();
     e.synth = SYNTH_CH;
     e.filter_type = bypass ? FILTER_NONE : filterType;
     e.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
     if (!bypass) {
-        e.filter_freq_coefs[COEF_EG0] = 0.0f;
-        e.filter_freq_coefs[COEF_EG1] = 0.0f;
+        // Zero EG coefficients so custom-shape filter envelopes (HOOVER, TECHNO_LEAD…) don't
+        // fight the FX cutoff. Skip for preset patches (Juno/DX7): their EG is baked into the
+        // patch and defines the instrument character (e.g. J:PNO attack brightness).
+        if (!s_synthChIsPatch) {
+            e.filter_freq_coefs[COEF_EG0] = 0.0f;
+            e.filter_freq_coefs[COEF_EG1] = 0.0f;
+        }
     }
     e.resonance = bypass ? 1.0f : resonance;
     amy_add_event(&e);
@@ -362,9 +370,19 @@ static_assert(sizeof(kShapeFilter)/sizeof(kShapeFilter[0]) == SHAPE_COUNT,
               "kShapeFilter must have one entry per SynthShape");
 
 // Restore the shape's native filter+EG coefficients after FX LPF/Overdrive is turned off.
-// Sends only filter params — no num_voices/oscs_per_voice → no voice reset, no audio glitch.
+// For preset shapes (Juno/DX7), re-sends patch_number to restore internal filter EG state that
+// was zeroed by audioSetAllFiltersT (which kills patch EG to avoid fighting the FX cutoff).
+// For custom shapes, sends only filter params — no num_voices → no voice reset.
 void audioRestoreShapeFilter(SynthShape shape) {
     if (!audioReady || (uint8_t)shape >= SHAPE_COUNT) return;
+    int16_t patch = shapePatch[(uint8_t)shape];
+    if (patch >= 0) {
+        amy_event e = amy_default_event();
+        e.synth = SYNTH_CH;
+        e.patch_number = (uint16_t)patch;
+        amy_add_event(&e);
+        return;
+    }
     const ShapeFilterSave& sf = kShapeFilter[(uint8_t)shape];
     amy_event e = amy_default_event();
     e.synth = SYNTH_CH;
@@ -385,8 +403,10 @@ void audioSetPitchBend(float ratio) {
 
 void audioSetShapeOnSynth(SynthShape shape, uint8_t synthCh) {
     if (!audioReady) return;
-    if (synthCh == SYNTH_CH)
+    if (synthCh == SYNTH_CH) {
         s_noiseShape = (shape==SHAPE_NOISE_WHITE || shape==SHAPE_NOISE_PINK || shape==SHAPE_NOISE_BROWN);
+        s_synthChIsPatch = (shapePatch[(uint8_t)shape] >= 0);
+    }
     int16_t patch = shapePatch[shape];
     amy_event e = amy_default_event();
     e.synth = synthCh;
@@ -2066,10 +2086,9 @@ void audioSW2SetBlend(float p2) {
     if (!audioReady) return;
     float a = (p2 < 0.5f) ? p2 * 2.0f : 1.0f;   // f-1 : active 0→50%
     float b = (p2 < 0.5f) ? 0.0f : (p2 - 0.5f) * 2.0f;  // f-2 : active 50→100%
-    float total = 1.0f + a + b;
-    { amy_event e = amy_default_event(); e.synth = T303_CH;        e.amp_coefs[COEF_CONST] = 1.0f/total; amy_add_event(&e); }
-    { amy_event e = amy_default_event(); e.synth = SW2_CH_BASE+0;  e.amp_coefs[COEF_CONST] = a/total;    amy_add_event(&e); }
-    { amy_event e = amy_default_event(); e.synth = SW2_CH_BASE+1;  e.amp_coefs[COEF_CONST] = b/total;    amy_add_event(&e); }
+    { amy_event e = amy_default_event(); e.synth = T303_CH;        e.amp_coefs[COEF_CONST] = 1.0f;       amy_add_event(&e); }
+    { amy_event e = amy_default_event(); e.synth = SW2_CH_BASE+0;  e.amp_coefs[COEF_CONST] = a * 0.5f;  amy_add_event(&e); }
+    { amy_event e = amy_default_event(); e.synth = SW2_CH_BASE+1;  e.amp_coefs[COEF_CONST] = b * 0.5f;  amy_add_event(&e); }
 }
 
 void audioSW2NoteOn(uint8_t note, float vel) {

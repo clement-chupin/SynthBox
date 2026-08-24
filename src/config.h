@@ -6,9 +6,7 @@
 enum AppMode : uint8_t {
     MODE_SYNTH = 0,
     MODE_OMNI,
-    MODE_DRUMS,
     MODE_SAMPLE,
-    MODE_FX,
     MODE_LIGHT,
     MODE_SEQ,       // 4-track × 8-step sample sequencer
     MODE_LIGHTPLAY, // live light ripple mode
@@ -16,7 +14,6 @@ enum AppMode : uint8_t {
     MODE_SYSINFO,   // cyberpunk HUD — system info / visual test
     MODE_HYBRID,    // synth note + assigned sample triggered simultaneously
     MODE_MODULAR,   // 6-encoder modular: OSC/filter/env/LFO + joystick velocity
-    MODE_SYNTH2,    // Diapasonix full patch browser (258 Juno+DX7 patches)
     MODE_MOD2,      // PolyAnalog-inspired: waveform morph, power-law filter, LFO dest toggle
     MODE_303,       // TB-303 emulation: resonant LPF + filter envelope + slide + accent
     MODE_GRANULAR,  // granular: play time-stretched slices of a sample (8-slice or 1/16)
@@ -35,11 +32,11 @@ enum AppMode : uint8_t {
 // ==================== MENU ====================
 #define MENU_COLS 3
 enum MenuItem : uint8_t {
-    MENU_SYNTH, MENU_OMNI, MENU_DRUMS,
-    MENU_SAMPLE, MENU_FX, MENU_LIGHT,
-    MENU_SEQ, MENU_LIGHTPLAY, MENU_SD,
+    MENU_SYNTH, MENU_OMNI, MENU_SAMPLE,
+    MENU_LIGHT, MENU_SEQ, MENU_LIGHTPLAY,
+    MENU_SD,
     MENU_ABOUT, MENU_HYBRID, MENU_MODULAR,
-    MENU_SYNTH2, MENU_MOD2, MENU_303,
+    MENU_MOD2, MENU_303,
     MENU_GRANULAR, MENU_GRANULAR2, MENU_MIDI,
     MENU_TRACKER, MENU_DRUM2, MENU_SYSEQ,
     MENU_303S,
@@ -49,13 +46,13 @@ enum MenuItem : uint8_t {
     MENU_ITEM_COUNT
 };
 static const char* menuLabels[] = {
-    "SYNTH","OMNI","DRUMS",
-    "SAMPL","FX","LIGHT",
-    "SEQ","LPLY","SD",
+    "SYNTH","OMNI","SAMPL",
+    "LIGHT","SEQ","LPLY",
+    "DIAG",
     "BATT","HYBRD","MODUL",
-    "SYN2","MOD2","303",
+    "MOD2","303",
     "GRAN","GR2","MIDI",
-    "TRKR","DR2","SSEQ",
+    "TRKR","DRUMS","SSEQ",
     "303S","SS2","ANIM",
     "I303"
 };
