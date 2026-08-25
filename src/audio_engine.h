@@ -33,6 +33,7 @@ void audioSetReverb(float level, float liveness, float damping, float xover_hz);
 void audioSetChorus(float level, float lfo_freq, float depth);
 void audioSetDelay(float level, float delay_ms, float feedback, float filter_coef);
 void audioSetOverdrive(float drive);
+void audioSetDistortion(float drive, float tone, float gain);
 void audioSetEq(float low, float mid, float high);  // 3-band EQ: 1.0=flat, >1 boost, <1 cut
 
 // Preview: aborts any in-progress load, loads file into preview preset and plays.

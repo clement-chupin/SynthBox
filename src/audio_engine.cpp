@@ -93,15 +93,21 @@ void audioInit() {
     cfg.features.default_synths = 0;
     cfg.platform.multithread = 1;
     cfg.platform.multicore = 1;
-    cfg.audio = AMY_AUDIO_IS_I2S;
     cfg.features.audio_in = 0;
+#ifdef SIMULATOR
+    cfg.audio = AMY_AUDIO_IS_MINIAUDIO;
+#else
+    cfg.audio = AMY_AUDIO_IS_I2S;
     cfg.i2s_mclk = 9;
     cfg.i2s_bclk = 9;
     cfg.i2s_lrc = 7;
     cfg.i2s_dout = 8;
+#endif
     // No file hooks — we load samples synchronously into RAM instead
     amy_start(cfg);
+#ifndef SIMULATOR
     esp32_setup_i2s();
+#endif
     delay(500);
 
     // Setup synth voices — no filter here; filter is owned entirely by the FX system.
@@ -708,12 +714,30 @@ void audioSetFmParams(float depth, float cutoffHz, float resonance) {
 void audioSetOverdrive(float drive) {
     if (!audioReady) return;
     if (drive < 0.01f) {
-        audioSetAllFilters(0.0f, 1.5f);  // 0 → open filter on everything
+        audioSetAllFilters(0.0f, 1.5f);
     } else {
         float cut = 3500.0f - drive * 2500.0f;  // 3500 → 1000 Hz
         float res = 1.5f  + drive * 2.5f;       // 1.5 → 4.0
         audioSetAllFilters(cut, res);
     }
+}
+
+// Distortion: drive closes filter + raises resonance; tone shifts base cutoff; gain scales output
+void audioSetDistortion(float drive, float tone, float gain) {
+    if (!audioReady) return;
+    if (drive < 0.01f) {
+        audioSetAllFilters(0.0f, 1.5f);
+        return;
+    }
+    float baseCut = 500.0f + tone * 3500.0f;         // 500-4000 Hz tone shaping
+    float cut = baseCut * (1.0f - drive * 0.85f);    // drive closes filter toward 15% of base
+    float res = 1.5f + drive * 3.5f;                 // 1.5 → 5.0 resonance
+    audioSetAllFilters(fmaxf(cut, 60.0f), res);
+    // gain applied as volume scale on the synth bus
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH;
+    e.volume[0] = gain * 3.0f;
+    amy_add_event(&e);
 }
 
 void audioSetVolume(float vol) {

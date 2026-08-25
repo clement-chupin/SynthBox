@@ -314,6 +314,7 @@ static bool    drum2SelFromAlt = false;  // true if pad was last selected from t
 #define SYSEQ_CHORD 16   // max notes per step
 static bool     syseqSeqView   = false;
 static uint8_t  syseqSelStep   = 0;
+static uint8_t  syseqSelNote   = 0;   // note-first: remembered selected note (0=none)
 // syseqStep and syseq playing state use drum2Step/drum2Playing/drum2LastStepMs (shared clock)
 static uint8_t  syseqNotes[SYSEQ_STEPS][SYSEQ_CHORD] = {};  // 0=empty, else MIDI note+1
 static uint8_t  syseqVels [SYSEQ_STEPS][SYSEQ_CHORD] = {};  // velocity 1-127
@@ -491,6 +492,22 @@ static inline uint8_t pianoNote(uint8_t row, uint8_t col, uint8_t baseNote) {
     return (uint8_t)constrain((int)baseNote + off, 0, 127);
 }
 
+// ==================== INSTRUMENT BROWSER ====================
+struct InstrCategory { const char* name; uint8_t start; uint8_t count; };
+static const InstrCategory instrCategories[] = {
+    {"WAVE",   0,  4},   // SAW SAW_FM SQR SIN
+    {"SYNTH",  4,  4},   // SSAW ACID BASS PLCK
+    {"NOISE",  8,  3},   // WHT PINK BRWN
+    {"JUNO",  11,  7},   // J:BRS J:STR J:PNO J:ORG J:CHR J:OR2 J:FRG
+    {"DX7",   18,  7},   // D:EP D:BEL D:BAS D:BRS D:STR D:ORG D:VOC
+    {"TECH",  25,  4},   // T:LED T:BAS HOVR STAB
+    {"ACID",  29,  3},   // WOBB EPLK INDS
+    {"FM",    32,  3},   // FMDFT FMBEL SDFT
+};
+static const uint8_t INSTR_CAT_COUNT = 8;
+static uint8_t instrBrCat  = 0;  // currently highlighted category
+static uint8_t instrBrItem = 0;  // currently highlighted item within category
+
 // Menu
 bool    menuOpen       = false;
 uint8_t menuRow        = 0, menuCol = 0;
@@ -506,7 +523,7 @@ static const MenuItem kMenuCatInstr[] = {
     MENU_GRANULAR2, MENU_MIDI
 };
 static const MenuItem kMenuCatSeq[] = {
-    MENU_SEQ, MENU_303S, MENU_TRACKER,
+    MENU_303S, MENU_TRACKER,
     MENU_DRUM2, MENU_SYSEQ, MENU_SS2
 };
 static const MenuItem kMenuCatAut[] = {
@@ -540,11 +557,11 @@ FxEffect fxList[] = {
      {"Cut","Res","Atn","Typ"},
      {65.0f,   0.5f, 0.0f, 0.0f},
      {18000.0f, 3.0f, 1.0f, 2.0f}},
-    // Overdrive: filter resonance saturation
-    {"OVERDRIVE",false, {0.6f, 0.0f,  0.0f, 0.0f},
-     {"Drv","","",""},
-     {0.0f, 0.0f, 0.0f, 0.0f},
-     {1.0f, 0.0f, 0.0f, 0.0f}},
+    // Distortion: wavefold-style saturation via filter drive + tone shaping
+    {"DISTORT",  false, {0.6f, 0.5f,  1.0f, 0.0f},
+     {"Drv","Ton","Gain",""},
+     {0.0f, 0.0f, 0.5f, 0.0f},
+     {1.0f, 1.0f, 2.0f, 0.0f}},
     // Reverb
     {"REVERB",   false, {1.5f, 0.85f, 0.5f, 3000.0f},
      {"Lvl","Live","Damp","Xover"},
@@ -645,9 +662,10 @@ void applyFxEffect(uint8_t fx) {
                 audioT303Params(t303Cutoff, t303Reso, t303EnvMod, t303Decay);
             break;
         }
-        case 1:  // Overdrive
-            Serial.printf("FX1 OVD %s drv=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
-            audioSetOverdrive(on ? e.params[0] : 0.0f);
+        case 1:  // Distortion: drive + tone + gain
+            Serial.printf("FX1 DIST %s drv=%.2f ton=%.2f gain=%.2f\n",
+                          on?"ON":"off", on?e.params[0]:0.0f, e.params[1], e.params[2]);
+            audioSetDistortion(on ? e.params[0] : 0.0f, e.params[1], e.params[2]);
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
             break;
         case 2:  // Reverb
@@ -747,13 +765,7 @@ void switchMode(AppMode newMode) {
     // Stop sample oscillators when leaving any mode that uses them
     if (currentMode==MODE_SAMPLE||currentMode==MODE_HYBRID)
         audioStopAllSamples();
-    if (currentMode==MODE_SEQ) {
-        // Keep SEQ playing only when entering utility/FX modes; kill it for any instrument mode
-        bool seqContinues = (newMode==MODE_LIGHT||
-                             newMode==MODE_LIGHTPLAY||newMode==MODE_BATTERY||newMode==MODE_SYSINFO||
-                             newMode==MODE_ANIM);
-        if (!seqContinues) { audioStopAllSamples(); seqPlaying=false; }
-    }
+
     if (currentMode==MODE_MODULAR||currentMode==MODE_MOD2){
         audioSetFilter(0.0f, 1.5f);
         audioSetPitchBend(1.0f);
@@ -825,11 +837,10 @@ void switchMode(AppMode newMode) {
     s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
     currentMode=newMode;
     { static const char* kVizMode[MODE_COUNT]={
-          "SYNTH","OMNI","SAMPL","LIGHT","SEQ","LPLY",
+          "SYNTH","OMNI","SAMPL","LIGHT","LPLY",
           "BATT","DIAG","HYBRD","MODUL","MOD2","303","GRAN",
-          "GR2","MIDI","TRKR","DRUMS","SSEQ","303S","SS2","ANIM","I303"};
+          "GR2","MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303"};
       Serial.printf("M:%s\n", newMode<MODE_COUNT?kVizMode[newMode]:"?"); }
-    if (newMode==MODE_SEQ&&sdReady) sdListDir("/");
     if (newMode==MODE_LIGHTPLAY) memset(rippleBrightMap,0,sizeof(rippleBrightMap));
     if (newMode==MODE_HYBRID&&sdReady) sdListDir("/");
     if (newMode==MODE_MOD2 && audioReady) {
@@ -960,7 +971,6 @@ static void dispatchMenuItem(MenuItem item) {
         case MENU_OMNI:      switchMode(MODE_OMNI);      break;
         case MENU_SAMPLE:    switchMode(MODE_SAMPLE);    if(sdReady) sdListDir("/"); break;
         case MENU_LIGHT:     switchMode(MODE_LIGHT);     break;
-        case MENU_SEQ:       switchMode(MODE_SEQ);       break;
         case MENU_LIGHTPLAY: switchMode(MODE_LIGHTPLAY); break;
         case MENU_SD:        switchMode(MODE_SYSINFO);   break;
         case MENU_ABOUT:     switchMode(MODE_BATTERY);   break;
@@ -1007,17 +1017,11 @@ static const int8_t kOctOpts[] = {-2, -1, 0, 1};
 void overlayKeyPress(uint8_t row, uint8_t col) {
     if (s_overlayCloseAt) return;
 
-    // Full-grid overlay INSTR: toute touche de note valide
+    // INSTR browser: note rows play normally (handled by handleNoteKeyAudio).
+    // BTN row closes the browser and applies the selected instrument.
     if (s_overlay == OVERLAY_INSTR) {
         if (row >= KBD_NOTE_ROWS) { s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0; return; }
-        uint8_t opt = (uint8_t)((3u - row) * 8u + (7u - col));
-        if (opt < (uint8_t)SHAPE_COUNT) {
-            audioAllNotesOff();  // release active voices before resetting oscillator pool
-            currentShape = (SynthShape)opt;
-            audioSetShape(currentShape);
-        }
-        s_overlayCloseAt = millis() + 200;
-        return;
+        return;  // note rows: audio handled separately, no overlay selection logic
     }
 
     bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET || s_overlay == OVERLAY_SYSEQ || s_overlay == OVERLAY_SEQB2);
@@ -1195,6 +1199,12 @@ void handleButton(uint8_t rawBtn, bool pressed) {
     uint8_t btn = 3 - rawBtn;  // raw3=btn0(left), raw0=btn3(right)
     Serial.printf("BTN raw=%d mapped=%d %s\n", rawBtn, btn, pressed?"DN":"UP");
 
+    // Any button press while instrument browser is open: close and apply selection
+    if (s_overlay == OVERLAY_INSTR && pressed) {
+        s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
+        return;
+    }
+
     if (btn==0) {
         if (pressed) { btn1PressTime=millis(); btn1Handled=false; }
         else {
@@ -1222,7 +1232,6 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                         }
 #endif
                         break;
-                    case MODE_SEQ:   seqPlaying=!seqPlaying; if(!seqPlaying) seqStep=0; break;
                     case MODE_SAMPLE:
                         // Back / go up one directory; at root → open main menu
                         if (sdPath == "/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true; }
@@ -1321,7 +1330,21 @@ void handleButton(uint8_t rawBtn, bool pressed) {
         case MODE_SYNTH:
             if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_SCALE_ARP) s_overlay=OVERLAY_SCALE_ARP; }
             if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_ENV) s_overlay=OVERLAY_ENV; }
-            if (btn==3) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_INSTR) s_overlay=OVERLAY_INSTR; }
+            if (btn==3) {
+                OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0;
+                if (old != OVERLAY_INSTR) {
+                    s_overlay = OVERLAY_INSTR;
+                    // Init browser to current instrument's category
+                    for (uint8_t ci=0; ci<INSTR_CAT_COUNT; ci++) {
+                        if ((uint8_t)currentShape >= instrCategories[ci].start &&
+                            (uint8_t)currentShape <  instrCategories[ci].start + instrCategories[ci].count) {
+                            instrBrCat  = ci;
+                            instrBrItem = (uint8_t)currentShape - instrCategories[ci].start;
+                            break;
+                        }
+                    }
+                }
+            }
             break;
         case MODE_OMNI:
             if (btn==1) fxSelected=(fxSelected+1)%FX_COUNT;
@@ -1350,15 +1373,6 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                 }
             }
             if (btn==3) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_SAMP_OPT) s_overlay=OVERLAY_SAMP_OPT; }
-            break;
-        case MODE_SEQ:
-            if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_FX) s_overlay=OVERLAY_FX; }
-            if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_SEQ_OPT) s_overlay=OVERLAY_SEQ_OPT; }
-            if (btn==3){
-                // Toggle page (page 1 = tracks 1-4, page 2 = tracks 5-8)
-                seqPage=1-seqPage;
-                seqTrackSel=0;
-            }
             break;
         case MODE_303:
             if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_303)            s_overlay=OVERLAY_303;            }
@@ -1617,19 +1631,35 @@ void drawScreen() {
     oled.clearBuffer();
 
     // ---- FULL-SCREEN OVERLAY ----
-    // INSTR: grille 8×4 complète (16×32px par case), toutes les 32 touches de notes
+    // INSTR: categorized instrument browser — left column = categories, right = items
     if (s_overlay == OVERLAY_INSTR) {
-        for (int i = 0; i < min((int)SHAPE_COUNT, 32); i++) {
-            int ci = i % 8, ri = i / 8;   // row-major: top row = shapes 0-7
-            int x = ci * 16, y = ri * 32;
-            bool sel = (currentShape == (SynthShape)i);
-            if (sel) { oled.drawBox(x, y, 16, 32); oled.setDrawColor(0); }
-            else oled.drawFrame(x, y, 16, 32);
-            oled.setFont(u8g2_font_4x6_tf);
-            char nm[5]; strncpy(nm, shapeNames[i], 4); nm[4] = '\0';
-            oled.drawStr(x + 1, y + 20, nm);
-            if (sel) oled.setDrawColor(1);
+        oled.setFont(u8g2_font_4x6_tf);
+        // Left column: categories (32px wide, each cat 16px tall, 8 cats = 128px)
+        for (int c = 0; c < INSTR_CAT_COUNT; c++) {
+            int y = c * 16;
+            bool selCat = (c == instrBrCat);
+            if (selCat) { oled.drawBox(0, y, 32, 15); oled.setDrawColor(0); }
+            else        oled.drawFrame(0, y, 32, 15);
+            oled.drawStr(2, y + 10, instrCategories[c].name);
+            if (selCat) oled.setDrawColor(1);
         }
+        // Right column: items in selected category (96px wide, 5 visible, scrolled)
+        const InstrCategory &cat = instrCategories[instrBrCat];
+        uint8_t maxVis = 8;  // up to 8 items visible (16px each = 128px)
+        uint8_t scroll = (instrBrItem >= maxVis) ? (instrBrItem - maxVis + 1) : 0;
+        for (uint8_t i = 0; i < maxVis && (i + scroll) < cat.count; i++) {
+            uint8_t idx = scroll + i;
+            uint8_t shapeIdx = cat.start + idx;
+            bool sel = (idx == instrBrItem);
+            bool cur = (shapeIdx < SHAPE_COUNT && (SynthShape)shapeIdx == currentShape);
+            int y = i * 16;
+            if (sel) { oled.drawBox(34, y, 94, 15); oled.setDrawColor(0); }
+            else if (cur) oled.drawRBox(34, y, 94, 15, 2);
+            else          oled.drawFrame(34, y, 94, 15);
+            if (shapeIdx < SHAPE_COUNT) oled.drawStr(37, y + 10, shapeNames[shapeIdx]);
+            if (sel || cur) oled.setDrawColor(1);
+        }
+        oled.drawVLine(33, 0, 128);
         oled.sendBuffer();
         return;
     }
@@ -2250,61 +2280,6 @@ void drawScreen() {
                 break;
             }
             // ---- SEQUENCER ----
-            case MODE_SEQ: {
-                oled.setFont(u8g2_font_4x6_tf);
-                snprintf(buf,sizeof(buf),"SEQ %dBPM %s P%d T%d",
-                         bpm, seqPlaying?"[>]":"[.]", seqPage+1, seqPage*4+seqTrackSel+1);
-                oled.drawStr(0,0,buf); oled.drawHLine(0,7,128);
-                // SD file browser — 7 items
-                for(int i=0;i<7&&(i+sdScroll)<sdFileCount;i++){
-                    int idx=i+sdScroll, y=9+i*8; bool sel=(idx==sdCursor);
-                    int assignedTrack=-1;
-                    if(!sdFileIsDir[idx]){
-                        char fp[80]; snprintf(fp,sizeof(fp),"%s%s%s",
-                            sdPath.c_str(),sdPath.endsWith("/")?"":"/",sdFiles[idx].c_str());
-                        for(int t=0;t<8;t++) if(seqPaths[t]==String(fp)){assignedTrack=t;break;}
-                    }
-                    char line[25];
-                    if(sdFileIsDir[idx]) snprintf(line,sizeof(line),"%s[%s]",sel?">":"  ",sdFiles[idx].c_str());
-                    else if(assignedTrack>=0) snprintf(line,sizeof(line),"%sT%d:%s",sel?">":"  ",assignedTrack+1,sdFiles[idx].c_str());
-                    else snprintf(line,sizeof(line),"%s %s",sel?">":"  ",sdFiles[idx].c_str());
-                    line[24]='\0'; oled.drawStr(0,y,line);
-                }
-                oled.drawHLine(0,65,128);
-                // Step grid: 4 tracks of current page; row 3 at top, row 0 at bottom
-                for(int t=0;t<4;t++){
-                    uint8_t track=seqPage*4+t;
-                    int cy=67+(3-t)*14;
-                    // Track name (show global track number)
-                    char tname[5];
-                    if(seqPaths[track].length()>0){
-                        const char* base=strrchr(seqPaths[track].c_str(),'/');
-                        base=base?base+1:seqPaths[track].c_str();
-                        strncpy(tname,base,4); tname[4]='\0';
-                        char* dot=strrchr(tname,'.');
-                        if(dot)*dot='\0';
-                    } else {
-                        snprintf(tname,sizeof(tname),"T%d",track+1);
-                    }
-                    bool trackSel=(t==seqTrackSel);
-                    if(trackSel){oled.drawRBox(0,cy-1,16,9,1);oled.setDrawColor(0);}
-                    oled.drawStr(0,cy+7,tname);
-                    if(trackSel) oled.setDrawColor(1);
-                    // Steps
-                    for(int s=0;s<8;s++){
-                        int cx=17+s*14;
-                        bool curStep=(s==(int)seqStep&&seqPlaying);
-                        if(curStep){oled.drawBox(cx,cy-1,13,9);oled.setDrawColor(0);}
-                        if(seqPattern[track][s]) oled.drawBox(cx+1,cy,11,7);
-                        else oled.drawFrame(cx+1,cy,11,7);
-                        if(curStep) oled.setDrawColor(1);
-                    }
-                }
-                if(!sdReady) oled.drawStr(20,64,"SD not found");
-                oled.setFont(u8g2_font_5x7_tf);
-                snprintf(buf,sizeof(buf),"Ply Trk Map8 Pg%d  %dBPM",seqPage+1,bpm); oled.drawStr(0,127,buf);
-                break;
-            }
             // ---- LIGHT PLAY ----
             case MODE_LIGHTPLAY: {
                 oled.drawStr(0,0,"LIGHT PLAY"); oled.drawHLine(0,9,128);
@@ -3713,25 +3688,6 @@ static void updateLedsAndShow()
     for(int i=0;i<NUM_LEDS;i++) leds[i]=CRGB::Black;
     if(!menuOpen){
         switch(currentMode){
-            case MODE_SEQ: {
-                // Same coordinate transform as all other modes:
-                // track t = physical row t → gr = KBD_ROWS-1-t = 4-t
-                // step  s = physical col 7-s → gc = KBD_COLS-1-(7-s) = s
-                static const uint8_t trackHues[4]={0,85,170,42};
-                for(int t=0;t<4;t++) for(int s=0;s<8;s++){
-                    uint8_t track=seqPage*4+t;
-                    int idx=(4-t)*KBD_COLS + s;
-                    int li=crdToIdx(idx,0);
-                    if(li<0||li>=NUM_LEDS) continue;
-                    if(seqPattern[track][s]){
-                        bool cur=(seqPlaying&&s==(int)seqStep);
-                        leds[li]=CHSV(trackHues[t],255,cur?255:80);
-                    } else if(seqPlaying&&s==(int)seqStep){
-                        leds[li]=CHSV(trackHues[t],120,40);
-                    }
-                }
-                break;
-            }
             case MODE_LIGHTPLAY: {
                 // Decay all LEDs
                 for(int i=0;i<NUM_LEDS;i++) if(rippleBrightMap[i]>12) rippleBrightMap[i]-=12;
@@ -3901,13 +3857,15 @@ static void updateLedsAndShow()
                             else if (cnt)              leds[li] = CHSV(170, 240, 100);  // has notes
                             else                       leds[li] = CHSV(170, 255,   8);  // empty
                         } else {
-                            // Bottom 2 rows: hold-to-play keyboard (sequential 2-row mapping)
+                            // Bottom 2 rows: note-first keyboard
                             uint8_t note = noteMap.getMidiNoteByIdx((KBD_COLS-1-c)*2+r);
                             bool isSeqPlaying = false;
                             for(uint8_t i=0;i<syseqActiveCnt;i++) if(syseqActive[i]==note) { isSeqPlaying=true; break; }
                             bool inSelStep = false;
                             for(uint8_t i=0;i<SYSEQ_CHORD;i++) if(syseqNotes[syseqSelStep][i]==note+1) { inSelStep=true; break; }
+                            bool isSel = (note == syseqSelNote);
                             if (keyState[r][c] || isSeqPlaying) leds[li] = CHSV(60, 220, 255);
+                            else if (isSel)                      leds[li] = CHSV(30, 220, 200);  // amber = selected note
                             else if (inSelStep)                  leds[li] = CHSV(60, 200, 110);
                             else                                 leds[li] = CHSV(60, 255,   8);
                         }
@@ -4407,20 +4365,6 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             }
             break;
         }
-        case MODE_SEQ:{
-            // Each row = one track on current page, each column = one step
-            if(pressed){
-                uint8_t step=(uint8_t)(KBD_COLS-1-col); // col7=step0..col0=step7
-                uint8_t track=seqPage*4+row;
-                seqTrackSel = row;  // highlight pressed track on OLED
-                bool wasSet=seqPattern[track][step];
-                seqPattern[track][step]=!wasSet;
-                // Preview sample when activating a step
-                if(!wasSet && audioKeyLoaded(SEQ_KEY_BASE+track))
-                    audioPlayKey(SEQ_KEY_BASE+track, volume);
-            }
-            break;
-        }
         case MODE_MODULAR:{
             uint8_t note=noteMap.getMidiNote(row,col);
             activeNotes[row][col]=pressed?note:0;
@@ -4749,39 +4693,36 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
         case MODE_SYSEQ: {
             if (syseqSeqView) {
                 if (row >= 2) {
-                    // Top rows (steps): place all currently-held notes; same note = toggle off
+                    // Top rows (steps): toggle syseqSelNote on/off this step (note-first)
                     if (!pressed) break;
                     uint8_t step = (uint8_t)((row == 3 ? 0 : 8) + (KBD_COLS - 1 - col));
                     if (step >= SYSEQ_STEPS) break;
                     syseqSelStep = step;
-                    // Place each note currently held in bottom rows
-                    for (uint8_t r2=0; r2<KBD_NOTE_ROWS; r2++)
-                        for (uint8_t c2=0; c2<KBD_COLS; c2++) {
-                            if (!activeNotes[r2][c2]) continue;
-                            uint8_t stored = (uint8_t)(activeNotes[r2][c2] + 1);
-                            bool found = false;
-                            for (uint8_t i=0; i<SYSEQ_CHORD; i++)
-                                if (syseqNotes[step][i] == stored) {
-                                    syseqNotes[step][i] = 0; syseqVels[step][i] = 0;
-                                    found = true; break;
-                                }
-                            if (!found)
-                                for (uint8_t i=0; i<SYSEQ_CHORD; i++)
-                                    if (syseqNotes[step][i] == 0) {
-                                        syseqNotes[step][i] = stored;
-                                        syseqVels[step][i]  = 100;
-                                        break;
-                                    }
+                    if (syseqSelNote == 0) break;  // no note selected yet
+                    uint8_t stored = (uint8_t)(syseqSelNote + 1);
+                    bool found = false;
+                    for (uint8_t i=0; i<SYSEQ_CHORD; i++)
+                        if (syseqNotes[step][i] == stored) {
+                            syseqNotes[step][i] = 0; syseqVels[step][i] = 0;
+                            found = true; break;
                         }
+                    if (!found)
+                        for (uint8_t i=0; i<SYSEQ_CHORD; i++)
+                            if (syseqNotes[step][i] == 0) {
+                                syseqNotes[step][i] = stored;
+                                syseqVels[step][i]  = 100;
+                                break;
+                            }
                 } else {
-                    // Bottom rows (notes): select + preview only — no step modification
+                    // Bottom rows (notes): remember as selected note + preview
                     uint8_t note = noteMap.getMidiNoteByIdx((KBD_COLS - 1 - col) * 2 + row);
+                    activeNotes[row][col] = pressed ? note : 0;
                     if (pressed) {
-                        activeNotes[row][col] = note;
+                        syseqSelNote = note;  // remember for step placement (stays after release)
                         audioNoteOn(note, 0.75f);
                     } else {
-                        activeNotes[row][col] = 0;
                         audioNoteOff(note);
+                        // syseqSelNote intentionally kept after release
                     }
                 }
             } else {
@@ -5098,7 +5039,7 @@ void loop() {
     {
         bool isBrw = !menuOpen && sdReady &&
             (currentMode==MODE_SS2 ||
-             currentMode==MODE_SAMPLE || currentMode==MODE_SEQ ||
+             currentMode==MODE_SAMPLE ||
              currentMode==MODE_GRANULAR || currentMode==MODE_GRANULAR2);
         if (click && !lastClick) { joyClickMs = isBrw ? millis() : 0; joyLongFired = false; }
     }
@@ -5106,7 +5047,7 @@ void loop() {
         joyLongFired = true;
         bool isBrowserMode = !menuOpen && sdReady &&
             (currentMode==MODE_SS2 ||
-             currentMode==MODE_SAMPLE || currentMode==MODE_SEQ ||
+             currentMode==MODE_SAMPLE ||
              currentMode==MODE_GRANULAR || currentMode==MODE_GRANULAR2);
         if (isBrowserMode) {
             if (sdPath == "/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true; }
@@ -5114,7 +5055,10 @@ void loop() {
         }
     }
     if (click && !lastClick && !joyLongFired) {
-        if(menuOpen){
+        if (s_overlay == OVERLAY_INSTR) {
+            // Joystick click: confirm selected instrument and close browser
+            s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
+        } else if(menuOpen){
             selectMenuItem();
         } else if(currentMode==MODE_GRANULAR&&sdReady){
             // Granular: click navigates folders or loads selected file as granular source
@@ -5171,19 +5115,13 @@ void loop() {
                     }
                 }
             }
-        } else if((currentMode==MODE_SAMPLE||currentMode==MODE_SEQ)&&sdReady){
+        } else if(currentMode==MODE_SAMPLE&&sdReady){
             if(sdCursor<sdFileCount){
                 if(sdFiles[sdCursor]==".."){
                     if(sdPath=="/"){audioAllNotesOff();menuOpen=true;menuRow=0;menuCol=0;}
                     else{int ls=sdPath.lastIndexOf('/',sdPath.length()-2);sdListDir(ls<=0?"/":sdPath.substring(0,ls+1));}
                 } else if(sdFileIsDir[sdCursor]){
                     String np=sdPath; if(!np.endsWith("/"))np+="/"; np+=sdFiles[sdCursor]; sdListDir(np);
-                } else if(currentMode==MODE_SEQ){
-                    String fp=buildSdFilePath();
-                    uint8_t track=seqPage*4+seqTrackSel;
-                    seqPaths[track]=fp;
-                    audioLoadKey(fp.c_str(), SEQ_KEY_BASE+track);
-                    Serial.printf("SEQ T%d -> %s\n",track+1,fp.c_str());
                 } else {
                     String fp=buildSdFilePath();
                     Serial.printf("LOAD: %s\n",fp.c_str());
@@ -5699,7 +5637,6 @@ void loop() {
                     break;
                 }
                 case MODE_SAMPLE:
-                case MODE_SEQ:
                 case MODE_HYBRID: {
                     // Pots 3-6 = active FX params (same as SYNTH mode)
                     if(fxList[fxSelected].active){
@@ -5875,36 +5812,36 @@ void loop() {
                     break;
                 }
                 case MODE_SS2: {
-                    if (s_overlay == OVERLAY_FX) {
-                        if (fxList[fxSelected].active) {
-                            static float lpSS2fx[4]={-1,-1,-1,-1};
-                            static uint8_t lpSS2FxSel=0xFF;
-                            if (lpSS2FxSel!=fxSelected || fxPotNeedSync) {
-                                for (int p=0;p<4;p++) lpSS2fx[p]=pots[3+p].value;
-                                lpSS2FxSel=fxSelected; fxPotNeedSync=false;
-                            }
-                            bool fxChanged=false;
-                            for (int p=0;p<4;p++) {
-                                if (fxList[fxSelected].paramNames[p][0]=='\0') continue;
-                                if (fabsf(pots[3+p].value-lpSS2fx[p])>0.001f) {
-                                    float mn=fxList[fxSelected].paramMin[p];
-                                    float mx=fxList[fxSelected].paramMax[p];
-                                    if (fxSelected==0 && p==0)
-                                        fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
-                                    else if (fxSelected==0 && p==3) {
-                                        fxList[0].params[3]=floorf(pots[3+p].value*2.9999f);
-                                        s_filtMetaChanged=true;
-                                    } else {
-                                        fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
-                                        if (fxSelected==0) s_filtMetaChanged=true;
-                                    }
-                                    lpSS2fx[p]=pots[3+p].value; fxChanged=true;
-                                }
-                            }
-                            if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
-                            else if (fxChanged && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
+                    // FX params editable via pots 3-6 whenever any FX is active (not just when overlay is open)
+                    bool anyFxSS2 = false;
+                    for (int f=0;f<FX_COUNT;f++) if(fxList[f].active){anyFxSS2=true;break;}
+                    if (anyFxSS2) {
+                        static float lpSS2fx[4]={-1,-1,-1,-1};
+                        static uint8_t lpSS2FxSel=0xFF;
+                        if (lpSS2FxSel!=fxSelected || fxPotNeedSync) {
+                            for (int p=0;p<4;p++) lpSS2fx[p]=pots[3+p].value;
+                            lpSS2FxSel=fxSelected; fxPotNeedSync=false;
                         }
-                        break;
+                        bool fxChanged=false;
+                        for (int p=0;p<4;p++) {
+                            if (fxList[fxSelected].paramNames[p][0]=='\0') continue;
+                            if (fabsf(pots[3+p].value-lpSS2fx[p])>0.001f) {
+                                float mn=fxList[fxSelected].paramMin[p];
+                                float mx=fxList[fxSelected].paramMax[p];
+                                if (fxSelected==0 && p==0)
+                                    fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
+                                else if (fxSelected==0 && p==3) {
+                                    fxList[0].params[3]=floorf(pots[3+p].value*2.9999f);
+                                    s_filtMetaChanged=true;
+                                } else {
+                                    fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
+                                    if (fxSelected==0) s_filtMetaChanged=true;
+                                }
+                                lpSS2fx[p]=pots[3+p].value; fxChanged=true;
+                            }
+                        }
+                        if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
+                        else if (fxChanged && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
                     }
                     break;
                 }
@@ -6516,15 +6453,45 @@ void loop() {
             }
         }
 
+        // Instrument browser (OVERLAY_INSTR): joystick X=category, Y=item, click=confirm
+        if (s_overlay == OVERLAY_INSTR) {
+            static unsigned long lastInstrNav = 0;
+            if (millis() - lastInstrNav >= 160) {
+                float nx = cachedJoyX / 64.0f;
+                float ny = cachedJoyY / 64.0f;
+                bool moved = false;
+                if (nx < -0.3f) {
+                    if (instrBrCat > 0) { instrBrCat--; instrBrItem = 0; } moved = true;
+                } else if (nx > 0.3f) {
+                    if (instrBrCat < INSTR_CAT_COUNT - 1) { instrBrCat++; instrBrItem = 0; } moved = true;
+                }
+                const InstrCategory &cat = instrCategories[instrBrCat];
+                if (ny < -0.3f) {
+                    if (instrBrItem > 0) instrBrItem--; moved = true;
+                } else if (ny > 0.3f) {
+                    if (instrBrItem + 1 < cat.count) instrBrItem++; moved = true;
+                }
+                if (moved) {
+                    // Preview: apply highlighted instrument immediately
+                    uint8_t shapeIdx = instrCategories[instrBrCat].start + instrBrItem;
+                    if (shapeIdx < SHAPE_COUNT) {
+                        currentShape = (SynthShape)shapeIdx;
+                        audioSetShape(currentShape);
+                    }
+                    lastInstrNav = millis();
+                }
+            }
+        }
+
         // Global pitch bend via JY — SYNTH / HYBRID (MODULAR/MOD2 handle it themselves)
-        if((currentMode==MODE_SYNTH||currentMode==MODE_HYBRID)&&!menuOpen&&audioReady){
+        if((currentMode==MODE_SYNTH||currentMode==MODE_HYBRID)&&!menuOpen&&audioReady&&s_overlay!=OVERLAY_INSTR){
             float jy=cachedJoyY/64.0f;
             float bend=(fabsf(jy)<0.15f)?0.0f:-jy*2.0f;  // ±2 semitones, centre deadzone
             audioSetPitchBend(powf(2.0f,bend/12.0f));
         }
 
-        // SD browser joystick navigation (SAMPLE, SEQ, and GRANULAR — always browsable)
-        bool needsSdNav = (currentMode==MODE_SAMPLE||currentMode==MODE_SEQ)
+        // SD browser joystick navigation (SAMPLE, GRANULAR — always browsable)
+        bool needsSdNav = currentMode==MODE_SAMPLE
                        || currentMode==MODE_GRANULAR
                        || currentMode==MODE_GRANULAR2;
         if(needsSdNav&&!menuOpen&&sdReady){
@@ -6532,8 +6499,7 @@ void loop() {
             float ny=cachedJoyY/64.0f;
             bool gran2AnyComputed = false;
             if (currentMode==MODE_GRANULAR2) for (uint8_t _s=0;_s<GRAN2_MAX_SAMPLES;_s++) if (gran2[_s].computed) { gran2AnyComputed=true; break; }
-            uint8_t visLines=(currentMode==MODE_SEQ)?7
-                            :(currentMode==MODE_GRANULAR&&!granComputed)?13
+            uint8_t visLines=(currentMode==MODE_GRANULAR&&!granComputed)?13
                             :(currentMode==MODE_GRANULAR&&granComputed)?8
                             :(currentMode==MODE_GRANULAR2&&!gran2AnyComputed)?13
                             :(currentMode==MODE_GRANULAR2)?7:8;

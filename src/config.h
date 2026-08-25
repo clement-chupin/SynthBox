@@ -8,7 +8,6 @@ enum AppMode : uint8_t {
     MODE_OMNI,
     MODE_SAMPLE,
     MODE_LIGHT,
-    MODE_SEQ,       // 4-track × 8-step sample sequencer
     MODE_LIGHTPLAY, // live light ripple mode
     MODE_BATTERY,
     MODE_SYSINFO,   // cyberpunk HUD — system info / visual test
@@ -33,28 +32,22 @@ enum AppMode : uint8_t {
 #define MENU_COLS 3
 enum MenuItem : uint8_t {
     MENU_SYNTH, MENU_OMNI, MENU_SAMPLE,
-    MENU_LIGHT, MENU_SEQ, MENU_LIGHTPLAY,
-    MENU_SD,
+    MENU_LIGHT, MENU_LIGHTPLAY, MENU_SD,
     MENU_ABOUT, MENU_HYBRID, MENU_MODULAR,
-    MENU_MOD2, MENU_303,
-    MENU_GRANULAR, MENU_GRANULAR2, MENU_MIDI,
-    MENU_TRACKER, MENU_DRUM2, MENU_SYSEQ,
-    MENU_303S,
-    MENU_SS2,
-    MENU_ANIM,
-    MENU_I303,
+    MENU_MOD2, MENU_303, MENU_GRANULAR,
+    MENU_GRANULAR2, MENU_MIDI, MENU_TRACKER,
+    MENU_DRUM2, MENU_SYSEQ, MENU_303S,
+    MENU_SS2, MENU_ANIM, MENU_I303,
     MENU_ITEM_COUNT
 };
 static const char* menuLabels[] = {
     "SYNTH","OMNI","SAMPL",
-    "LIGHT","SEQ","LPLY",
-    "DIAG",
+    "LIGHT","LPLY","DIAG",
     "BATT","HYBRD","MODUL",
-    "MOD2","303",
-    "GRAN","GR2","MIDI",
-    "TRKR","DRUMS","SSEQ",
-    "303S","SS2","ANIM",
-    "I303"
+    "MOD2","303","GRAN",
+    "GR2","MIDI","TRKR",
+    "DRUMS","SYNS","303S",
+    "SAMPS","ANIM","I303"
 };
 #define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
 
@@ -246,25 +239,25 @@ enum Mod2PlayMode : uint8_t { MOD2_POLY=0, MOD2_MONO, MOD2_SLIDE, MOD2_PLAY_COUN
 static const char* mod2PlayModeNames[] = {"Poly","Mono","Slid"};
 
 static const char* btnLabels[][4] = {
-    {"FX","Scl/Arp","Env","Instr"},  // SYNTH — btn0=FX overlay, btn1=Scale/Arp/Oct, btn2=Env, btn3=Instr
-    {"Shape","Mix","Sus","Oct"},    // OMNI
-    {"Patt","Play","Clr","Bank"},   // DRUMS
-    {"Bck","FX","Map","Opt"},       // SAMPLE — btn1=FX overlay, btn2=automap, btn3=SampOpt
-    {"Pres","Prm+","On/Of","Save"}, // FX
-    {"Spd","Sprd","Brt","Sat"},     // LIGHT
-    {"Play","FX","Opt","Pg"},       // SEQ — btn1=FX overlay, btn2=SeqOpt, btn3=page
-    {"","","",""},                  // LIGHTPLAY
-    {"","","",""},                  // BATTERY
-    {"","","",""},                  // SYSINFO
-    {"Scale","Env","Mix","Oct"},    // HYBRID — btn3=oct
-    {"OSC","Env","Flt","Oct"},      // MODULAR — btn1=env / btn3=oct
-    {"Ptch-","Ptch+","","Oct"},     // SYNTH2 — patch ±1 / octave
-    {"LFO","Mode","Oct",""},        // MOD2 — LFO mode / Poly-Mono / octave
-    {"FX","Wv/Arp","Sus","Tone"},    // 303
-    {"","","",""},                  // GRANULAR (15)
-    {"","","",""},                  // GRANULAR2 (16)
-    {"","","",""},                  // MIDI (17)
-    {"","","",""},                  // TRACKER (18)
-    {"FX","Ply","Rec","Seq"},       // DRUM2 — btn0=FX, btn1=Play/Stop, btn2=Rec, btn3=Seq/Pad
-    {"FX","Ply","Env","Seq"},       // SYSEQ — btn0=FX, btn1=Play/Stop, btn2=Env, btn3=Seq/Pad
+    {"FX","Scl/Arp","Env","Instr"},  // SYNTH
+    {"Shape","Mix","Sus","Oct"},     // OMNI
+    {"Patt","Play","Clr","Bank"},    // SAMPLE
+    {"Spd","Sprd","Brt","Sat"},      // LIGHT
+    {"","","",""},                   // LIGHTPLAY
+    {"","","",""},                   // BATTERY
+    {"","","",""},                   // SYSINFO
+    {"Scale","Env","Mix","Oct"},     // HYBRID
+    {"OSC","Env","Flt","Oct"},       // MODULAR
+    {"Ptch-","Ptch+","","Oct"},      // MOD2
+    {"LFO","Mode","Oct",""},         // 303
+    {"FX","Wv/Arp","Sus","Tone"},    // GRANULAR
+    {"","","",""},                   // GRANULAR2
+    {"","","",""},                   // MIDI
+    {"","","",""},                   // TRACKER
+    {"FX","Ply","Rec","Seq"},        // DRUM2
+    {"FX","Ply","Env","Seq"},        // SYSEQ (SYNS)
+    {"FX","Ply","Opt","Seq"},        // 303S
+    {"Bck","FX","Map","Seq"},        // SS2 (SAMPS)
+    {"","","",""},                   // ANIM
+    {"FX","Wv","Sld","Oct"},         // I303
 };

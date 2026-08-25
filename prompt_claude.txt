@@ -142,7 +142,7 @@ J'aimerais comme pour les drums, faire un système note first, je joue une note,
 renome SSEQ par SYNS pour synth SEQUENCEUR
 renome SS2 par SAMPS pour sample sequenceur, et je n'arrive pas à modifié les paramètres des FX une fois le sous menu FX refermé dans ce mode
 pour le mode Synth, je veux que le sous menu de sélectionn d'instruments via BTN3 ouvre un navigateur d'instruments, classé par catégorie d'instruments, où je peut naviguer dans ce menu avec le joystick, quand quand j'appuie sur les touches, ça joue les notes de l'instrument actuellement sélectionné, et que soit via le clic du joystick, soit l'appuie d'un BTN0-3 pour sortir du mode avec l'instrument sélectionné
-change le FX overdrive par une distortion, avec 2-3 paramètres
+change le FX overdrive par distortion, avec 2-3 paramètres
 
 
 
