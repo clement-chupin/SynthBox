@@ -134,6 +134,7 @@ INSTRUMENT : regroupe tous les mode permettant de joué des notes avec le clavie
 SEQUENCEUR : regroupe tous les séquenceurs, et notament ceux synchronisé entre eux
 AUTRES : le light show, le batterie et diagnostic
 
+#### 
 
 supprime le mode SEQ, 
 pour SSEQ, le système de placement des notes est pas ergonomique, je doit maintenir une note avant de la placer sur un tempo. 
