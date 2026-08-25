@@ -93,13 +93,6 @@ enum SeqPlayMode : uint8_t { SEQ_FULL=0, SEQ_CUT_BAR, SEQ_CUT_NOTE };
 static SeqPlayMode seqPlayMode = SEQ_FULL;
 static const char* kSeqPlayModes[] = {"Full","CBar","CNot"};
 
-// Modular synth state (MODE_MODULAR) — analog signal chain: OSC → FILTER → AMP, LFO → pitch
-static uint8_t  modShapeIdx  = 0;
-static uint8_t  modEnvIdx    = 0;
-static float    modCutoff    = 4000.0f;
-static float    modReso      = 1.5f;
-static float    modLfoRate   = 2.0f;
-static float    modLfoDepth  = 0.0f;
 
 // Smoothed battery voltage (EMA updated every 10ms tick)
 static float s_battVSmooth = 8.0f;
@@ -355,45 +348,6 @@ static uint8_t rippleBrightMap[NUM_LEDS] = {};
 // ==================== ANIM STATE (MODE_ANIM) ====================
 static uint8_t animIdx = 0;   // active animation: 0=WAVE 1=BARS 2=TECHNO 3=ACID 4=8BIT
 
-// ==================== GRANULAR STATE ====================
-static uint8_t  granSubMode   = 0;        // 0 = 8-slice, 1 = 1/16 energy-ranked
-static uint8_t  granSliceCount = 0;       // computed after source load
-static uint8_t  granWaveform[128]  = {};  // 0-255 amplitude bars for display
-static bool     granComputed   = false;   // slices computed and ready to play
-static String   granFilePath   = "";      // path of current granular source
-
-// granSubMode: 0=8-slice  1=1/16-energy  2=8-slice-loop  3=1/16-loop
-// 8-slice row layout: R0=one-shot px, R1=double px+px+1, R2=tail sx→end (looped), R3=px reversed
-// 16-slice row layout: R0=slices 0-7, R1=slices 8-15, R2=0-7 looped, R3=8-15 looped
-static inline uint16_t granPresetForKey(uint8_t row, uint8_t col) {
-    uint8_t c = 7u - col;  // physical left key = slice 0 (start of sample)
-    if ((granSubMode & 1u) == 0) {
-        // 8-slice mode
-        if (row == 0) return GRANULAR_PRESET_BASE + c;   // one-shot px
-        if (row == 1) return GRANULAR_DBL_PRESET  + c;   // double px+px+1
-        if (row == 2) return GRANULAR_TAIL_PRESET + c;   // tail sx→end (looped)
-        return              GRANULAR_REV_PRESET   + c;   // px reversed
-    } else {
-        // 16-slice mode: rows 0-1 = slices 0-15, rows 2-3 = same slices but looped
-        if (row == 0) return GRANULAR_PRESET_BASE     + c;       // slices 0-7
-        if (row == 1) return GRANULAR_PRESET_BASE + 8 + c;       // slices 8-15
-        if (row == 2) return GRANULAR_PRESET_BASE     + c;       // slices 0-7 looped
-        return              GRANULAR_PRESET_BASE + 8 + c;        // slices 8-15 looped
-    }
-}
-static inline bool granIsLoop(uint8_t row) {
-    if (granSubMode >= 2) return true;                    // modes 2&3: always loop
-    if ((granSubMode & 1u) == 0) return (row == 2);      // 8-slice: row2 (tail) loops
-    return (row >= 2);                                    // 16-slice: rows 2-3 loop
-}
-static float granWinStart = 0.0f, granWinEnd = 1.0f;
-static int8_t granPlayingSlice = -1;  // 0-N-1: last selected slice index (persists after release); -1 = none
-static bool   granKeyHeld = false;   // true while a granular key is physically held
-// Split points: N+1 boundaries within window [0.0..1.0]. Pot A = splits[x], Pot B = splits[x+1].
-static float granSplits[GRANULAR_MAX_SLICES + 1] = {};  // initialized to even spacing on file load
-// Signals the pot handler to re-sync its delta baseline to current pot positions
-// (set true on file load and mode entry to prevent stale deltas from other modes)
-static bool granPotNeedsSync = true;
 
 // ==================== GRANULAR2 STATE ====================
 struct Gran2State {
@@ -405,7 +359,7 @@ struct Gran2State {
     uint8_t waveform[128];
 };
 static Gran2State   gran2[GRAN2_MAX_SAMPLES];
-// gran2PlayMode: 0=once (one-shot), 1=loop (loop slice), 2=full (loop full sample from slice start)
+// gran2PlayMode: 0=NRM(one-shot), 1=LOP(loop slice), 2=FUL(loop full), 3=SEQ(sequential queue)
 // Fixed x4: 4 samples (TL=S0, TR=S1, BL=S2, BR=S3), 4 slices each, fwd+rev rows per half.
 static uint8_t      gran2PlayMode     = 0;
 static int8_t       gran2ActiveSample = -1;   // last-played sample index (for display + pot control)
@@ -413,8 +367,32 @@ static int8_t       gran2ActiveSlice  = -1;   // last-played slice within that s
 static uint8_t      gran2LoadTarget   = 0;    // which slot the SD browser loads into
 static bool         gran2PotNeedsSync = true;
 
+// SEQ mode: circular queue of slices to play in order, one at a time
+#define GRAN2_SEQ_MAX 16
+#define GRAN2_SEQ_OSC 32   // dedicated oscIdx (AMY osc GRANULAR_OSC_BASE+32=182, outside key range)
+struct Gran2SeqEntry { uint8_t sampleIdx, sliceIdx; bool reverse; };
+static Gran2SeqEntry g_gran2SeqQueue[GRAN2_SEQ_MAX];
+static uint8_t  g_gran2SeqHead = 0, g_gran2SeqTail = 0;  // head=read, tail=write
+static uint32_t g_gran2SeqEndMs  = 0;   // millis() when current slice ends
+static float    g_gran2SeqVolume = 0.7f;
+
 static uint8_t gran2NumSamples() { return 4u; }
 static uint8_t gran2NumSlices()  { return 4u; }
+
+static void gran2SeqStartHead() {
+    if (g_gran2SeqHead == g_gran2SeqTail) return;
+    const Gran2SeqEntry& e = g_gran2SeqQueue[g_gran2SeqHead];
+    if (!gran2[e.sampleIdx].computed) { g_gran2SeqHead = (g_gran2SeqHead + 1) % GRAN2_SEQ_MAX; return; }
+    // 0ms attack: retriggering the same OSC immediately interrupts current slice (no gap)
+    audioPlayGranular2(GRAN2_SEQ_OSC, e.sampleIdx, e.sliceIdx, e.reverse, g_gran2SeqVolume, 0, 0);
+    gran2ActiveSample = (int8_t)e.sampleIdx;
+    gran2ActiveSlice  = (int8_t)e.sliceIdx;
+    uint32_t totalMs = audioGranular2SampleLenMs(e.sampleIdx);
+    float frac = gran2[e.sampleIdx].splits[e.sliceIdx + 1] - gran2[e.sampleIdx].splits[e.sliceIdx];
+    uint32_t sliceMs = (uint32_t)(frac * (float)totalMs);
+    // Trigger next 5ms early to absorb the 10ms loop detection latency
+    g_gran2SeqEndMs = millis() + (sliceMs > 5u ? sliceMs - 5u : 0u);
+}
 
 // Map (row, col) → (sampleIdx, sliceIdx, isReverse).
 // Physical layout (code row 0 = physical bottom; gc = 7-c so code col 7 = physical left):
@@ -518,8 +496,7 @@ bool    menuOnTabBar   = true;  // true=cursor on tab bar, false=cursor in item 
 static const char* kMenuCatNames[] = { "INSTR", "SEQNC", "AUTRE" };
 static const MenuItem kMenuCatInstr[] = {
     MENU_SYNTH, MENU_OMNI, MENU_SAMPLE,
-    MENU_HYBRID, MENU_MODULAR, MENU_MOD2,
-    MENU_303, MENU_I303, MENU_GRANULAR,
+    MENU_HYBRID, MENU_MOD2, MENU_I303,
     MENU_GRANULAR2, MENU_MIDI
 };
 static const MenuItem kMenuCatSeq[] = {
@@ -530,10 +507,11 @@ static const MenuItem kMenuCatAut[] = {
     MENU_LIGHT, MENU_LIGHTPLAY, MENU_ABOUT, MENU_SD, MENU_ANIM
 };
 static const MenuItem* kMenuCatItems[] = { kMenuCatInstr, kMenuCatSeq, kMenuCatAut };
-static const uint8_t kMenuCatSizes[] = { 11, 6, 5 };
+static const uint8_t kMenuCatSizes[] = { 8, 5, 5 };
 bool    lastClick      = false;
 uint32_t joyClickMs   = 0;    // millis() when joystick click started (0=not pressed)
 bool    joyLongFired  = false; // long-click action already triggered this press
+bool    joyBrwActed   = false; // browser short-click already acted this press (blocks long-press)
 uint32_t btn1PressTime = 0;
 bool    btn1Handled    = false;
 
@@ -552,16 +530,16 @@ struct FxEffect {
 };
 
 FxEffect fxList[] = {
-    // FILT: filtre général — Atn=pente (0=12dB, 1=24dB pour LPF), Typ=type (0=LPF,1=HPF,2=BPF)
-    {"FILT",     false, {2000.0f, 1.5f, 1.0f, 0.0f},
-     {"Cut","Res","Atn","Typ"},
+    // FILT: filtre général — Typ=type (0=LPF,1=HPF,2=BPF)
+    {"FILT",     false, {2000.0f, 1.5f, 0.0f, 0.0f},
+     {"Cut","Res","","Typ"},
      {65.0f,   0.5f, 0.0f, 0.0f},
-     {18000.0f, 3.0f, 1.0f, 2.0f}},
+     {18000.0f, 3.0f, 0.0f, 2.0f}},
     // Distortion: wavefold-style saturation via filter drive + tone shaping
-    {"DISTORT",  false, {0.6f, 0.5f,  1.0f, 0.0f},
-     {"Drv","Ton","Gain",""},
-     {0.0f, 0.0f, 0.5f, 0.0f},
-     {1.0f, 1.0f, 2.0f, 0.0f}},
+    {"DISTORT",  false, {0.6f, 0.5f,  0.0f, 0.0f},
+     {"Drv","Ton","",""},
+     {0.0f, 0.0f, 0.0f, 0.0f},
+     {1.0f, 1.0f, 0.0f, 0.0f}},
     // Reverb
     {"REVERB",   false, {1.5f, 0.85f, 0.5f, 3000.0f},
      {"Lvl","Live","Damp","Xover"},
@@ -602,7 +580,7 @@ FxEffect fxList[] = {
 };
 static const uint8_t FX_COUNT = 9;
 
-// Noms des types de filtre FILT — LPF (12dB ou 24dB selon Atn), HPF, BPF
+// Noms des types de filtre FILT — LPF, HPF, BPF
 static const char* kFiltTypN[] = {"LPF","HPF","BPF"};
 static const char* fxFiltTypName() {
     return kFiltTypN[(uint8_t)constrain((int)roundf(fxList[0].params[3]), 0, 2)];
@@ -615,7 +593,7 @@ static const uint8_t DELAY_SUBDIV_COUNT = 7;
 
 uint8_t fxSelected = 0;
 static float lpfSmoothCut = 8000.0f; // anti-zipper: smoothed cutoff applied each 10ms tick
-static bool  s_filtMetaChanged = false; // true when FILT Res/Atn/Typ changed → applyFxEffect(0) needed
+static bool  s_filtMetaChanged = false; // true when FILT Res/Typ changed → applyFxEffect(0) needed
 
 // Activation order: fxOrderList[0] was activated first, fxOrderList[fxOrderCount-1] last.
 // Effects applied in this order, so the last activated filter effect wins.
@@ -643,29 +621,23 @@ void applyFxEffect(uint8_t fx) {
         return !fxList[0].active && !fxList[1].active && !fxList[6].active;
     };
     switch (fx) {
-        case 0: {  // FILT — filtre général (params[3]=Typ: 0=LPF,1=HPF,2=BPF ; params[2]=Atn: 0=bypass,1=full)
+        case 0: {  // FILT — filtre général (params[3]=Typ: 0=LPF,1=HPF,2=BPF)
             static const uint8_t kFiltAMY[] = {FILTER_LPF, FILTER_HPF, FILTER_BPF};
             uint8_t ti  = (uint8_t)constrain((int)roundf(e.params[3]), 0, 2);
-            float   atn = e.params[2];
             float   cut = e.params[0], res = e.params[1];
-            // Atn=0 → filtre transparent ; Atn=1 → effet plein
-            float eff_cut, eff_res;
-            if (ti == 0) { eff_cut = 18000.0f + atn*(cut-18000.0f); eff_res = res; } // LPF: lerp(18k→cut)
-            else if (ti == 1) { eff_cut = 20.0f + atn*(cut-20.0f); eff_res = res; }  // HPF: lerp(20→cut)
-            else { eff_cut = cut; eff_res = 0.5f + atn*(res-0.5f); }                  // BPF: Q lerp(0.5→res)
-            Serial.printf("FX0 FILT %s cut=%.0f(eff=%.0f) res=%.2f typ=%s atn=%.2f\n",
-                on?"ON":"off", cut, on?eff_cut:0.0f, on?eff_res:1.5f, kFiltTypN[ti], atn);
-            audioSetAllFiltersT(on ? eff_cut : 0.0f, on ? eff_res : 1.5f,
+            Serial.printf("FX0 FILT %s cut=%.0f res=%.2f typ=%s\n",
+                on?"ON":"off", on?cut:0.0f, on?res:1.5f, kFiltTypN[ti]);
+            audioSetAllFiltersT(on ? cut : 0.0f, on ? res : 1.5f,
                                 on ? kFiltAMY[ti] : FILTER_LPF24);
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
-            if (!on && (currentMode == MODE_303 || currentMode == MODE_303S))
+            if (!on && currentMode == MODE_303S)
                 audioT303Params(t303Cutoff, t303Reso, t303EnvMod, t303Decay);
             break;
         }
-        case 1:  // Distortion: drive + tone + gain
-            Serial.printf("FX1 DIST %s drv=%.2f ton=%.2f gain=%.2f\n",
-                          on?"ON":"off", on?e.params[0]:0.0f, e.params[1], e.params[2]);
-            audioSetDistortion(on ? e.params[0] : 0.0f, e.params[1], e.params[2]);
+        case 1:  // Distortion: drive + tone
+            Serial.printf("FX1 DIST %s drv=%.2f ton=%.2f\n",
+                          on?"ON":"off", on?e.params[0]:0.0f, e.params[1]);
+            audioSetDistortion(on ? e.params[0] : 0.0f, e.params[1]);
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
             break;
         case 2:  // Reverb
@@ -766,15 +738,9 @@ void switchMode(AppMode newMode) {
     if (currentMode==MODE_SAMPLE||currentMode==MODE_HYBRID)
         audioStopAllSamples();
 
-    if (currentMode==MODE_MODULAR||currentMode==MODE_MOD2){
+    if (currentMode==MODE_MOD2){
         audioSetFilter(0.0f, 1.5f);
         audioSetPitchBend(1.0f);
-    }
-    if (currentMode==MODE_303){
-        if (t303CurrentNote) audioT303NoteOff(t303CurrentNote);
-        audioT303PitchBend(1.0f);
-        t303CurrentNote=0; t303SlideActive=false; t303PressedRow=-1; t303PressedCol=-1;
-        applyFxEffect(2);  // restore global reverb to FX state on 303 exit
     }
     if (currentMode==MODE_DRUM2){
         drum2RecArmed=false;
@@ -800,7 +766,7 @@ void switchMode(AppMode newMode) {
     if (currentMode==MODE_I303){
         midiAllNotesOff(MIDI_CH_BASS);
     }
-    if ((currentMode==MODE_303S || currentMode==MODE_I303 || currentMode==MODE_303) && audioReady)
+    if ((currentMode==MODE_303S || currentMode==MODE_I303) && audioReady)
         audioSW2Deactivate();
     if (currentMode==MODE_SS2){
         for(uint8_t r2=0;r2<KBD_NOTE_ROWS;r2++)
@@ -808,8 +774,11 @@ void switchMode(AppMode newMode) {
                 activeNotes[r2][c2]=0;
         // Keep samples in PSRAM — other sequencer modes may use them
     }
-    if (currentMode==MODE_GRANULAR)  audioUnloadGranular();
-    if (currentMode==MODE_GRANULAR2) audioUnloadGranular2();
+    if (currentMode==MODE_GRANULAR2) {
+        audioStopGranular2(GRAN2_SEQ_OSC);
+        g_gran2SeqHead = g_gran2SeqTail = 0;
+        audioUnloadGranular2();
+    }
     if (currentMode==MODE_TRACKER && trkPlaying) {
         trkPlaying=false;
         for (int t=0;t<TRACKER_TRACKS;t++) {
@@ -838,8 +807,8 @@ void switchMode(AppMode newMode) {
     currentMode=newMode;
     { static const char* kVizMode[MODE_COUNT]={
           "SYNTH","OMNI","SAMPL","LIGHT","LPLY",
-          "BATT","DIAG","HYBRD","MODUL","MOD2","303","GRAN",
-          "GR2","MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303"};
+          "BATT","DIAG","HYBRD","MOD2","GRANU",
+          "MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303"};
       Serial.printf("M:%s\n", newMode<MODE_COUNT?kVizMode[newMode]:"?"); }
     if (newMode==MODE_LIGHTPLAY) memset(rippleBrightMap,0,sizeof(rippleBrightMap));
     if (newMode==MODE_HYBRID&&sdReady) sdListDir("/");
@@ -847,10 +816,6 @@ void switchMode(AppMode newMode) {
         audioSetShape(mod2ShapeSteps[mod2ShapeIdx]);
         audioSetFilter(mod2Cutoff, mod2Reso);
         audioSetEnvelope(envTable[mod2EnvIdx]);
-    }
-    if (newMode==MODE_303 && audioReady) {
-        audioT303SetSustain(t303SustainOn ? 1.0f : 0.0f);
-        audioT303Init(t303Cutoff, t303Reso, t303EnvMod, t303Decay, t303Wave);
     }
     if (newMode==MODE_DRUM2) {
         drum2Step=0; drum2LastStepMs=millis();
@@ -906,7 +871,6 @@ void switchMode(AppMode newMode) {
         if (sdReady) sdListDir(sdPath.length()>1 ? sdPath.c_str() : "/");
         for(uint8_t i=0;i<SS2_SLOTS;i++) ss2Loaded[i] = ss2Path[i][0] && audioKeyLoaded(SS2_KEY_BASE+i);
     }
-    if (newMode==MODE_GRANULAR && sdReady) { sdListDir("/"); granWinStart=0.0f; granWinEnd=1.0f; granPlayingSlice=-1; granKeyHeld=false; granPotNeedsSync=true; }
     if (newMode==MODE_GRANULAR2 && sdReady) {
         sdListDir("/");
         memset(gran2, 0, sizeof(gran2));
@@ -975,10 +939,7 @@ static void dispatchMenuItem(MenuItem item) {
         case MENU_SD:        switchMode(MODE_SYSINFO);   break;
         case MENU_ABOUT:     switchMode(MODE_BATTERY);   break;
         case MENU_HYBRID:    switchMode(MODE_HYBRID);    if(sdReady) sdListDir("/"); break;
-        case MENU_MODULAR:   switchMode(MODE_MODULAR);   break;
         case MENU_MOD2:      switchMode(MODE_MOD2);      break;
-        case MENU_303:       switchMode(MODE_303);        break;
-        case MENU_GRANULAR:  switchMode(MODE_GRANULAR);   break;
         case MENU_GRANULAR2: switchMode(MODE_GRANULAR2);  break;
         case MENU_MIDI:      switchMode(MODE_MIDI);       break;
         case MENU_TRACKER:   switchMode(MODE_TRACKER);    break;
@@ -1069,10 +1030,6 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
             if (opt < ENV_PRESET_COUNT) {
                 currentEnv = (EnvPreset)opt;
                 audioSetEnvelope(envTable[currentEnv]);
-                if (currentMode == MODE_303 && audioReady)
-                    audioT303SetAmpEnv((float)envTable[currentEnv].atk,
-                                       envTable[currentEnv].sus,
-                                       (float)envTable[currentEnv].rel);
                 if (currentMode == MODE_I303 && audioReady)
                     audioI303SetAmpEnv((float)envTable[currentEnv].atk,
                                        envTable[currentEnv].sus,
@@ -1215,7 +1172,6 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                 }
                 else switch(currentMode) {
                     case MODE_SYNTH:
-                    case MODE_303:
                     case MODE_I303: {
                         OverlayType old = s_overlay; s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
                         if (old != OVERLAY_FX) s_overlay = OVERLAY_FX;
@@ -1374,11 +1330,6 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             }
             if (btn==3) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_SAMP_OPT) s_overlay=OVERLAY_SAMP_OPT; }
             break;
-        case MODE_303:
-            if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_303)            s_overlay=OVERLAY_303;            }
-            if (btn==2) { t303SustainOn = !t303SustainOn; if(audioReady) audioT303SetSustain(t303SustainOn ? 1.0f : 0.0f); }
-            if (btn==3) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_303_PRESET)     s_overlay=OVERLAY_303_PRESET;     }
-            break;
         case MODE_DRUM2:
             // B1(btn0)=Play handled in the btn==0 block above (must reach second switch via btn==1,2,3)
             if (btn==1) {  // B2: FX overlay
@@ -1496,36 +1447,18 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             if (btn==2) mod2PlayMode=(Mod2PlayMode)((mod2PlayMode+1)%MOD2_PLAY_COUNT);
             if (btn==3) noteMap.nextOctave();
             break;
-        case MODE_MODULAR:
-            if (btn==1){ modEnvIdx=(modEnvIdx+1)%ENV_PRESET_COUNT; audioSetEnvelope(envTable[modEnvIdx]); }
-            if (btn==3) noteMap.nextOctave();
-            break;
         case MODE_HYBRID:
             if (btn==3) noteMap.nextOctave();
             break;
-        case MODE_GRANULAR:
-            // Btn1: cycle sub-mode 0→1→2→3→0 (8sl / 1/16 / 8sl-loop / 1/16-loop)
-            if (btn==1 && granComputed) {
-                granSubMode = (granSubMode + 1) & 3u;
-                audioSetGranularWindow(granWinStart, granWinEnd);
-                granSliceCount = audioComputeGranularSlices(granSubMode & 1u, granWaveform);
-                granComputed = (granSliceCount > 0);
-                if (granComputed) {
-                    for (int i = 0; i <= granSliceCount; i++) granSplits[i] = i / (float)granSliceCount;
-                    granPlayingSlice = -1;
-                    granPotNeedsSync = true;
-                }
-            }
-            // Btn2: FX overlay
-            if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_FX) s_overlay=OVERLAY_FX; }
-            break;
         case MODE_GRANULAR2:
-            // Btn2: cycle play mode once→loop→full→once
+            // Btn2: cycle play mode NRM→LOP→FUL→SEQ→NRM
             if (btn==1) {
-                gran2PlayMode = (gran2PlayMode + 1) % 3;
+                // Stop SEQ if leaving it
+                if (gran2PlayMode == 3) { audioStopGranular2(GRAN2_SEQ_OSC); g_gran2SeqHead = g_gran2SeqTail = 0; }
+                gran2PlayMode = (gran2PlayMode + 1) % 4;
                 gran2ActiveSample = -1; gran2ActiveSlice = -1; gran2PotNeedsSync = true;
                 // Re-register presets with correct sample_length for the new play mode:
-                // LOP needs extended length (SYNTH_OFF prevention); NRM needs exact slice length.
+                // LOP needs extended length (SYNTH_OFF prevention); NRM/SEQ need exact slice length.
                 for (uint8_t s = 0; s < GRAN2_MAX_SAMPLES; s++) {
                     if (gran2[s].computed)
                         audioApplyGranular2Splits(s, gran2[s].splits, gran2[s].sliceCount, gran2PlayMode == 1);
@@ -1533,16 +1466,42 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             }
             // Btn3: cycle load target slot
             if (btn==2) gran2LoadTarget = (gran2LoadTarget + 1) % gran2NumSamples();
-            // Btn4: clear all loaded GR2 samples to allow remapping
+            // Btn4: automap if no samples loaded, else clear all
             if (btn==3) {
-                for (uint8_t r = 0; r < KBD_NOTE_ROWS; r++) for (uint8_t c = 0; c < KBD_COLS; c++)
-                    audioStopGranular2((uint8_t)(r * KBD_COLS + c));
-                for (uint8_t s = 0; s < GRAN2_MAX_SAMPLES; s++) {
-                    if (gran2[s].loaded) audioUnloadGranular2Slot(s);
-                    gran2[s] = Gran2State{};
+                bool anyLoaded = false;
+                for (uint8_t s = 0; s < GRAN2_MAX_SAMPLES; s++)
+                    if (gran2[s].loaded || !gran2[s].path.isEmpty()) { anyLoaded = true; break; }
+                if (!anyLoaded && sdReady) {
+                    // Automap: fill slots 0-3 with first audio files in current SD folder
+                    uint8_t slot = 0;
+                    uint8_t numSamp = gran2NumSamples();
+                    for (int fi = 0; fi < sdFileCount && slot < numSamp; fi++) {
+                        if (sdFiles[fi] == ".." || sdFileIsDir[fi]) continue;
+                        if (!isAudioFile(sdFiles[fi].c_str())) continue;
+                        String fp = sdPath;
+                        if (!fp.endsWith("/")) fp += "/";
+                        fp += sdFiles[fi];
+                        gran2[slot].path     = fp;
+                        gran2[slot].loaded   = false;
+                        gran2[slot].computed = false;
+                        gran2[slot].sliceCount = 0;
+                        audioLoadGranular2Source(fp.c_str(), slot);
+                        slot++;
+                    }
+                    gran2LoadTarget = 0; gran2ActiveSample = -1; gran2ActiveSlice = -1; gran2PotNeedsSync = true;
+                } else {
+                    // Clear all loaded samples
+                    for (uint8_t r = 0; r < KBD_NOTE_ROWS; r++) for (uint8_t c = 0; c < KBD_COLS; c++)
+                        audioStopGranular2((uint8_t)(r * KBD_COLS + c));
+                    audioStopGranular2(GRAN2_SEQ_OSC);
+                    g_gran2SeqHead = g_gran2SeqTail = 0;
+                    for (uint8_t s = 0; s < GRAN2_MAX_SAMPLES; s++) {
+                        if (gran2[s].loaded) audioUnloadGranular2Slot(s);
+                        gran2[s] = Gran2State{};
+                    }
+                    gran2ActiveSample = -1; gran2ActiveSlice = -1;
+                    gran2LoadTarget = 0; gran2PotNeedsSync = true;
                 }
-                gran2ActiveSample = -1; gran2ActiveSlice = -1;
-                gran2LoadTarget = 0; gran2PotNeedsSync = true;
             }
             break;
         case MODE_TRACKER:
@@ -1682,13 +1641,12 @@ void drawScreen() {
                     int vp[4]; int vpc = 0;
                     for (int p = 0; p < 4; p++) if (fx.paramNames[p][0]) vp[vpc++] = p;
                     if (vpc == 0) continue;
-                    // Special case: FILT — Cut:Res sur l2, Atn:Typ(string) sur l3
+                    // Special case: FILT — Cut:Res sur l2, Typ sur l3
                     if (i == 0) {
                         char cv[8]; fmtFloat(cv, sizeof(cv), fx.params[0]);
                         char rv[8]; fmtFloat(rv, sizeof(rv), fx.params[1]);
                         snprintf(b.l2, sizeof(b.l2), "Cu:%s Re:%s", cv, rv);
-                        char av[8]; fmtFloat(av, sizeof(av), fx.params[2]);
-                        snprintf(b.l3, sizeof(b.l3), "At:%s %s", av, fxFiltTypName());
+                        snprintf(b.l3, sizeof(b.l3), "Ty:%s", fxFiltTypName());
                         continue;
                     }
                     // Special case: Delay shows level + BPM-synced time hint
@@ -2241,40 +2199,6 @@ void drawScreen() {
                 }
                 oled.drawHLine(0, 42, 128);
                 // Active note names
-                snprintf(buf,sizeof(buf),"Vol:%.0f%%",pots[0].value*100);
-                oled.drawStr(0,122,buf);
-                break;
-            }
-            // ---- MODULAR ----
-            case MODE_MODULAR: {
-                oled.drawStr(0,0,"MODULAR"); oled.drawHLine(0,9,128);
-                oled.setFont(u8g2_font_4x6_tf);
-                // P1: OSC shape
-                snprintf(buf,sizeof(buf),"P1 OSC  : %s (oct %d)",shapeNames[modShapeIdx],noteMap.getOctave());
-                oled.drawStr(0,18,buf);
-                // P2/P3: Filter
-                snprintf(buf,sizeof(buf),"P3 FILT : %uHz  P4 Q:%.1f",(unsigned)modCutoff,modReso);
-                oled.drawStr(0,27,buf);
-                // P4: Envelope
-                snprintf(buf,sizeof(buf),"P4 ENV  : %s",envNames[modEnvIdx]);
-                oled.drawStr(0,36,buf);
-                // P5/P6: LFO vibrato
-                snprintf(buf,sizeof(buf),"P5 LFO  : %.1fHz  P6 vib:%.1f st",modLfoRate,modLfoDepth);
-                oled.drawStr(0,45,buf);
-                // Joystick hint
-                oled.drawStr(0,54,"JY=bend  JX=velocity");
-                oled.setFont(u8g2_font_5x7_tf);
-                oled.drawHLine(0,58,128);
-                // Joystick X velocity indicator bar
-                {
-                    float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                    int barW=(int)((jx+1.0f)*0.5f*128.0f);
-                    oled.drawFrame(0,60,128,6);
-                    if(barW>2) oled.drawBox(0,60,barW,6);
-                    snprintf(buf,sizeof(buf),"vel %.0f%%",(0.8f+jx*0.6f)*100.0f);
-                    oled.drawStr(0,74,buf);
-                }
-                // Volume on last line
                 snprintf(buf,sizeof(buf),"Vol:%.0f%%",pots[0].value*100);
                 oled.drawStr(0,122,buf);
                 break;
@@ -3048,54 +2972,6 @@ void drawScreen() {
                 oled.drawStr(0,122,buf);
                 break;
             }
-            // ---- 303 — TB-303 emulation ----
-            case MODE_303: {
-                oled.setFont(u8g2_font_4x6_tf);
-                { snprintf(buf,sizeof(buf),"303 %s/%s %dBPM%s%s%s",
-                           t303Tones[t303ToneIdx].name, t303WaveName(t303Wave), bpm,
-                           t303AccentOn?" [A]":"",t303SlideOn?" [S]":"",
-                           t303SustainOn?" [Sus]":""); }
-                oled.drawStr(0,0,buf); oled.drawHLine(0,7,128);
-                snprintf(buf,sizeof(buf),"Cut:%4dHz  Res:%.1f",(int)t303Cutoff,t303Reso);
-                oled.drawStr(0,17,buf);
-                snprintf(buf,sizeof(buf),"Mod:%4dHz  Dur:%.0f%%",(int)t303EnvMod,t303Duration*100.0f);
-                oled.drawStr(0,26,buf);
-                { float pk=constrain(t303Cutoff+t303EnvMod,80.0f,8000.0f);
-                  snprintf(buf,sizeof(buf),"Oct:%+d  Pk:%.0fHz",t303Oct,pk); }
-                oled.drawStr(0,35,buf);
-                { float jx303=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                  float jy303=constrain(cachedJoyY/64.0f,-1.0f,1.0f);
-                  snprintf(buf,sizeof(buf),"JX:vel%+.0f%%  JY:flt%+.0f%%",jx303*40.0f,jy303*100.0f);
-                  oled.drawStr(0,44,buf); }
-                if(t303CurrentNote>0){
-                    static const char* nn[]={"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
-                    snprintf(buf,sizeof(buf),">> %s%d%s",
-                             nn[t303CurrentNote%12], t303CurrentNote/12-1,
-                             t303SlideActive?" ~glide~":"");
-                    oled.drawStr(0,55,buf);
-                }
-                oled.drawHLine(0,62,128);
-                {
-                    const int WX=0,WY=64,WW=128,WH=20,cy=WY+WH/2,ah=WH/2-2;
-                    oled.drawFrame(WX,WY,WW,WH);
-                    float p2=pots[1].value;
-                    { float wfBuf[126]; t303FillWaveform(t303Wave,p2,wfBuf,WW-2);
-                      int prev=cy;
-                      for(int i=0;i<WW-2;i++){
-                          int py=constrain(cy-(int)(wfBuf[i]*ah+0.5f),WY+1,WY+WH-2);
-                          if(i>0) oled.drawLine(WX+i,prev,WX+1+i,py); else oled.drawPixel(WX+1,py);
-                          prev=py;
-                      }
-                    }
-                }
-                oled.setFont(u8g2_font_6x10_tf);
-                oled.drawHLine(0,87,128);
-                snprintf(buf,sizeof(buf),"Cut:%-4d  Res:%.1f",(int)t303Cutoff,t303Reso);
-                oled.drawStr(0,101,buf);
-                snprintf(buf,sizeof(buf),"Dur:%.0f%%  Mod:%-4.1f",t303Duration*100.0f,t303EnvMod);
-                oled.drawStr(0,118,buf);
-                break;
-            }
             // ---- I303 — polyphonic TB-303 ----
             case MODE_I303: {
                 oled.setFont(u8g2_font_5x7_tf);
@@ -3144,120 +3020,6 @@ void drawScreen() {
                 oled.drawStr(0,118,buf);
                 break;
             }
-            // ---- GRANULAR ----
-            case MODE_GRANULAR: {
-                static const char* kGranModeStr[4] = {"8-SL","1/16","8-LP","16LP"};
-                oled.setFont(u8g2_font_4x6_tf);
-
-                // Trigger slice computation when source finishes loading
-                if (!granComputed && audioIsStreamingDone() && !audioIsGranularReady()) {
-                    audioSetGranularWindow(granWinStart, granWinEnd);
-                    granSliceCount = audioComputeGranularSlices(granSubMode & 1u, granWaveform);
-                    granComputed = (granSliceCount > 0);
-                    if (granComputed) {
-                        for (int i = 0; i <= granSliceCount; i++) granSplits[i] = i / (float)granSliceCount;
-                        granPotNeedsSync = true;
-                    }
-                }
-
-                if (!audioIsStreamingDone()) {
-                    // ---- LOADING PHASE ----
-                    oled.drawStr(0,7,"GRAN  Loading...");
-                    oled.drawHLine(0,9,128);
-                    oled.drawStr(0,118,"Clk=load B1=mode B2=FX");
-                    break;
-                }
-
-                if (!granComputed) {
-                    // ---- BROWSE PHASE: no sample loaded yet ----
-                    snprintf(buf,sizeof(buf),"GRAN [%s]", kGranModeStr[granSubMode]);
-                    oled.drawStr(0,7,buf); oled.drawHLine(0,9,128);
-                    // Show up to 13 files (7px line spacing, y=17 to y=101, then 118 for hint)
-                    for (int i=0; i<13 && (sdScroll+i)<sdFileCount; i++) {
-                        int fi = sdScroll+i;
-                        bool sel = (fi==sdCursor);
-                        snprintf(buf,sizeof(buf),"%c%.26s", sel?'>':(sdFileIsDir[fi]?'[':' '), sdFiles[fi].c_str());
-                        oled.drawStr(0, 17+i*7, buf);
-                        if (sel) oled.drawHLine(0, 18+i*7, 128);
-                    }
-                    oled.drawStr(0,118,"Joy=nav Clk=load B1=mode");
-                    break;
-                }
-
-                // ---- PLAY PHASE: sample loaded ----
-                snprintf(buf,sizeof(buf),"GRAN [%s] W:%.0f-%.0f%%",
-                         kGranModeStr[granSubMode], granWinStart*100.f, granWinEnd*100.f);
-                oled.drawStr(0,7,buf); oled.drawHLine(0,9,128);
-
-                // Waveform (y 10-32, height 23px)
-                for (int x=0;x<128;x++) {
-                    uint8_t h = (uint8_t)(granWaveform[x] * 21 / 255);
-                    if (h < 1) h=1;
-                    oled.drawVLine(x, 32 - h, h);
-                }
-                // Window boundaries
-                int wx0 = (int)(granWinStart * 128);
-                int wx1 = (int)(granWinEnd   * 128) - 1;
-                if (wx1 >= 128) wx1 = 127;
-                int gww = wx1 - wx0;
-                oled.drawVLine(wx0, 10, 23);
-                oled.drawVLine(wx1, 10, 23);
-
-                // Slice highlight using granSplits positions: XOR when key held, frame when selected
-                if (granPlayingSlice >= 0 && granPlayingSlice < granSliceCount) {
-                    int sx0 = wx0 + (int)(granSplits[granPlayingSlice]   * gww);
-                    int sx1 = wx0 + (int)(granSplits[granPlayingSlice+1] * gww);
-                    if (granKeyHeld) {
-                        oled.setDrawColor(2);
-                        oled.drawBox(sx0, 10, sx1 - sx0, 23);
-                        oled.setDrawColor(1);
-                    } else {
-                        oled.drawFrame(sx0, 10, sx1 - sx0, 23);
-                    }
-                }
-
-                // Split dividers + mini arrows below waveform (y=33-39)
-                if (granSliceCount > 0) {
-                    for (int i = 0; i <= granSliceCount; i++) {
-                        int x = wx0 + (int)(granSplits[i] * gww);
-                        oled.drawVLine(x, 10, 23);  // divider line through waveform
-                        oled.drawVLine(x, 33, 4);   // tick mark below waveform
-                    }
-                    if (granPlayingSlice >= 0 && granPlayingSlice < granSliceCount) {
-                        int sx0 = wx0 + (int)(granSplits[granPlayingSlice]   * gww);
-                        int sx1 = wx0 + (int)(granSplits[granPlayingSlice+1] * gww);
-                        oled.drawHLine(sx0+1, 37, sx1 - sx0 - 1);
-                        int mx = (sx0 + sx1) / 2;
-                        oled.drawPixel(mx, 38);
-                        oled.drawHLine(mx-1, 39, 3);
-                    }
-                }
-
-                // Info line (y=42): split positions when slice selected, row hint otherwise
-                static const char* kGranRowHint[4] = {
-                    "R0:px R1:px+px+1 R2:tail R3:rev",
-                    "R0-1:1/16  R2-3:1/16Lp",
-                    "All: 1/8 loop",
-                    "All: 1/16 loop"
-                };
-                if (granPlayingSlice >= 0 && granPlayingSlice < granSliceCount) {
-                    int x = granPlayingSlice;
-                    snprintf(buf,sizeof(buf),"Sl%d S%d:%.0f%% S%d:%.0f%% P3/P4",
-                             x, x, granSplits[x]*100.f, x+1, granSplits[x+1]*100.f);
-                    oled.drawStr(0, 42, buf);
-                } else {
-                    oled.drawStr(0, 42, kGranRowHint[granSubMode]);
-                }
-
-                // File browser in play phase (8 entries at 7px spacing, y=51..105)
-                for (int i=0; i<8 && (sdScroll+i)<sdFileCount; i++) {
-                    int fi = sdScroll+i;
-                    snprintf(buf,sizeof(buf),"%c%.26s", (fi==sdCursor)?'>':(sdFileIsDir[fi]?'[':' '), sdFiles[fi].c_str());
-                    oled.drawStr(0, 51+i*7, buf);
-                }
-                oled.drawStr(0,118,"Joy=nav Clk=load B1=mode B2=FX");
-                break;
-            }
             // ---- GRANULAR2 ----
             case MODE_GRANULAR2: {
                 oled.setFont(u8g2_font_4x6_tf);
@@ -3284,7 +3046,7 @@ void drawScreen() {
                 }
 
                 // Header — include per-sample load status as compact chars after mode tag
-                static const char* kGran2ModeStr[3] = {"NRM","LOP","FUL"};
+                static const char* kGran2ModeStr[4] = {"NRM","LOP","FUL","SEQ"};
                 {
                     char st[5] = "----";
                     for (uint8_t s = 0; s < numSamp && s < 4; s++) {
@@ -3294,7 +3056,7 @@ void drawScreen() {
                         else                                                  st[s] = '-';
                     }
                     st[numSamp] = '\0';
-                    snprintf(buf, sizeof(buf), "GR2[%s] T%d %s", kGran2ModeStr[gran2PlayMode], gran2LoadTarget, st);
+                    snprintf(buf, sizeof(buf), "GRANU[%s] T%d %s", kGran2ModeStr[gran2PlayMode], gran2LoadTarget, st);
                 }
                 oled.drawStr(0, 7, buf); oled.drawHLine(0, 9, 128);
 
@@ -3404,10 +3166,14 @@ void drawScreen() {
                                 o2 += snprintf(l2 + o2, sizeof(l2) - o2, " %.3s=%s", pp[i].name, pp[i].val);
                             oled.drawStr(0, 118, l2 + 1); // skip leading space
                         } else {
-                            oled.drawStr(0, 118, "B1=FX B2=mode B3=Tgt B4=Clr");
+                            bool g2AnyLoaded2 = false;
+                            for (uint8_t _s=0;_s<GRAN2_MAX_SAMPLES;_s++) if(gran2[_s].loaded||!gran2[_s].path.isEmpty()){g2AnyLoaded2=true;break;}
+                            oled.drawStr(0, 118, g2AnyLoaded2 ? "B1=FX B2=mode B3=Tgt B4=Clr" : "B1=FX B2=mode B3=Tgt B4=auto");
                         }
                     } else {
-                        oled.drawStr(0, 118, "B1=FX B2=mode B3=Tgt B4=Clr");
+                        bool g2AnyLoaded2 = false;
+                        for (uint8_t _s=0;_s<GRAN2_MAX_SAMPLES;_s++) if(gran2[_s].loaded||!gran2[_s].path.isEmpty()){g2AnyLoaded2=true;break;}
+                        oled.drawStr(0, 118, g2AnyLoaded2 ? "B1=FX B2=mode B3=Tgt B4=Clr" : "B1=FX B2=mode B3=Tgt B4=auto");
                     }
                 }
                 break;
@@ -3742,34 +3508,6 @@ static void updateLedsAndShow()
                 }
                 break;
             }
-            case MODE_303: {
-                for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
-                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
-                    int li=(idx>=0&&idx<NUM_LEDS+4)?crdToIdx(idx,0):-1;
-                    if(li<0||li>=NUM_LEDS) continue;
-                    if (kbdLayout == KBD_LAYOUT_PIANO) {
-                        int8_t off = pianoPad[r][c];
-                        if (off < 0) { leds[li]=CRGB::Black; continue; }
-                        bool white = (0xAB5 >> (off % 12)) & 1;
-                        bool pr = keyState[r][c];
-                        uint8_t thisNote = (uint8_t)constrain(
-                            (int)(48 + noteMap.getOctave()*12) + off + (int)t303Oct*12, 0, 127);
-                        bool playing = (thisNote == t303CurrentNote && t303CurrentNote != 0);
-                        if (playing)     leds[li] = t303AccentOn ? CHSV(40,255,255) : CHSV(0,255,255);
-                        else if (pr)     leds[li] = CHSV(15, 220, 180);
-                        else             leds[li] = white ? CHSV(28,200,55) : CHSV(128,255,55);
-                    } else {
-                        uint8_t base = noteMap.getMidiNote(r, c);
-                        uint8_t note = (uint8_t)constrain((int)base + (int)t303Oct*12, 0, 127);
-                        bool playing = (note == t303CurrentNote && t303CurrentNote != 0);
-                        bool pressed = keyState[r][c];
-                        if(playing)      leds[li] = t303AccentOn ? CHSV(40,255,255) : CHSV(0,255,255);
-                        else if(pressed) leds[li] = CHSV(15, 220, 180);
-                        else             leds[li] = CHSV(10, 180, 15);
-                    }
-                }
-                break;
-            }
             case MODE_DRUM2: {
                 // Pad hue = rainbow across 8 pads (uniform step of 32)
                 // so each pad has a clearly distinct but logically ordered color
@@ -4007,31 +3745,12 @@ static void updateLedsAndShow()
                 }
                 break;
             }
-            case MODE_GRANULAR: {
-                if(!granComputed){
-                    // Browser phase: show nothing (file list on OLED)
-                    break;
-                }
-                // Highlight active slice regions per row based on sub-mode
-                for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
-                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c;
-                    int idx=gr*KBD_COLS+gc;
-                    if(idx<0||idx>=NUM_LEDS+4) continue;
-                    int li=crdToIdx(idx,0);
-                    if(li<0||li>=NUM_LEDS) continue;
-                    // dim base colour: row 0=green, 1=cyan, 2=blue, 3=magenta (reverse)
-                    static const uint8_t granHues[4]={85,128,170,213};
-                    uint8_t bri = keyState[r][c] ? 255 : 30;
-                    leds[li] = CHSV(granHues[r], 200, bri);
-                }
-                break;
-            }
             case MODE_GRANULAR2: {
                 // Per-sample hue: S0=green, S1=cyan, S2=blue, S3=magenta; fwd=brighter, rev=dimmer
                 static const uint8_t g2Hues[4] = {85, 128, 170, 213};
                 uint8_t g2NumSamp = gran2NumSamples();
-                // NRM: dim idle glow shows loaded samples. LOOP/FULL: dark unless pressed.
-                bool g2IdleOn = (gran2PlayMode == 0);
+                // NRM/SEQ: dim idle glow shows loaded samples. LOOP/FULL: dark unless pressed.
+                bool g2IdleOn = (gran2PlayMode == 0 || gran2PlayMode == 3);
                 for (int r = 0; r < KBD_NOTE_ROWS; r++) for (int c = 0; c < KBD_COLS; c++) {
                     uint8_t si, sl; bool rev;
                     gran2KeyInfo((uint8_t)r, (uint8_t)c, si, sl, rev);
@@ -4365,19 +4084,6 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             }
             break;
         }
-        case MODE_MODULAR:{
-            uint8_t note=noteMap.getMidiNote(row,col);
-            activeNotes[row][col]=pressed?note:0;
-            if(pressed){
-                // Joystick X → velocity: center=0.8, full tilt = ±0.6
-                float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                float vel=constrain(0.8f+jx*0.6f, 0.05f, 1.5f);
-                audioNoteOn(note, vel);
-            } else {
-                audioNoteOff(note);
-            }
-            break;
-        }
         case MODE_HYBRID:{
             uint8_t note=noteMap.getMidiNote(row,col);
             uint8_t kidx=(uint8_t)(row*8+col);
@@ -4442,61 +4148,6 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     playI303On(note, vel);
                 } else {
                     playI303Off(note);
-                }
-            }
-            break;
-        }
-        case MODE_303: {
-            uint8_t base;
-            if (kbdLayout == KBD_LAYOUT_PIANO) {
-                base = pianoNote(row, col, (uint8_t)(48 + noteMap.getOctave()*12));
-                if (base == 0xFF) return;
-            } else {
-                base = noteMap.getMidiNote(row, col);
-            }
-            uint8_t note = (uint8_t)constrain((int)base + (int)t303Oct * 12, 0, 127);
-            if (arpMode != 0) {
-                // Arp mode: manage arpNotes[] like SYNTH does; arp loop calls audioT303NoteOn
-                if (pressed) {
-                    bool found=false;
-                    for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){found=true;break;}
-                    if(!found&&arpNoteCount<32) arpNotes[arpNoteCount++]=note;
-                } else {
-                    for(uint8_t i=0;i<arpNoteCount;i++) if(arpNotes[i]==note){
-                        memmove(&arpNotes[i],&arpNotes[i+1],(arpNoteCount-i-1));
-                        arpNoteCount--;
-                        break;
-                    }
-                    if(arpNoteCount==0&&arpCurrent!=0){audioT303NoteOff(arpCurrent);arpCurrent=0;}
-                }
-                break;
-            }
-            // Direct play (no arp)
-            if (pressed) {
-                if (t303SlideOn && t303CurrentNote != 0) {
-                    float initSemis = (float)(int8_t)((int)t303CurrentNote - (int)note);
-                    audioT303PitchBend(powf(2.0f, initSemis / 12.0f));
-                    t303SlideFrom = t303CurrentNote;
-                    t303SlideTo   = note;
-                    t303SlideMs   = millis();
-                    t303SlideActive = true;
-                } else {
-                    t303SlideActive = false;
-                    audioT303PitchBend(1.0f);
-                }
-                { float jx303=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                  float vel303=constrain((t303AccentOn?1.2f:0.7f)+jx303*0.4f,0.1f,1.5f);
-                  playBassOn(note, vel303);
-                  Serial.printf("N+:%d:%d\n", note, (int)(vel303*100)); }
-                t303CurrentNote  = note;
-                t303PressedRow   = (int8_t)row;
-                t303PressedCol   = (int8_t)col;
-            } else {
-                if ((int8_t)row == t303PressedRow && (int8_t)col == t303PressedCol) {
-                    playBassOff(note);
-                    t303CurrentNote = 0;
-                    t303PressedRow  = -1;
-                    t303PressedCol  = -1;
                 }
             }
             break;
@@ -4796,38 +4447,25 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             }
             break;
         }
-        case MODE_GRANULAR: {
-            if (!granComputed) break;
-            uint8_t oscIdx = (uint8_t)(row * 8 + col);
-            if (pressed) {
-                uint16_t preset = granPresetForKey(row, col);
-                bool   loop    = granIsLoop(row);
-                audioPlayGranularSlice(oscIdx, preset, volume, loop);
-                granKeyHeld = true;
-                // Slice index = col position (0=left/start of sample, 7=right)
-                if ((granSubMode & 1u) == 0) {
-                    granPlayingSlice = (int8_t)(7u - col);  // 8-slice: all rows share same 0-7 index
-                } else {
-                    // 16-slice: rows 0/2 → 0-7, rows 1/3 → 8-15
-                    granPlayingSlice = (row == 1 || row == 3) ? (int8_t)(15u - col) : (int8_t)(7u - col);
-                }
-                // Re-sync pot baselines so the pot's current physical position becomes the new
-                // delta reference — both directions are accessible regardless of where the pot sits.
-                granPotNeedsSync = true;
-            } else {
-                audioStopGranularOsc(oscIdx);
-                granKeyHeld = false;
-                // granPlayingSlice intentionally kept: pots still control last played slice
-            }
-            break;
-        }
         case MODE_GRANULAR2: {
             uint8_t sampleIdx, sliceIdx; bool reverse;
             gran2KeyInfo(row, col, sampleIdx, sliceIdx, reverse);
             if (sampleIdx >= gran2NumSamples()) break;
             if (!gran2[sampleIdx].computed) break;
             uint8_t keyOsc = (uint8_t)(row * 8 + col);
-            if (pressed) {
+            if (gran2PlayMode == 3) {
+                // SEQ: on press enqueue; no action on release (playback is timer-driven)
+                if (pressed) {
+                    g_gran2SeqVolume = volume;
+                    uint8_t next = (g_gran2SeqTail + 1) % GRAN2_SEQ_MAX;
+                    if (next != g_gran2SeqHead) {
+                        bool wasEmpty = (g_gran2SeqHead == g_gran2SeqTail);
+                        g_gran2SeqQueue[g_gran2SeqTail] = {sampleIdx, sliceIdx, reverse};
+                        g_gran2SeqTail = next;
+                        if (wasEmpty) gran2SeqStartHead();
+                    }
+                }
+            } else if (pressed) {
                 if (gran2PlayMode == 2) {
                     // FUL: build [tail_from_slice, full_sample] buffer → "N 0 1 2 N 0 1 2…"
                     float sf = reverse
@@ -5040,46 +4678,28 @@ void loop() {
         bool isBrw = !menuOpen && sdReady &&
             (currentMode==MODE_SS2 ||
              currentMode==MODE_SAMPLE ||
-             currentMode==MODE_GRANULAR || currentMode==MODE_GRANULAR2);
-        if (click && !lastClick) { joyClickMs = isBrw ? millis() : 0; joyLongFired = false; }
+             currentMode==MODE_GRANULAR2);
+        if (click && !lastClick) { joyClickMs = isBrw ? millis() : 0; joyLongFired = false; joyBrwActed = false; }
     }
-    if (click && !joyLongFired && joyClickMs && (millis() - joyClickMs >= 600)) {
+    if (click && !joyLongFired && !joyBrwActed && joyClickMs && (millis() - joyClickMs >= 600)) {
         joyLongFired = true;
         bool isBrowserMode = !menuOpen && sdReady &&
             (currentMode==MODE_SS2 ||
              currentMode==MODE_SAMPLE ||
-             currentMode==MODE_GRANULAR || currentMode==MODE_GRANULAR2);
+             currentMode==MODE_GRANULAR2);
         if (isBrowserMode) {
-            if (sdPath == "/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true; }
-            else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1)); sdScroll=0; sdCursor=0; }
+            audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true;
         }
     }
     if (click && !lastClick && !joyLongFired) {
         if (s_overlay == OVERLAY_INSTR) {
             // Joystick click: confirm selected instrument and close browser
             s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
+            joyLongFired = true;
         } else if(menuOpen){
             selectMenuItem();
-        } else if(currentMode==MODE_GRANULAR&&sdReady){
-            // Granular: click navigates folders or loads selected file as granular source
-            if(sdCursor<sdFileCount){
-                if(sdFiles[sdCursor]==".."){
-                    if(sdPath=="/"){audioAllNotesOff();menuOpen=true;menuRow=0;menuCol=0;}
-                    else{int ls=sdPath.lastIndexOf('/',sdPath.length()-2);sdListDir(ls<=0?"/":sdPath.substring(0,ls+1));}
-                } else if(sdFileIsDir[sdCursor]){
-                    String np=sdPath; if(!np.endsWith("/"))np+="/"; np+=sdFiles[sdCursor]; sdListDir(np);
-                } else if(isAudioFile(sdFiles[sdCursor].c_str())){
-                    granFilePath = buildSdFilePath();
-                    audioLoadGranularSource(granFilePath.c_str());
-                    granComputed = false;
-                    granWinStart = 0.0f; granWinEnd = 1.0f;
-                    granPlayingSlice = -1; granKeyHeld = false;
-                    for (int i = 0; i <= GRANULAR_MAX_SLICES; i++) granSplits[i] = 0.0f;
-                    granPotNeedsSync = true;
-                }
-            }
+            joyLongFired = true;
         } else if(currentMode==MODE_GRANULAR2&&sdReady){
-            // Granular2: click navigates or loads file into gran2LoadTarget slot
             if(sdCursor<sdFileCount){
                 if(sdFiles[sdCursor]==".."){
                     if(sdPath=="/"){audioAllNotesOff();menuOpen=true;menuRow=0;menuCol=0;}
@@ -5088,11 +4708,6 @@ void loop() {
                     String np=sdPath; if(!np.endsWith("/"))np+="/"; np+=sdFiles[sdCursor]; sdListDir(np);
                 } else if(isAudioFile(sdFiles[sdCursor].c_str())){
                     uint8_t t = gran2LoadTarget;
-                    // Unload the old slot first: pcm_load (inside the service task) will call
-                    // pcm_unload_preset on the source, freeing the buffer that FWD extern16
-                    // presets still reference. Stopping + unloading here prevents dangling pointers
-                    // during the load window, which caused FWD to play garbage while REV (using
-                    // its own PSRAM copy) still worked.
                     for (uint8_t r = 0; r < KBD_NOTE_ROWS; r++) {
                         for (uint8_t c = 0; c < KBD_COLS; c++) {
                             uint8_t si, sl; bool rv;
@@ -5107,7 +4722,6 @@ void loop() {
                     gran2[t].sliceCount = 0;
                     for (int i = 0; i <= GRAN2_MAX_SLICES; i++) gran2[t].splits[i] = 0.0f;
                     audioLoadGranular2Source(gran2[t].path.c_str(), t);
-                    // Advance load target to next empty slot if available
                     uint8_t numSamp = gran2NumSamples();
                     for (uint8_t ns = 1; ns < numSamp; ns++) {
                         uint8_t next = (t + ns) % numSamp;
@@ -5115,6 +4729,7 @@ void loop() {
                     }
                 }
             }
+            joyBrwActed = true;  // block long-press: short click already acted
         } else if(currentMode==MODE_SAMPLE&&sdReady){
             if(sdCursor<sdFileCount){
                 if(sdFiles[sdCursor]==".."){
@@ -5128,6 +4743,7 @@ void loop() {
                     audioLoadAndPlay(fp.c_str(), PCM_PREVIEW_PRESET, volume);
                 }
             }
+            joyBrwActed = true;  // block long-press: short click already acted
         } else if (currentMode==MODE_SS2 && sdReady) {
             if (sdCursor < sdFileCount) {
                 if (sdFiles[sdCursor]=="..") {
@@ -5146,16 +4762,14 @@ void loop() {
                     if(ss2SelSlot < SS2_SLOTS-1) ss2SelSlot++;
                 }
             }
+            joyBrwActed = true;  // block long-press: short click already acted
         } else {
             audioAllNotesOff(); omniRoot=0xFF; omniStrumPos=-1;
             menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true;
+            joyLongFired = true;
         }
-        // A short-click was handled — prevent the long-click from also firing for this same press.
-        // Without this, holding the joystick >600ms after a folder entry would trigger the
-        // long-click and immediately navigate back to parent.
-        joyLongFired = true;
     }
-    if (!click) { joyClickMs = 0; joyLongFired = false; }
+    if (!click) { joyClickMs = 0; joyLongFired = false; joyBrwActed = false; }
     lastClick=click;
 
     // ---- OMNICHORD STRUM ----
@@ -5401,8 +5015,8 @@ void loop() {
         }
     }
 
-    // ---- ARPEGGIATOR (MODE_SYNTH + MODE_303, speed = BPM 16th notes) ----
-    bool arpActive = (currentMode==MODE_SYNTH || currentMode==MODE_303 || currentMode==MODE_I303) && arpMode!=0 && !menuOpen;
+    // ---- ARPEGGIATOR (MODE_SYNTH + MODE_I303, speed = BPM 16th notes) ----
+    bool arpActive = (currentMode==MODE_SYNTH || currentMode==MODE_I303) && arpMode!=0 && !menuOpen;
     if(arpActive){
         static unsigned long lastArp=0;
         unsigned long ARP_MS = max(10UL, 60000UL / (unsigned long)bpm / 4); // 16th note
@@ -5428,10 +5042,6 @@ void loop() {
                 if(arpCurrent!=0) playI303Off(arpCurrent);
                 float vel303=constrain(0.75f+(cachedJoyX/64.0f)*0.4f,0.1f,1.5f);
                 playI303On(noteToPlay, vel303);
-            } else if (currentMode==MODE_303) {
-                if(arpCurrent!=0) audioT303NoteOff(arpCurrent);
-                float vel303=constrain((t303AccentOn?1.2f:0.7f)+(cachedJoyX/64.0f)*0.4f,0.1f,1.5f);
-                audioT303NoteOn(noteToPlay, vel303);
             } else {
                 if(arpCurrent!=0) audioNoteOff(arpCurrent);
                 audioNoteOn(noteToPlay,0.8f);
@@ -5439,7 +5049,6 @@ void loop() {
             arpCurrent=noteToPlay;
         } else if(arpNoteCount==0&&arpCurrent!=0){
             if(currentMode==MODE_I303) playI303Off(arpCurrent);
-            else if(currentMode==MODE_303) audioT303NoteOff(arpCurrent);
             else audioNoteOff(arpCurrent);
             arpCurrent=0;
         }
@@ -5604,38 +5213,6 @@ void loop() {
                     // Nothing to do here; values used in LED rendering section.
                     break;
                 }
-                case MODE_MODULAR: {
-                    // P1=OSC  P2=BPM(global)  P3=Cutoff  P4=Reso  P5=LFO rate  P6=LFO depth
-                    static float lpm[5]={-1,-1,-1,-1,-1};
-                    if(fabsf(pots[1].value-lpm[0])>0.005f){
-                        uint8_t ns=(uint8_t)(pots[1].value*((float)SHAPE_COUNT-0.01f));
-                        if(ns!=modShapeIdx){ modShapeIdx=ns; audioSetShape((SynthShape)modShapeIdx); }
-                        lpm[0]=pots[1].value;
-                    }
-                    // P3 = Filter Cutoff — exponential 80Hz→8000Hz
-                    if(fabsf(pots[3].value-lpm[1])>0.002f){
-                        modCutoff=80.0f*powf(100.0f, pots[3].value);
-                        audioSetFilter(modCutoff, modReso);
-                        lpm[1]=pots[3].value;
-                    }
-                    // P4 = Filter Resonance — 0.5→6
-                    if(fabsf(pots[4].value-lpm[2])>0.002f){
-                        modReso=0.5f+pots[4].value*2.5f;  // 0.5→3.0
-                        audioSetFilter(modCutoff, modReso);
-                        lpm[2]=pots[4].value;
-                    }
-                    // P5 = LFO Rate — 0.1→20Hz
-                    if(fabsf(pots[5].value-lpm[3])>0.002f){
-                        modLfoRate=0.1f+pots[5].value*19.9f;
-                        lpm[3]=pots[5].value;
-                    }
-                    // P6 = LFO Depth — 0→2 semitones
-                    if(fabsf(pots[6].value-lpm[4])>0.002f){
-                        modLfoDepth=pots[6].value*2.0f;
-                        lpm[4]=pots[6].value;
-                    }
-                    break;
-                }
                 case MODE_SAMPLE:
                 case MODE_HYBRID: {
                     // Pots 3-6 = active FX params (same as SYNTH mode)
@@ -5660,69 +5237,6 @@ void loop() {
                         }
                         if(changed) applyAllFx();
                     }
-                    break;
-                }
-                case MODE_303: {
-                    // When FX overlay is open, redirect pots to FX param control (same as MODE_FX)
-                    if (s_overlay == OVERLAY_FX) {
-                        if (fxList[fxSelected].active) {
-                            static float lp303fx[4]={-1,-1,-1,-1};
-                            static uint8_t lp303FxSel=0xFF;
-                            if (lp303FxSel!=fxSelected || fxPotNeedSync) {
-                                for (int p=0;p<4;p++) lp303fx[p]=pots[3+p].value;
-                                lp303FxSel=fxSelected; fxPotNeedSync=false;
-                            }
-                            bool fxChanged=false;
-                            for (int p=0;p<4;p++) {
-                                if (fxList[fxSelected].paramNames[p][0]=='\0') continue;
-                                if (fabsf(pots[3+p].value-lp303fx[p])>0.001f) {
-                                    float mn=fxList[fxSelected].paramMin[p];
-                                    float mx=fxList[fxSelected].paramMax[p];
-                                    if (fxSelected==0 && p==0)
-                                        fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
-                                    else if (fxSelected==0 && p==3) {
-                                        fxList[0].params[3]=floorf(pots[3+p].value*2.9999f);
-                                        s_filtMetaChanged=true;
-                                    } else {
-                                        fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
-                                        if (fxSelected==0) s_filtMetaChanged=true;
-                                    }
-                                    lp303fx[p]=pots[3+p].value;
-                                    fxChanged=true;
-                                }
-                            }
-                            if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
-                            else if (fxChanged && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
-                        }
-                        // Keep 303 pot baselines in sync with current pot positions so closing
-                        // the FX overlay doesn't cause phantom 303 param jumps (e.g. resonance
-                        // spiking because a pot was moved to control reverb level).
-                        for (int p = 0; p < 4; p++) lp303[p] = pots[3+p].value;
-                        break;
-                    }
-                    // P2 = 3-zone waveform morph: SAW(0-0.33) → TRI(0.33-0.67) → SQR+duty(0.67-1)
-                    {
-                        static float lp303wf=-1.0f;
-                        if(fabsf(pots[1].value-lp303wf)>0.005f){
-                            float p2=pots[1].value;
-                            uint8_t nw=(p2<0.33f)?SAW_DOWN:(p2<0.67f)?TRIANGLE:PULSE;
-                            if(nw!=t303Wave){
-                                t303Wave=nw;
-                                if(audioReady){ audioT303Wave(nw); audioT303Wavefold(0.0f); audioT303Feedback(0.0f); }
-                            }
-                            if(t303Wave==PULSE){
-                                float norm=(p2-0.67f)/0.33f;
-                                if(audioReady) audioT303Duty(0.5f-norm*0.48f);
-                            }
-                            lp303wf=p2;
-                        }
-                    }
-                    bool ch303=false;
-                    if(fabsf(pots[3].value-lp303[0])>0.002f){ t303Reso=1.0f+pots[3].value*2.0f;           lp303[0]=pots[3].value; ch303=true; }
-                    if(fabsf(pots[4].value-lp303[1])>0.002f){ t303EnvMod=pots[4].value*10.0f;              lp303[1]=pots[4].value; ch303=true; }
-                    if(fabsf(pots[5].value-lp303[2])>0.002f){ t303Duration=pots[5].value; lp303[2]=pots[5].value; audioT303SetSustain(t303Duration); }
-                    if(fabsf(pots[6].value-lp303[3])>0.002f){ t303Cutoff=80.0f*powf(25.0f,pots[6].value); lp303[3]=pots[6].value; ch303=true; }
-                    if(ch303 && audioReady) audioT303Params(t303Cutoff,t303Reso,t303EnvMod,t303Decay);
                     break;
                 }
                 case MODE_303S: {
@@ -5975,40 +5489,19 @@ void loop() {
             // Converge raw cutoff (anti-zipper)
             float prevCut = lpfSmoothCut;
             lpfSmoothCut += (fxList[0].params[0] - lpfSmoothCut) * 0.5f;
-            // Atn: 0=bypass (eff_cut→open), 1=full (eff_cut=raw)
-            uint8_t fti = (uint8_t)constrain((int)roundf(fxList[0].params[3]), 0, 2);
-            float   atn = fxList[0].params[2];
-            float   rawRes = fxList[0].params[1];
-            float   effCut = (fti==0) ? (18000.0f + atn*(lpfSmoothCut-18000.0f)) :
-                             (fti==1) ? (20.0f    + atn*(lpfSmoothCut-20.0f))    :
-                                         lpfSmoothCut;
-            float   effRes = (fti==2) ? (0.5f + atn*(rawRes-0.5f)) : rawRes;
+            float   effCut = lpfSmoothCut;
+            float   effRes = fxList[0].params[1];
             audioSetFilterFreq(effCut, effRes);
-            // T303_CH needs its own event
-            if (currentMode == MODE_303) {
-                amy_event t3e = amy_default_event();
-                t3e.synth = T303_CH;
-                t3e.filter_freq_coefs[COEF_CONST] = effCut;
-                t3e.filter_freq_coefs[COEF_EG0]   = t303EnvMod;
-                t3e.resonance = effRes;
-                amy_add_event(&t3e);
-            }
             if (fabsf(lpfSmoothCut - prevCut) > 1.0f)
                 audioSetGranular2FilterFreq(effCut, effRes);
         }
 
-        // MODULAR: joystick Y pitch bend + LFO vibrato (10ms tick)
-        if(currentMode==MODE_MODULAR&&!menuOpen&&audioReady){
-            static float modLfoPhase=0.0f;
-            // Advance LFO
-            modLfoPhase += modLfoRate * 2.0f * (float)M_PI * 0.01f;
-            if(modLfoPhase > 2.0f*(float)M_PI) modLfoPhase -= 2.0f*(float)M_PI;
-            // Joystick Y → pitch bend (same behaviour as SYNTH mode)
-            float jy = cachedJoyY / 64.0f;
-            float baseBend = (fabsf(jy) < 0.15f) ? 0.0f : -jy * 2.0f;  // ±2 semitones
-            // LFO → vibrato: sinusoidal ±modLfoDepth semitones
-            float vibrato = (modLfoDepth > 0.01f) ? sinf(modLfoPhase) * modLfoDepth : 0.0f;
-            audioSetPitchBend(powf(2.0f, (baseBend + vibrato) / 12.0f));
+        // GR2 SEQ: advance queue when current slice ends
+        if (currentMode==MODE_GRANULAR2 && gran2PlayMode==3 && audioReady) {
+            if (g_gran2SeqHead != g_gran2SeqTail && (int32_t)(millis() - g_gran2SeqEndMs) >= 0) {
+                g_gran2SeqHead = (g_gran2SeqHead + 1) % GRAN2_SEQ_MAX;
+                gran2SeqStartHead();  // retriggering the OSC stops the old slice seamlessly
+            }
         }
 
         // MOD2: joystick Y pitch bend + LFO (10ms tick)
@@ -6074,7 +5567,7 @@ void loop() {
         }
 
         // 303 portamento slide: interpolate pitch_bend from t303SlideFrom to t303SlideTo
-        if((currentMode==MODE_303||currentMode==MODE_303S) && t303SlideActive && audioReady){
+        if(currentMode==MODE_303S && t303SlideActive && audioReady){
             unsigned long elapsed = millis() - t303SlideMs;
             unsigned long slideDur = max(30UL, 60000UL / (unsigned long)bpm / 4); // one 16th note
             if(elapsed >= slideDur){
@@ -6084,22 +5577,6 @@ void loop() {
                 float frac  = (float)elapsed / (float)slideDur;
                 float semis = (float)(int8_t)((int)t303SlideFrom - (int)t303SlideTo) * (1.0f - frac);
                 audioT303PitchBend(powf(2.0f, semis / 12.0f));
-            }
-        }
-
-        // 303 joystick Y: real-time filter cutoff offset (push up = filter opens)
-        if(currentMode==MODE_303 && !menuOpen && audioReady){
-            static float last303CutSent = -1.0f;
-            float jy303 = cachedJoyY / 64.0f;
-            float jyOff = (fabsf(jy303) > 0.12f) ? jy303 * 2500.0f : 0.0f;
-            float effCut = constrain(t303Cutoff + jyOff, 80.0f, 8000.0f);
-            if (fabsf(effCut - last303CutSent) > 15.0f) {
-                amy_event e = amy_default_event();
-                e.synth = T303_CH;
-                e.filter_freq_coefs[COEF_CONST] = effCut;
-                e.filter_freq_coefs[COEF_EG0]   = t303EnvMod;  // pair with EG0 — must always send both
-                amy_add_event(&e);
-                last303CutSent = effCut;
             }
         }
 
@@ -6237,120 +5714,6 @@ void loop() {
             }
         }
 #endif
-
-        // GRANULAR pots: frame-by-frame delta — no jump on slice change, fully bidirectional.
-        // Pot A (pots[3]) → sx or window start.  Pot B (pots[4]) → sx+1 or window end.
-        // Split control: pure delta — the pot's movement (not position) is applied to the
-        // split. Baseline re-syncs on every key press and on state changes (sub-mode toggle,
-        // new sample load) so the pots are always responsive immediately.
-        // Bidirectional cascade keeps splits[] non-decreasing: if sx crosses a neighbor,
-        // that neighbor is pushed to sx and the propagation continues outward.
-        if (currentMode==MODE_GRANULAR && granComputed && audioReady) {
-            static float lastPA = 0.0f, lastPB = 0.0f;
-            static unsigned long winDebMs = 0;
-
-            if (granPotNeedsSync) {
-                granPotNeedsSync = false;
-                lastPA = pots[3].value;
-                lastPB = pots[4].value;
-            }
-
-            if (s_overlay == OVERLAY_FX) {
-                // FX overlay active: pots control the selected effect instead of splits.
-                if (fxList[fxSelected].active) {
-                    static float lpGranFx[4] = {-1,-1,-1,-1};
-                    static uint8_t lpGranFxSel = 0xFF;
-                    if (lpGranFxSel != fxSelected || fxPotNeedSync) {
-                        for (int p = 0; p < 4; p++) lpGranFx[p] = pots[3+p].value;
-                        lpGranFxSel = fxSelected; fxPotNeedSync = false;
-                    }
-                    bool fxChanged = false;
-                    for (int p = 0; p < 4; p++) {
-                        if (fxList[fxSelected].paramNames[p][0] == '\0') continue;
-                        if (fabsf(pots[3+p].value - lpGranFx[p]) > 0.001f) {
-                            float mn = fxList[fxSelected].paramMin[p];
-                            float mx = fxList[fxSelected].paramMax[p];
-                            if (fxSelected == 0 && p == 0)
-                                fxList[0].params[0] = mn * powf(mx/mn, pots[3].value);
-                            else if (fxSelected == 0 && p == 3) {
-                                fxList[0].params[3] = floorf(pots[3+p].value * 2.9999f);
-                                s_filtMetaChanged = true;
-                            } else {
-                                fxList[fxSelected].params[p] = mn + (mx - mn) * pots[3+p].value;
-                                if (fxSelected==0) s_filtMetaChanged=true;
-                            }
-                            lpGranFx[p] = pots[3+p].value;
-                            fxChanged = true;
-                        }
-                    }
-                    if (fxChanged && fxSelected != 0) applyFxEffect(fxSelected);
-                    else if (fxChanged && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
-                }
-                lastPA = pots[3].value; lastPB = pots[4].value;
-            } else if (granPlayingSlice >= 0 && granPlayingSlice < granSliceCount) {
-                // --- Split control (delta, bidirectional cascade) ---
-                int x = granPlayingSlice;
-                float dpA = pots[3].value - lastPA;
-                float dpB = pots[4].value - lastPB;
-                lastPA = pots[3].value;
-                lastPB = pots[4].value;
-                bool changed = false;
-
-                // Pot A → splits[x]. All splits movable, including splits[0] (start of used region).
-                if (fabsf(dpA) > 0.002f) {
-                    granSplits[x] = constrain(granSplits[x] + dpA, 0.0f, 1.0f);
-                    for (int i = x-1; i >= 0; i--) {
-                        if (granSplits[i] > granSplits[i+1]) granSplits[i] = granSplits[i+1];
-                        else break;
-                    }
-                    for (int i = x+1; i <= granSliceCount; i++) {
-                        if (granSplits[i] < granSplits[i-1]) granSplits[i] = granSplits[i-1];
-                        else break;
-                    }
-                    changed = true;
-                }
-
-                // Pot B → splits[x+1]. All splits movable, including splits[N] (end of used region).
-                if (fabsf(dpB) > 0.002f) {
-                    granSplits[x+1] = constrain(granSplits[x+1] + dpB, 0.0f, 1.0f);
-                    for (int i = x; i >= 0; i--) {
-                        if (granSplits[i] > granSplits[i+1]) granSplits[i] = granSplits[i+1];
-                        else break;
-                    }
-                    for (int i = x+2; i <= granSliceCount; i++) {
-                        if (granSplits[i] < granSplits[i-1]) granSplits[i] = granSplits[i-1];
-                        else break;
-                    }
-                    changed = true;
-                }
-
-                if (changed) audioApplyGranularSplits(granSplits, granSliceCount);
-            } else {
-                // --- Global window control (no slice selected) ---
-                float dpA = (pots[3].value - lastPA) * 0.5f;
-                float dpB = (pots[4].value - lastPB) * 0.5f;
-                lastPA = pots[3].value; lastPB = pots[4].value;
-
-                if (fabsf(dpA) > 0.004f || fabsf(dpB) > 0.004f) {
-                    float ws = granWinStart + dpA;
-                    float we = granWinEnd   + dpB;
-                    if (ws < 0.0f) ws = 0.0f;
-                    if (we > 1.0f) we = 1.0f;
-                    if (we < ws + 0.05f) we = ws + 0.05f;
-                    if (we > 1.0f) { we = 1.0f; ws = we - 0.05f; if (ws < 0.0f) ws = 0.0f; }
-                    granWinStart = ws; granWinEnd = we;
-                    winDebMs = millis();
-                }
-                if (winDebMs && millis() - winDebMs >= 300) {
-                    winDebMs = 0;
-                    audioSetGranularWindow(granWinStart, granWinEnd);
-                    granSliceCount = audioComputeGranularSlices(granSubMode & 1u, granWaveform);
-                    granComputed = (granSliceCount > 0);
-                    if (granComputed)
-                        for (int i = 0; i <= granSliceCount; i++) granSplits[i] = i / (float)granSliceCount;
-                }
-            }
-        }
 
         // GRANULAR2 pots: per-sample split delta control (same cascade logic as GRANULAR).
         // Pot A (pots[3]) → splits[sliceIdx], Pot B (pots[4]) → splits[sliceIdx+1].
@@ -6492,16 +5855,13 @@ void loop() {
 
         // SD browser joystick navigation (SAMPLE, GRANULAR — always browsable)
         bool needsSdNav = currentMode==MODE_SAMPLE
-                       || currentMode==MODE_GRANULAR
                        || currentMode==MODE_GRANULAR2;
         if(needsSdNav&&!menuOpen&&sdReady){
             static unsigned long lastSdNav=0;
             float ny=cachedJoyY/64.0f;
             bool gran2AnyComputed = false;
             if (currentMode==MODE_GRANULAR2) for (uint8_t _s=0;_s<GRAN2_MAX_SAMPLES;_s++) if (gran2[_s].computed) { gran2AnyComputed=true; break; }
-            uint8_t visLines=(currentMode==MODE_GRANULAR&&!granComputed)?13
-                            :(currentMode==MODE_GRANULAR&&granComputed)?8
-                            :(currentMode==MODE_GRANULAR2&&!gran2AnyComputed)?13
+            uint8_t visLines=(currentMode==MODE_GRANULAR2&&!gran2AnyComputed)?13
                             :(currentMode==MODE_GRANULAR2)?7:8;
             if(millis()-lastSdNav>=150){
                 if(ny<-0.3f&&sdCursor>0){sdCursor--;if(sdCursor<sdScroll)sdScroll=sdCursor;lastSdNav=millis();}

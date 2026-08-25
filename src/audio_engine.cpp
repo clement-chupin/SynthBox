@@ -722,8 +722,8 @@ void audioSetOverdrive(float drive) {
     }
 }
 
-// Distortion: drive closes filter + raises resonance; tone shifts base cutoff; gain scales output
-void audioSetDistortion(float drive, float tone, float gain) {
+// Distortion: drive closes filter + raises resonance; tone shifts base cutoff
+void audioSetDistortion(float drive, float tone) {
     if (!audioReady) return;
     if (drive < 0.01f) {
         audioSetAllFilters(0.0f, 1.5f);
@@ -733,11 +733,6 @@ void audioSetDistortion(float drive, float tone, float gain) {
     float cut = baseCut * (1.0f - drive * 0.85f);    // drive closes filter toward 15% of base
     float res = 1.5f + drive * 3.5f;                 // 1.5 → 5.0 resonance
     audioSetAllFilters(fmaxf(cut, 60.0f), res);
-    // gain applied as volume scale on the synth bus
-    amy_event e = amy_default_event();
-    e.synth = SYNTH_CH;
-    e.volume[0] = gain * 3.0f;
-    amy_add_event(&e);
 }
 
 void audioSetVolume(float vol) {
@@ -2709,6 +2704,14 @@ void audioStopGranular2(uint8_t oscIdx) {
 bool audioGranular2HasReverse(uint8_t sampleIdx) {
     if (sampleIdx >= GRAN2_MAX_SAMPLES) return false;
     return s_gran2FullRevBuf[sampleIdx] != nullptr;
+}
+
+uint32_t audioGranular2SampleLenMs(uint8_t sampleIdx) {
+    if (sampleIdx >= GRAN2_MAX_SAMPLES || !s_gran2Loaded[sampleIdx]) return 0;
+    uint32_t totalLen = 0;
+    pcm_get_sample_ram_for_preset(GRAN2_SOURCE_BASE + sampleIdx, &totalLen);
+    if (totalLen == 0) return 0;
+    return (uint32_t)((uint64_t)totalLen * 1000u / PCM_TARGET_RATE);
 }
 
 void audioUnloadGranular2Slot(uint8_t sampleIdx) {

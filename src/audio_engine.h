@@ -33,7 +33,7 @@ void audioSetReverb(float level, float liveness, float damping, float xover_hz);
 void audioSetChorus(float level, float lfo_freq, float depth);
 void audioSetDelay(float level, float delay_ms, float feedback, float filter_coef);
 void audioSetOverdrive(float drive);
-void audioSetDistortion(float drive, float tone, float gain);
+void audioSetDistortion(float drive, float tone);
 void audioSetEq(float low, float mid, float high);  // 3-band EQ: 1.0=flat, >1 boost, <1 cut
 
 // Preview: aborts any in-progress load, loads file into preview preset and plays.
@@ -120,6 +120,7 @@ void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, boo
 void audioPlayGranular2Ful(uint8_t oscIdx, uint8_t sampleIdx, bool reverse, float vel, float startFrac);
 void audioStopGranular2(uint8_t oscIdx);
 bool audioGranular2HasReverse(uint8_t sampleIdx);  // false if PSRAM exhausted during load
+uint32_t audioGranular2SampleLenMs(uint8_t sampleIdx);  // total sample duration in ms (0 if not loaded)
 void audioUnloadGranular2Slot(uint8_t sampleIdx);  // free one slot's presets and PSRAM
 void audioUnloadGranular2();
 

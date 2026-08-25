@@ -12,10 +12,7 @@ enum AppMode : uint8_t {
     MODE_BATTERY,
     MODE_SYSINFO,   // cyberpunk HUD — system info / visual test
     MODE_HYBRID,    // synth note + assigned sample triggered simultaneously
-    MODE_MODULAR,   // 6-encoder modular: OSC/filter/env/LFO + joystick velocity
     MODE_MOD2,      // PolyAnalog-inspired: waveform morph, power-law filter, LFO dest toggle
-    MODE_303,       // TB-303 emulation: resonant LPF + filter envelope + slide + accent
-    MODE_GRANULAR,  // granular: play time-stretched slices of a sample (8-slice or 1/16)
     MODE_GRANULAR2, // granular2: multi-sample (2 or 4), fwd+rev only, per-sample split control
     MODE_MIDI,      // USB MIDI device: keyboard → NoteOn/Off, host → LED feedback (LaunchPad)
     MODE_TRACKER,   // 32-step quantized recorder: left 4×4 = instruments, right 4×4 = notes
@@ -33,8 +30,7 @@ enum AppMode : uint8_t {
 enum MenuItem : uint8_t {
     MENU_SYNTH, MENU_OMNI, MENU_SAMPLE,
     MENU_LIGHT, MENU_LIGHTPLAY, MENU_SD,
-    MENU_ABOUT, MENU_HYBRID, MENU_MODULAR,
-    MENU_MOD2, MENU_303, MENU_GRANULAR,
+    MENU_ABOUT, MENU_HYBRID, MENU_MOD2,
     MENU_GRANULAR2, MENU_MIDI, MENU_TRACKER,
     MENU_DRUM2, MENU_SYSEQ, MENU_303S,
     MENU_SS2, MENU_ANIM, MENU_I303,
@@ -44,8 +40,7 @@ static const char* menuLabels[] = {
     "SYNTH","OMNI","SAMPL",
     "LIGHT","LPLY","DIAG",
     "BATT","HYBRD","MODUL",
-    "MOD2","303","GRAN",
-    "GR2","MIDI","TRKR",
+    "GRANU","MIDI","TRKR",
     "DRUMS","SYNS","303S",
     "SAMPS","ANIM","I303"
 };

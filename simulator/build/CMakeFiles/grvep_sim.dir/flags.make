@@ -7,11 +7,11 @@ C_DEFINES = -DOOPSIE_LED_FLAG=1 -DSIMULATOR=1
 
 C_INCLUDES = -I/home/cchupin/projects/GrvEP/simulator/hal -I/home/cchupin/projects/GrvEP/simulator/hal/freertos -I/home/cchupin/projects/GrvEP/simulator -I/home/cchupin/projects/GrvEP/simulator/../include -I/home/cchupin/projects/GrvEP/simulator/../src -I"/home/cchupin/projects/GrvEP/simulator/../lib/AMY Synthesizer/src" -I/home/cchupin/projects/GrvEP/simulator/../lib/U8g2/src/clib -I/home/cchupin/projects/GrvEP/simulator/../lib/U8g2/src -I/home/cchupin/projects/GrvEP/simulator/sdl2_local/usr/include -I/home/cchupin/projects/GrvEP/simulator/sdl2_local/usr/include/SDL2 -I/home/cchupin/projects/GrvEP/simulator/sdl2_local/usr/include/x86_64-linux-gnu -I/home/cchupin/projects/GrvEP/simulator/sdl2_local/usr/include/x86_64-linux-gnu/SDL2
 
-C_FLAGS = -O3 -DNDEBUG -std=gnu11 -O2 -Wall -Wno-unused-variable -Wno-unused-function -Wno-unused-parameter -Wno-sign-compare -Wno-deprecated-declarations -fno-strict-aliasing -Wno-implicit-function-declaration
+C_FLAGS = -g -std=gnu11 -O2 -Wall -Wno-unused-variable -Wno-unused-function -Wno-unused-parameter -Wno-sign-compare -Wno-deprecated-declarations -fno-strict-aliasing -Wno-implicit-function-declaration
 
 CXX_DEFINES = -DOOPSIE_LED_FLAG=1 -DSIMULATOR=1
 
 CXX_INCLUDES = -I/home/cchupin/projects/GrvEP/simulator/hal -I/home/cchupin/projects/GrvEP/simulator/hal/freertos -I/home/cchupin/projects/GrvEP/simulator -I/home/cchupin/projects/GrvEP/simulator/../include -I/home/cchupin/projects/GrvEP/simulator/../src -I"/home/cchupin/projects/GrvEP/simulator/../lib/AMY Synthesizer/src" -I/home/cchupin/projects/GrvEP/simulator/../lib/U8g2/src/clib -I/home/cchupin/projects/GrvEP/simulator/../lib/U8g2/src -I/home/cchupin/projects/GrvEP/simulator/sdl2_local/usr/include -I/home/cchupin/projects/GrvEP/simulator/sdl2_local/usr/include/SDL2 -I/home/cchupin/projects/GrvEP/simulator/sdl2_local/usr/include/x86_64-linux-gnu -I/home/cchupin/projects/GrvEP/simulator/sdl2_local/usr/include/x86_64-linux-gnu/SDL2
 
-CXX_FLAGS = -O3 -DNDEBUG -std=gnu++17 -O2 -Wall -Wno-unused-variable -Wno-unused-function -Wno-unused-parameter -Wno-sign-compare -Wno-deprecated-declarations -fno-strict-aliasing
+CXX_FLAGS = -g -std=gnu++17 -O2 -Wall -Wno-unused-variable -Wno-unused-function -Wno-unused-parameter -Wno-sign-compare -Wno-deprecated-declarations -fno-strict-aliasing
 
