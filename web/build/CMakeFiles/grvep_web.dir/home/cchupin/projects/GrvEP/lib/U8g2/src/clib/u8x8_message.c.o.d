@@ -1,0 +1,28 @@
+CMakeFiles/grvep_web.dir/home/cchupin/projects/GrvEP/lib/U8g2/src/clib/u8x8_message.c.o: \
+  /home/cchupin/projects/GrvEP/lib/U8g2/src/clib/u8x8_message.c \
+  /home/cchupin/projects/GrvEP/lib/U8g2/src/clib/u8x8.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/stdint.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/stdint.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/bits/alltypes.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/compat/stdarg.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/stdarg.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/stdarg.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stdarg_header_macro.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stdarg___gnuc_va_list.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stdarg_va_list.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stdarg_va_arg.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stdarg___va_copy.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stdarg_va_copy.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/stddef.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/stddef.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stddef_header_macro.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stddef_ptrdiff_t.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stddef_size_t.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stddef_wchar_t.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stddef_null.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stddef_max_align_t.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/__stddef_offsetof.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/limits.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/limits.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/features.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/bits/limits.h

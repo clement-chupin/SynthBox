@@ -1,0 +1,25 @@
+CMakeFiles/grvep_web.dir/web_leds.cpp.o: \
+  /home/cchupin/projects/GrvEP/web/web_leds.cpp \
+  /home/cchupin/projects/GrvEP/web/../include/Leds.h \
+  /home/cchupin/projects/GrvEP/web/../include/HWConfig.h \
+  /home/cchupin/projects/GrvEP/web/hal/FastLED.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/stdint.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/stdint.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/bits/alltypes.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/compat/string.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/c++/v1/string.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/c++/v1/__config \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/c++/v1/__config_site \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/c++/v1/__configuration/abi.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/c++/v1/__configuration/compiler.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/c++/v1/__configuration/platform.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/features.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/c++/v1/__configuration/availability.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/c++/v1/__configuration/language.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/c++/v1/__configuration/experimental.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/c++/v1/__configuration/hardening.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/string.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/strings.h \
+  /home/cchupin/projects/GrvEP/web/web_state.h \
+  /home/cchupin/emsdk/upstream/lib/clang/24/include/stdbool.h \
+  /home/cchupin/emsdk/upstream/emscripten/cache/sysroot/include/stdbool.h
