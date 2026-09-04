@@ -2266,6 +2266,9 @@ static bool  s_sw2Active   = false;  // true when T303_SW2_WAVE is selected
 extern "C" float amy_wavefold_gain;       // defined in amy.c; controls 303 bus-1 wavefolder (1.0=dry)
 extern "C" float amy_wavefold_pos_only;   // defined in amy.c; >0.5 = fold positive half only (TRI2)
 extern "C" float amy_wavefold_gain_bus0;  // defined in amy.c; global REP FX on bus 0 (1.0=dry)
+extern "C" float amy_ladder_on;         // defined in amy.c; 0=bypass, 1=engaged
+extern "C" float amy_ladder_cutoff;     // defined in amy.c; Hz
+extern "C" float amy_ladder_resonance;  // defined in amy.c; feedback gain into tanh(), no hard ceiling
 
 void audioT303Init(float cutoff, float reso, float envMod, float decay, uint8_t amyWave) {
     if (!audioReady) return;
@@ -2496,6 +2499,12 @@ void audioI303Init(float cutoff, float reso, float envMod, float decay, uint8_t 
 
 void audioSetWavefold(float gain) {
     amy_wavefold_gain_bus0 = gain;
+}
+
+void audioSetLadderFilter(float cutoffHz, float resonance, bool on) {
+    amy_ladder_on        = on ? 1.0f : 0.0f;
+    amy_ladder_cutoff     = cutoffHz;
+    amy_ladder_resonance  = resonance;
 }
 
 // Symmetric wavefolder for TRI/SAW2/SQ2: depth 0→1 maps gain 1x→32x (extreme folds).

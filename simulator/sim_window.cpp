@@ -95,6 +95,17 @@ void simKeyPress(uint8_t row, uint8_t col, bool pressed);
 #define JBTN_W      60
 #define JBTN_H      48
 
+// Android-only: always-visible "import a folder" button — one tap opens the SAF
+// folder picker directly, from any mode/menu state (main.cpp's loop() handles
+// g_simImportTap). Sits in the strip of unused space below the pots/joystick, full
+// width, generously sized (unlike JBTN, this is a rare, deliberate action, not a
+// per-note control) so it's easy to find and hit despite having no text label
+// (SDL2 has no font renderer here — see renderImportBtn()'s icon-only design).
+#define IMPORTBTN_X   (SPLIT_X + 20)
+#define IMPORTBTN_Y   385
+#define IMPORTBTN_W   (WIN_W - SPLIT_X - 40)
+#define IMPORTBTN_H   65
+
 // Secondary pots (FX params) — right side of ctrl area
 #define SPOT_X      (JBTN_X + JBTN_W + 8)    // 678
 #define SPOT_Y      MPOT_Y
@@ -190,7 +201,7 @@ static bool jbtnHitTest(int lx, int ly) {
 #define MAX_FINGERS 10
 struct FingerTarget {
     SDL_FingerID id;
-    enum Kind { NONE, KEY, JOY, JBTN, POT } kind;
+    enum Kind { NONE, KEY, JOY, JBTN, POT, IMPORTBTN } kind;
     int  row, col;    // KEY
     int  potIdx;      // POT
     float lastX, lastY; // JOY & POT — physical pixel position
@@ -217,13 +228,26 @@ static FingerTarget* fingerAlloc(SDL_FingerID id) {
 // taking SDL's letterbox (from SDL_RenderSetLogicalSize) into account.
 static float s_lboxScale = 1.0f;  // physical pixels per logical pixel (from letterbox)
 
+// SDL_TouchFingerEvent's tf.x/tf.y are normalized [0..1] against the renderer's actual
+// output size in PHYSICAL PIXELS (SDL_GetRendererOutputSize), not the window's size in
+// DPI-scaled points (SDL_GetWindowSize) — those two differ on essentially every Android
+// device. The previous version multiplied tf.x/tf.y by the window's point size and fed
+// that into SDL_RenderWindowToLogical (which itself expects point-size window
+// coordinates), so on any display where points != physical pixels every touch landed
+// offset from where it visually looked, including all key/pot/joystick/button hit-
+// testing (every SDL_FINGERDOWN/UP/MOTION handler calls this first). Fixed by doing the
+// same manual letterbox math windowToLogical() already uses for the desktop mouse path
+// (that comment already flags SDL_RenderWindowToLogical as unreliable across platforms/
+// DPI settings) — just starting from the physical-pixel drawable size finger events are
+// actually normalized against, instead of window points.
 static void fingerToLogical(SDL_TouchFingerEvent const& tf, int* lx, int* ly) {
-    int pw, ph;
-    SDL_GetWindowSize(s_win, &pw, &ph);
-    float physX = tf.x * pw, physY = tf.y * ph;
-    float fx, fy;
-    SDL_RenderWindowToLogical(s_rend, (int)physX, (int)physY, &fx, &fy);
-    *lx = (int)fx; *ly = (int)fy;
+    int dw, dh;
+    SDL_GetRendererOutputSize(s_rend, &dw, &dh);
+    float scale = fminf((float)dw / WIN_W, (float)dh / WIN_H);
+    float offsetX = (dw - WIN_W * scale) * 0.5f;
+    float offsetY = (dh - WIN_H * scale) * 0.5f;
+    *lx = (int)((tf.x * dw - offsetX) / scale);
+    *ly = (int)((tf.y * dh - offsetY) / scale);
 }
 
 #endif // __ANDROID__
@@ -432,6 +456,41 @@ static void renderJoyBtn() {
     SDL_RenderDrawLine(s_rend, cx+4, cy,       cx+20, cy+rr-2); // lower diagonal
 }
 
+#ifdef __ANDROID__
+// ---- "Import a folder" button (Android only) ----
+static bool s_importBtnDown = false;
+static bool importBtnHitTest(int lx, int ly) {
+    return lx >= IMPORTBTN_X && lx < IMPORTBTN_X + IMPORTBTN_W &&
+           ly >= IMPORTBTN_Y && ly < IMPORTBTN_Y + IMPORTBTN_H;
+}
+static void renderImportBtn() {
+    uint8_t r = s_importBtnDown ?  60 :  30;
+    uint8_t g = s_importBtnDown ? 200 : 150;
+    uint8_t b = s_importBtnDown ? 220 : 170;
+    SDL_Rect btn = {IMPORTBTN_X, IMPORTBTN_Y, IMPORTBTN_W, IMPORTBTN_H};
+    SDL_SetRenderDrawColor(s_rend, r, g, b, 255);
+    SDL_RenderFillRect(s_rend, &btn);
+    SDL_SetRenderDrawColor(s_rend, 255, 255, 255, 255);
+    SDL_RenderDrawRect(s_rend, &btn);
+    SDL_Rect inner = {IMPORTBTN_X+3, IMPORTBTN_Y+3, IMPORTBTN_W-6, IMPORTBTN_H-6};
+    SDL_RenderDrawRect(s_rend, &inner);
+    // Icon (no SDL_ttf available): a downward arrow dropping into an open tray/folder,
+    // i.e. "import files in" — shaft + arrowhead + a tray line underneath, repeated
+    // 3x across the bar's width so it reads as an icon wherever the eye lands on it.
+    int cy = IMPORTBTN_Y + IMPORTBTN_H / 2;
+    for (int k = -1; k <= 1; k++) {
+        int cx = IMPORTBTN_X + IMPORTBTN_W / 2 + k * 90;
+        int top = cy - 16, shaftBot = cy + 6, trayY = cy + 16, trayHalfW = 16;
+        SDL_RenderDrawLine(s_rend, cx, top, cx, shaftBot);                       // shaft
+        SDL_RenderDrawLine(s_rend, cx - 9, shaftBot - 9, cx, shaftBot);          // arrowhead left
+        SDL_RenderDrawLine(s_rend, cx + 9, shaftBot - 9, cx, shaftBot);          // arrowhead right
+        SDL_RenderDrawLine(s_rend, cx - trayHalfW, trayY, cx + trayHalfW, trayY); // tray
+        SDL_RenderDrawLine(s_rend, cx - trayHalfW, trayY, cx - trayHalfW, trayY - 8); // tray left wall
+        SDL_RenderDrawLine(s_rend, cx + trayHalfW, trayY, cx + trayHalfW, trayY - 8); // tray right wall
+    }
+}
+#endif // __ANDROID__
+
 // ---- Hit tests ----
 static bool potHitTest(int mx, int my, int* idx) {
     for (int i = 0; i < POT_COUNT; i++) {
@@ -502,10 +561,15 @@ bool simWindowInit() {
     SDL_RenderSetLogicalSize(s_rend, WIN_W, WIN_H);
 
 #ifdef __ANDROID__
-    // Compute letterbox scale for converting physical finger deltas to logical units
+    // Compute letterbox scale for converting physical finger deltas to logical units.
+    // Must match fingerToLogical()'s basis (renderer output / drawable pixels, what
+    // finger events are actually normalized against) — not SDL_GetWindowSize's
+    // DPI-scaled points, which differ from drawable pixels on essentially every
+    // Android device and previously made touch position and drag sensitivity
+    // inconsistent with each other.
     {
         int pw, ph;
-        SDL_GetWindowSize(s_win, &pw, &ph);
+        SDL_GetRendererOutputSize(s_rend, &pw, &ph);
         float sx = (float)pw / WIN_W, sy = (float)ph / WIN_H;
         s_lboxScale = (sx < sy) ? sx : sy;
     }
@@ -552,6 +616,27 @@ bool simWindowPollEvents() {
 
         case SDL_QUIT:
             return false;
+
+        // Regaining window focus (e.g. after the Android SAF folder picker — or any other
+        // activity — took over the screen mid-touch) can lose a finger's matching UP event,
+        // leaving a stale FingerTarget slot stuck as JOY/POT/JBTN/IMPORTBTN forever, which can
+        // then misdirect a later unrelated touch that happens to reuse the same finger id
+        // (Android commonly recycles low SDL_FingerID values). Reset all press/drag state —
+        // never touches actual pot/joystick VALUES, only what's currently "being held".
+        case SDL_WINDOWEVENT:
+            if (e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
+#ifdef __ANDROID__
+                for (int i = 0; i < MAX_FINGERS; i++) s_fingers[i].kind = FingerTarget::NONE;
+                s_jbtnDown = false;
+                s_importBtnDown = false;
+#endif
+                g_simJoySW = false;
+                g_simJoyX = 0.0f;
+                g_simJoyY = 0.0f;
+                s_dragPot = -1;
+                s_dragJoy = false;
+            }
+            break;
 
         // ---- PC Keyboard (scancodes = physical positions, AZERTY/QWERTY independent) ----
         case SDL_KEYDOWN:
@@ -778,15 +863,19 @@ bool simWindowPollEvents() {
                 ft->kind = FingerTarget::JBTN;
                 g_simJoySW = true;
                 s_jbtnDown = true;
+            } else if (importBtnHitTest(lx, ly)) {
+                ft->kind = FingerTarget::IMPORTBTN;
+                s_importBtnDown = true;
+                g_simImportTap = true;  // one-shot: main.cpp's loop() consumes and resets this
             } else if (joyHitTest(lx, ly)) {
                 ft->kind = FingerTarget::JOY;
-                int pw, ph; SDL_GetWindowSize(s_win, &pw, &ph);
+                int pw, ph; SDL_GetRendererOutputSize(s_rend, &pw, &ph);
                 ft->lastX = e.tfinger.x * pw;
                 ft->lastY = e.tfinger.y * ph;
             } else if (potHitTest(lx, ly, &pidx)) {
                 ft->kind = FingerTarget::POT;
                 ft->potIdx = pidx;
-                int pw, ph; SDL_GetWindowSize(s_win, &pw, &ph);
+                int pw, ph; SDL_GetRendererOutputSize(s_rend, &pw, &ph);
                 ft->lastY = e.tfinger.y * ph;
                 // Jump pot to touched position
                 SDL_Rect knob, track;
@@ -807,6 +896,8 @@ bool simWindowPollEvents() {
             } else if (ft->kind == FingerTarget::JBTN) {
                 g_simJoySW = false;
                 s_jbtnDown = false;
+            } else if (ft->kind == FingerTarget::IMPORTBTN) {
+                s_importBtnDown = false;
             } else if (ft->kind == FingerTarget::JOY) {
                 g_simJoyX = 0.0f;
                 g_simJoyY = 0.0f;
@@ -817,7 +908,7 @@ bool simWindowPollEvents() {
         case SDL_FINGERMOTION: {
             FingerTarget* ft = fingerFind(e.tfinger.fingerId);
             if (!ft) break;
-            int pw, ph; SDL_GetWindowSize(s_win, &pw, &ph);
+            int pw, ph; SDL_GetRendererOutputSize(s_rend, &pw, &ph);
             float physX = e.tfinger.x * pw, physY = e.tfinger.y * ph;
             if (ft->kind == FingerTarget::JOY) {
                 float dx = (physX - ft->lastX) / (JOY_R * s_lboxScale);
@@ -876,6 +967,9 @@ void simWindowRender() {
     renderPots();
     renderJoystick();
     renderJoyBtn();
+#ifdef __ANDROID__
+    renderImportBtn();
+#endif
 
     SDL_RenderPresent(s_rend);
 }

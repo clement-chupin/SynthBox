@@ -625,8 +625,6 @@ struct StoneWinState {
     float   end   = 1.0f;
 };
 static StoneWinState stoneWin;
-static uint32_t stonePopupUntil = 0;
-#define STONE_POPUP_MS 1200
 // Loop mode: double-click B3 toggles. When on, held notes loop within [start,end]
 // instead of playing once through — see audioStoneSetLoopMode() (audio_engine.cpp).
 static bool stoneLoopMode = false;
@@ -1196,11 +1194,12 @@ struct FxEffect {
 };
 
 FxEffect fxList[] = {
-    // FILT: filtre général — Typ=type (0=LPF,1=HPF,2=BPF)
+    // FILT: filtre général — Typ=type (0=LPF,1=HPF,2=BPF,3=LADDER: custom resonant/
+    // saturating 4-pole filter, exotic non-linear rolloff — see audioSetLadderFilter())
     {"FILT",     false, {2000.0f, 1.5f, 0.0f, 0.0f},
      {"Cut","Res","","Typ"},
      {65.0f,   0.5f, 0.0f, 0.0f},
-     {18000.0f, 3.0f, 0.0f, 2.0f}},
+     {18000.0f, 3.0f, 0.0f, 3.0f}},
     // Distortion: wavefold-style saturation via filter drive + tone shaping
     {"DISTORT",  false, {0.6f, 0.5f,  0.0f, 0.0f},
      {"Drv","Ton","",""},
@@ -1260,9 +1259,9 @@ FxEffect fxList[] = {
 static const uint8_t FX_COUNT = 11;
 
 // Noms des types de filtre FILT — LPF, HPF, BPF
-static const char* kFiltTypN[] = {"LPF","HPF","BPF"};
+static const char* kFiltTypN[] = {"LPF","HPF","BPF","LDR"};
 static const char* fxFiltTypName() {
-    return kFiltTypN[(uint8_t)constrain((int)roundf(fxList[0].params[3]), 0, 2)];
+    return kFiltTypN[(uint8_t)constrain((int)roundf(fxList[0].params[3]), 0, 3)];
 }
 
 // Delay subdivisions — param[1] is an index 0..6 into these tables
@@ -1302,14 +1301,20 @@ void applyFxEffect(uint8_t fx) {
                && !(fxList[10].active && fxList[10].params[1] > 200.0f);
     };
     switch (fx) {
-        case 0: {  // FILT — filtre général (params[3]=Typ: 0=LPF,1=HPF,2=BPF)
+        case 0: {  // FILT — filtre général (params[3]=Typ: 0=LPF,1=HPF,2=BPF,3=LADDER)
             static const uint8_t kFiltAMY[] = {FILTER_LPF, FILTER_HPF, FILTER_BPF};
-            uint8_t ti  = (uint8_t)constrain((int)roundf(e.params[3]), 0, 2);
+            uint8_t ti  = (uint8_t)constrain((int)roundf(e.params[3]), 0, 3);
+            bool ladder = (ti == 3);
             float   cut = e.params[0], res = e.params[1];
             Serial.printf("FX0 FILT %s cut=%.0f res=%.2f typ=%s\n",
                 on?"ON":"off", on?cut:0.0f, on?res:1.5f, kFiltTypN[ti]);
-            audioSetAllFiltersT(on ? cut : 0.0f, on ? res : 1.5f,
-                                on ? kFiltAMY[ti] : FILTER_LPF24);
+            // LADDER bypasses AMY's own per-voice filter (plain linear biquads, no
+            // ladder topology exists in AMY) and instead runs a custom bus-level 4-pole
+            // filter with tanh-saturated feedback — see audioSetLadderFilter() and
+            // amy.c's bus-0 processing block for the actual "exotic" nonlinear rolloff.
+            audioSetAllFiltersT(on && !ladder ? cut : 0.0f, on && !ladder ? res : 1.5f,
+                                (on && !ladder) ? kFiltAMY[ti] : FILTER_LPF24);
+            audioSetLadderFilter(cut, res * 2.0f, on && ladder);  // *2: wider effective resonance range than the shared 0-3 param slot, safe since the ladder's tanh feedback can't blow up regardless of gain
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
             // audioSetAllFiltersT() above reaches every channel including T303_CH, so
             // turning the FX LPF off leaves the 303 stuck on the FX's last cutoff/type
@@ -2742,7 +2747,6 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                 if (isDbl) {
                     stoneLoopMode = !stoneLoopMode;
                     audioStoneSetLoopMode(stoneLoopMode);
-                    stonePopupUntil = millis() + STONE_POPUP_MS;  // flash the waveform popup so LOOP state is visible
                 } else {
                     audioStoneAllNotesOff();  // panic stop
                 }
@@ -4014,64 +4018,112 @@ void drawScreen(bool blockWait) {
                 }
                 break;
             }
-            // ---- STONE ----
+            // ---- STONE ---- (layout deliberately mirrors MODE_GRANULAR2's: waveform+window
+            // up top, a status-chip row, a numeric readout, then the file browser at the same
+            // 7-row/y=58 cadence, then an FX-or-hints footer — see that case for the source
+            // of each proportion below.)
             case MODE_STONE: {
                 oled.setFont(u8g2_font_4x6_tf);
-                { char pb[32]; snprintf(pb, sizeof(pb), "STONE %.22s", sdPath.c_str()); oled.drawStr(0, 7, pb); }
-                oled.drawHLine(0, 9, 128);
-                if (millis() < stonePopupUntil && stoneWin.computed) {
-                    // Waveform + start/end window popup — same visual language as
-                    // GRANULAR2's own waveform display, shown temporarily while P4-P7
-                    // are actively being touched (mirrors GEST2's popup pattern).
+                {
+                    char fn[20] = "----";
+                    if (stoneLoadedPath.length() > 0) {
+                        int ls = stoneLoadedPath.lastIndexOf('/');
+                        String f = ls >= 0 ? stoneLoadedPath.substring(ls + 1) : stoneLoadedPath;
+                        snprintf(fn, sizeof(fn), "%.18s", f.c_str());
+                    }
+                    snprintf(buf, sizeof(buf), "STONE[%s] %s", stoneLoopMode ? "LOOP" : "NRM", fn);
+                }
+                oled.drawStr(0, 7, buf); oled.drawHLine(0, 9, 128);
+
+                // Waveform (y=10..32, height 23px) + start/end window frame — same geometry
+                // as GRANULAR2's waveform+active-slice-frame.
+                if (stoneWin.computed) {
                     for (int x = 0; x < 128; x++) {
-                        uint8_t h = (uint8_t)(stoneWin.waveform[x] * 55 / 255);
+                        uint8_t h = (uint8_t)(stoneWin.waveform[x] * 21 / 255);
                         if (h < 1) h = 1;
-                        oled.drawVLine(x, 68 - h, h);
+                        oled.drawVLine(x, 32 - h, h);
                     }
                     int sx0 = (int)(stoneWin.start * 127.f);
                     int sx1 = (int)(stoneWin.end   * 127.f);
-                    oled.drawVLine(sx0, 12, 57);
-                    oled.drawVLine(sx1, 12, 57);
-                    oled.drawFrame(sx0, 12, (sx1 - sx0) > 0 ? (sx1 - sx0) : 1, 57);
-                    oled.setFont(u8g2_font_5x7_tf);
-                    snprintf(buf, sizeof(buf), "St:%d%% En:%d%% Ln:%d%% %s",
-                             (int)(stoneWin.start * 100.f), (int)(stoneWin.end * 100.f),
-                             (int)((stoneWin.end - stoneWin.start) * 100.f), stoneLoopMode ? "LOOP" : "");
-                    oled.drawStr(0, 80, buf);
-                    oled.setFont(u8g2_font_4x6_tf);
-                } else if (!sdReady) {
-                    oled.drawStr(10, 40, "SD not found");
+                    oled.drawVLine(sx0, 10, 23);
+                    oled.drawVLine(sx1, 10, 23);
+                    oled.drawFrame(sx0, 10, (sx1 - sx0) > 0 ? (sx1 - sx0) : 1, 23);
+                }
+
+                // Status chip row (y=36..44) — GRANULAR2 shows one chip per sample slot (S0-S3);
+                // STONE only ever has one sample, so the chip shows loop on/off instead, plus
+                // ready/loading/empty status the same way GRANULAR2's chips do (dot/circle).
+                oled.drawStr(0, 43, "M:");
+                oled.drawBox(11, 36, 25, 8);
+                if (stoneLoopMode) { oled.setDrawColor(0); oled.drawStr(12, 43, "LOOP"); oled.setDrawColor(1); }
+                else               { oled.setDrawColor(0); oled.drawStr(12, 43, "NRM");  oled.setDrawColor(1); }
+                if (audioIsStoneReady())            oled.drawPixel(40, 45);
+                else if (stoneLoadedPath.length())  oled.drawCircle(40, 44, 2, U8G2_DRAW_ALL);
+                snprintf(buf, sizeof(buf), "Oct%+d", noteMap.getOctave());
+                oled.drawStr(48, 43, buf);
+
+                // Window readout (y=51) — same slot as GRANULAR2's "SlN S0:x% S1:y%" line.
+                oled.setFont(u8g2_font_5x7_tf);
+                snprintf(buf, sizeof(buf), "St:%d%% En:%d%% Ln:%d%%",
+                         (int)(stoneWin.start * 100.f), (int)(stoneWin.end * 100.f),
+                         (int)((stoneWin.end - stoneWin.start) * 100.f));
+                oled.drawStr(0, 51, buf);
+                oled.setFont(u8g2_font_4x6_tf);
+
+                // File browser (7 entries from y=58 — GRANULAR2's exact play-phase cadence).
+                if (!sdReady) {
+                    oled.drawStr(10, 70, "SD not found");
                 } else {
-                    for (int i = 0; i < 9 && (i + sdScroll) < sdFileCount; i++) {
+                    for (int i = 0; i < 7 && (i + sdScroll) < sdFileCount; i++) {
                         int idx = i + sdScroll; bool sel = (idx == sdCursor);
                         bool isLoadedFile = !sdFileIsDir[idx] && stoneLoadedPath.endsWith(sdFiles[idx].c_str());
                         char line[29];
                         if (sdFileIsDir[idx]) snprintf(line, sizeof(line), "%c[%.24s]", sel ? '>' : ' ', sdFiles[idx].c_str());
                         else snprintf(line, sizeof(line), "%c%s%.25s", sel ? '>' : ' ', isLoadedFile ? "*" : "", sdFiles[idx].c_str());
-                        oled.drawStr(0, 17 + i * 7, line);
-                        if (sel) oled.drawHLine(0, 18 + i * 7, 128);
+                        oled.drawStr(0, 58 + i * 7, line);
+                        if (sel) oled.drawHLine(0, 59 + i * 7, 128);
                     }
                 }
-                oled.drawHLine(0, 83, 128);
-                oled.setFont(u8g2_font_5x7_tf);
-                if (stoneLoadedPath.length() > 0) {
-                    int ls = stoneLoadedPath.lastIndexOf('/');
-                    String fn = ls >= 0 ? stoneLoadedPath.substring(ls + 1) : stoneLoadedPath;
-                    snprintf(buf, sizeof(buf), "%.20s %s", fn.c_str(), audioIsStoneReady() ? "" : "...");
-                } else {
-                    snprintf(buf, sizeof(buf), "(pas d'echantillon)");
+
+                // Bottom: FX params when any FX is active, else button hints — identical
+                // pattern/positions to GRANULAR2's own footer block.
+                {
+                    bool anyFxDisp = false;
+                    for (uint8_t fi = 0; fi < FX_COUNT; fi++) if (fxList[fi].active) { anyFxDisp = true; break; }
+                    if (anyFxDisp) {
+                        const FxEffect& fx = fxList[fxSelected];
+                        struct { const char* name; char val[8]; } pp[4]; int np = 0;
+                        for (int p = 0; p < 4; p++) {
+                            if (!fx.paramNames[p][0]) continue;
+                            if (fxSelected == 0 && p == 3) {
+                                strncpy(pp[np].val, fxFiltTypName(), sizeof(pp[np].val)-1);
+                            } else {
+                                float v = fx.params[p];
+                                if      (v >= 1000.f) snprintf(pp[np].val, 8, "%.0fk", v / 1000.f);
+                                else if (v >= 10.f)   snprintf(pp[np].val, 8, "%.0f",  v);
+                                else                  snprintf(pp[np].val, 8, "%.2f",  v);
+                            }
+                            pp[np].name = fx.paramNames[p]; np++;
+                        }
+                        char l1[32] = {}, l2[32] = {};
+                        const char* fxdn = (fxSelected==0) ? fxFiltTypName() : fx.name;
+                        int o1 = snprintf(l1, sizeof(l1), "%s%s:", fx.active ? "*" : "-", fxdn);
+                        for (int i = 0; i < np && i < 2; i++)
+                            o1 += snprintf(l1 + o1, sizeof(l1) - o1, " %.3s=%s", pp[i].name, pp[i].val);
+                        oled.drawStr(0, 111, l1);
+                        if (np > 2) {
+                            int o2 = 0;
+                            for (int i = 2; i < np; i++)
+                                o2 += snprintf(l2 + o2, sizeof(l2) - o2, " %.3s=%s", pp[i].name, pp[i].val);
+                            oled.drawStr(0, 118, l2 + 1);
+                        } else {
+                            oled.drawStr(0, 118, "JY=browse Clk=load 2xB3=Loop");
+                        }
+                    } else {
+                        oled.drawStr(0, 111, "P4-7=St/En/Pos/Size  P2=cycle");
+                        oled.drawStr(0, 118, "JY=browse Clk=load 2xB3=Loop");
+                    }
                 }
-                oled.drawStr(0, 95, buf);
-                if (stoneAudioCount > 0) {
-                    uint8_t curIdx = 0;
-                    for (uint8_t i = 0; i < stoneAudioCount; i++) if (stoneAudioIdx[i] == sdCursor) { curIdx = i; break; }
-                    snprintf(buf, sizeof(buf), "P2: %d/%d  Oct:%+d %s", curIdx + 1, stoneAudioCount, noteMap.getOctave(), stoneLoopMode ? "LOOP" : "");
-                } else {
-                    snprintf(buf, sizeof(buf), "Oct:%+d %s", noteMap.getOctave(), stoneLoopMode ? "LOOP" : "");
-                }
-                oled.drawStr(0, 108, buf);
-                oled.drawStr(0, 120, "JY=browse Clk=load");
-                oled.drawStr(0, 127, "P2=cyc dblB3=loop");
                 break;
             }
             // ---- SEQUENCER ----
@@ -9131,7 +9183,7 @@ void loop() {
                                     if (fxSelected==0 && p==0)
                                         fxList[0].params[0]=mn*powf(mx/mn, pots[pIdx[0]].value);
                                     else if (fxSelected==0 && p==3) {
-                                        fxList[0].params[3]=floorf(pots[pIdx[p]].value*2.9999f);
+                                        fxList[0].params[3]=floorf(pots[pIdx[p]].value*3.9999f);
                                         s_filtMetaChanged=true;
                                     } else {
                                         fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
@@ -9161,7 +9213,7 @@ void loop() {
                                 if (fxSelected==0 && p==0)
                                     fxList[0].params[0]=mn*powf(mx/mn, pots[pIdx[0]].value);
                                 else if (fxSelected==0 && p==3) {
-                                    fxList[0].params[3]=floorf(pots[pIdx[p]].value*2.9999f);
+                                    fxList[0].params[3]=floorf(pots[pIdx[p]].value*3.9999f);
                                     s_filtMetaChanged=true;
                                 } else {
                                     fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
@@ -9216,7 +9268,7 @@ void loop() {
                                 if (fxSelected==0 && p==0)
                                     fxList[0].params[0]=mn*powf(mx/mn, pots[pIdx[0]].value);
                                 else if (fxSelected==0 && p==3) {
-                                    fxList[0].params[3]=floorf(pots[pIdx[p]].value*2.9999f);
+                                    fxList[0].params[3]=floorf(pots[pIdx[p]].value*3.9999f);
                                     s_filtMetaChanged=true;
                                 } else
                                     fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
@@ -9249,7 +9301,7 @@ void loop() {
                                 if (fxSelected==0 && p==0)
                                     fxList[0].params[0]=mn*powf(mx/mn, pots[pIdx[0]].value);
                                 else if (fxSelected==0 && p==3)
-                                    fxList[0].params[3]=floorf(pots[pIdx[p]].value*2.9999f);
+                                    fxList[0].params[3]=floorf(pots[pIdx[p]].value*3.9999f);
                                 else
                                     fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
                                 lp_fx_s[p]=pots[pIdx[p]].value;
@@ -9278,7 +9330,7 @@ void loop() {
                                     if (fxSelected==0 && p==0)
                                         fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
                                     else if (fxSelected==0 && p==3) {
-                                        fxList[0].params[3]=floorf(pots[3+p].value*2.9999f);
+                                        fxList[0].params[3]=floorf(pots[3+p].value*3.9999f);
                                         s_filtMetaChanged=true;
                                     } else {
                                         fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
@@ -9387,7 +9439,7 @@ void loop() {
                                 if (fxSelected==0 && p==0)
                                     fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
                                 else if (fxSelected==0 && p==3) {
-                                    fxList[0].params[3]=floorf(pots[3+p].value*2.9999f);
+                                    fxList[0].params[3]=floorf(pots[3+p].value*3.9999f);
                                     s_filtMetaChanged=true;
                                 } else {
                                     fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
@@ -9636,7 +9688,6 @@ void loop() {
                     }
                     if (winChanged) {
                         audioStoneApplyWindow(stoneWin.start, stoneWin.end, stoneLoopMode);
-                        stonePopupUntil = millis() + STONE_POPUP_MS;
                     }
                     break;
                 }
@@ -10197,7 +10248,7 @@ void loop() {
                             if (fxSelected == 0 && p == 0)
                                 fxList[0].params[0] = mn * powf(mx/mn, pots[3].value);
                             else if (fxSelected == 0 && p == 3) {
-                                fxList[0].params[3] = floorf(pots[3+p].value * 2.9999f);
+                                fxList[0].params[3] = floorf(pots[3+p].value * 3.9999f);
                                 s_filtMetaChanged = true;
                             } else {
                                 fxList[fxSelected].params[p] = mn + (mx - mn) * pots[3+p].value;
@@ -10517,6 +10568,21 @@ void loop() {
     }
 
 #ifdef __ANDROID__
+    {
+        // Always-visible on-screen "import a folder" button (sim_window.cpp draws/hit-
+        // tests it) — one tap jumps straight to MODE_IMPORT and opens the SAF picker
+        // immediately, from any mode/menu state, bypassing menu navigation and the
+        // B1-inside-MODE_IMPORT gesture entirely (both were hard to discover/reach on
+        // a touchscreen: B1 is an unlabeled key among the note grid, and MODE_IMPORT
+        // itself sits deep in the AUTRE tab's menu grid).
+        extern volatile bool g_simImportTap;
+        if (g_simImportTap) {
+            g_simImportTap = false;
+            if (currentMode != MODE_IMPORT) switchMode(MODE_IMPORT);
+            androidPickFolder();
+            importPhase = 1;
+        }
+    }
     if (importPhase == 1) {
         static uint32_t lastPoll = 0;
         if (millis() - lastPoll > 250 && sdReady) {

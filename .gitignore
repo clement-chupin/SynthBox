@@ -13,6 +13,9 @@ compile_commands.json
 
 # Desktop simulator build artifacts
 simulator/build/
+simulator/build-windows/
+simulator/.winbuild-toolchain/
+simulator/GrvEP.exe
 
 # Android native (SDL2) build artifacts — see android-native/.gitignore for details
 android-native/app/build/

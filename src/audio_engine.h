@@ -38,6 +38,13 @@ void audioSetOverdrive(float drive);
 void audioSetDistortion(float drive, float tone);
 void audioSetEq(float low, float mid, float high);  // 3-band EQ: 1.0=flat, >1 boost, <1 cut
 void audioSetWavefold(float gain);  // global wavefold on bus 0: 1.0=dry, >1 folds (gain = 1/threshold)
+// Global "ladder"-style resonant LPF on bus 0 (FX FILT, Typ=LADDER): a custom 4-pole
+// one-pole cascade with tanh-saturated feedback + per-stage saturation, giving a
+// nonlinear, self-compressing rolloff — AMY's own filter types are plain linear
+// biquads with no such character (see amy.c's bus-0 processing block for the DSP).
+// resonance has no hard ceiling (tanh keeps the loop stable at any gain); ~0-6 is
+// the useful range, higher self-oscillates harder.
+void audioSetLadderFilter(float cutoffHz, float resonance, bool on);
 
 // Preview: aborts any in-progress load, loads file into preview preset and plays.
 void audioLoadAndPlay(const char* path, uint16_t preset, float vel);

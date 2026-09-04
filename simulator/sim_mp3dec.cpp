@@ -13,10 +13,34 @@
 //   MP3GetLastFrameInfo: returns sample-rate/channels/outputSamps from last decode
 
 #include "hal/mp3dec.h"
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+#ifdef _WIN32
+// Windows build: no dlopen()/libmpg123.so equivalent to reach for here — unlike
+// Linux, there's no system library a plain end-user's machine can be expected to
+// already have installed, and statically bundling a full MP3 decoder is a separate
+// undertaking. MP3 sample playback is therefore unavailable in the Windows build for
+// now (WAV samples, and everything else, are unaffected); all the Helix API entry
+// points below just report "no decoder" instead of decoding.
+extern "C" HMP3Decoder MP3InitDecoder(void) { return nullptr; }
+extern "C" void MP3FreeDecoder(HMP3Decoder) {}
+extern "C" int MP3FindSyncWord(unsigned char* buf, int nBytes) {
+    for (int i = 0; i < nBytes - 1; i++)
+        if (buf[i] == 0xFF && (buf[i+1] & 0xE0) == 0xE0) return i;
+    return -1;
+}
+extern "C" int MP3Decode(HMP3Decoder, unsigned char**, int*, short*, int) { return ERR_MP3_NULL_POINTER; }
+extern "C" void MP3GetLastFrameInfo(HMP3Decoder, MP3FrameInfo* info) { if (info) *info = {}; }
+extern "C" int MP3GetNextFrameInfo(HMP3Decoder, MP3FrameInfo* info, unsigned char*) {
+    if (info) *info = {};
+    return ERR_MP3_INDATA_UNDERFLOW;
+}
+#else
 
 // ---- mpg123 types & constants (from mpg123.h — declared manually to avoid dep) ----
 typedef struct mpg123_handle_struct mpg123_handle_t;
@@ -148,3 +172,4 @@ extern "C" int MP3GetNextFrameInfo(HMP3Decoder /*hDec*/, MP3FrameInfo* info, uns
     if (info) *info = {};
     return ERR_MP3_INDATA_UNDERFLOW;
 }
+#endif // _WIN32

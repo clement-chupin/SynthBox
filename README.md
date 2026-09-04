@@ -52,6 +52,28 @@ DISPLAY=:1 ./build/grvep_sim
 
 Le binaire est produit dans `simulator/build/grvep_sim`.
 
+## Build d'un .exe Windows (cross-compilation depuis Linux)
+
+Un exécutable Windows tout-en-un (statiquement lié : ni SDL2.dll, ni libstdc++/libwinpthread
+à côté, pas de fenêtre console) peut être compilé depuis Linux via MinGW-w64 :
+
+```bash
+cd simulator
+./build_windows.sh
+```
+
+Au premier lancement, le script télécharge et extrait (sans root/sudo) le compilateur croisé
+et les fichiers de dev SDL2 dans `simulator/.winbuild-toolchain/` (~250 Mo, ignoré par git) ;
+les lancements suivants réutilisent ce cache. Le résultat est `simulator/GrvEP.exe` — un seul
+fichier à copier sur une machine Windows et à double-cliquer, sans installation.
+
+Un exécutable déjà compilé est disponible dans
+[releases/GrvEP-windows.exe](releases/GrvEP-windows.exe).
+
+Limitation connue : la lecture de fichiers `.mp3` n'est pas disponible dans le build Windows
+(le simulateur Linux s'appuie sur `libmpg123` via `dlopen`, sans équivalent simple côté
+Windows) — les échantillons `.wav` et tout le reste du firmware ne sont pas affectés.
+
 ## Build et installation de l'APK Android
 
 L'APK embarque directement le simulateur (SDL2 + C++, sans WebView) : `libmain.so` contient

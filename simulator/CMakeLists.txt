@@ -9,8 +9,18 @@ set(ROOT      ${CMAKE_SOURCE_DIR}/..)
 set(AMY_SRC   ${ROOT}/lib/AMY\ Synthesizer/src)
 set(U8G2_SRC  ${ROOT}/lib/U8g2/src)
 set(U8G2_CLIB ${U8G2_SRC}/clib)
-set(SDL2_INC  ${CMAKE_SOURCE_DIR}/sdl2_local/usr/include)
-set(SDL2_LIB  ${CMAKE_SOURCE_DIR}/sdl2_local/usr/lib/x86_64-linux-gnu)
+if(WIN32)
+    # Cross-compiling via toolchain-mingw64.cmake / build_windows.sh — SDL2_MINGW_DIR
+    # is set by build_windows.sh to wherever it bootstrapped the SDL2 mingw devel package.
+    if(NOT DEFINED SDL2_MINGW_DIR)
+        set(SDL2_MINGW_DIR ${CMAKE_SOURCE_DIR}/.winbuild-toolchain/SDL2-mingw/x86_64-w64-mingw32)
+    endif()
+    set(SDL2_INC ${SDL2_MINGW_DIR}/include)
+    set(SDL2_LIB ${SDL2_MINGW_DIR}/lib)
+else()
+    set(SDL2_INC  ${CMAKE_SOURCE_DIR}/sdl2_local/usr/include)
+    set(SDL2_LIB  ${CMAKE_SOURCE_DIR}/sdl2_local/usr/lib/x86_64-linux-gnu)
+endif()
 
 # ---- AMY sources (exclude ESP32/Web/Python-specific files) ----
 set(AMY_SOURCES
@@ -95,6 +105,13 @@ target_compile_definitions(grvep_sim PRIVATE
     OOPSIE_LED_FLAG=1
     # AMY platform (Linux, not ESP32)
     # Don't define ARDUINO — Amy checks !defined(ARDUINO) to use miniaudio
+    $<$<BOOL:${WIN32}>:WIN32_LEAN_AND_MEAN>
+    $<$<BOOL:${WIN32}>:NOMINMAX>
+    # ^ SDL2 pulls in <windows.h> transitively on this target; without
+    # WIN32_LEAN_AND_MEAN it drags in <dlgs.h>, whose own `CRGB` typedef (a Windows
+    # GDI dialog-template struct, unrelated to and unluckily same-named as FastLED's
+    # CRGB used throughout main.cpp) collides at global scope. NOMINMAX avoids the
+    # matching min/max macro collision some other Windows header would introduce.
 )
 
 # ---- Compile options ----
@@ -112,19 +129,34 @@ target_compile_options(grvep_sim PRIVATE
 )
 
 # ---- Link ----
-target_link_libraries(grvep_sim PRIVATE
-    # SDL2 — link to the system runtime directly (the local .so is a dangling symlink)
-    /usr/lib/x86_64-linux-gnu/libSDL2-2.0.so.0.3000.0
-    # Pthreads
-    pthread
-    # Math
-    m
-    # Dynamic linking for miniaudio
-    dl
-)
-
-# Set RPATH so the binary finds libSDL2.so at runtime
-set_target_properties(grvep_sim PROPERTIES
-    BUILD_RPATH "${SDL2_LIB};/usr/lib/x86_64-linux-gnu"
-    INSTALL_RPATH "${SDL2_LIB}"
-)
+if(WIN32)
+    # Fully static single-file .exe: no SDL2.dll / libwinpthread-1.dll / libstdc++-6.dll
+    # to ship alongside it. -mwindows = no console window (a GUI app, like any other
+    # Windows program); -static(-libgcc/-libstdc++) + -lwinpthread statically pull in
+    # the mingw/pthread runtime instead of needing their DLLs at runtime. The rest of
+    # the list is SDL2's own static-link dependency set for Windows (from its
+    # sdl2-config --static-libs), no dl/pthread (POSIX-only, not on this target).
+    target_link_libraries(grvep_sim PRIVATE
+        -static -static-libgcc -static-libstdc++ -lwinpthread
+        -mwindows
+        mingw32 SDL2main SDL2
+        m dinput8 dxguid dxerr8 user32 gdi32 winmm imm32 ole32 oleaut32 shell32 setupapi version uuid
+    )
+    target_link_directories(grvep_sim PRIVATE ${SDL2_LIB})
+else()
+    target_link_libraries(grvep_sim PRIVATE
+        # SDL2 — link to the system runtime directly (the local .so is a dangling symlink)
+        /usr/lib/x86_64-linux-gnu/libSDL2-2.0.so.0.3000.0
+        # Pthreads
+        pthread
+        # Math
+        m
+        # Dynamic linking for miniaudio
+        dl
+    )
+    # Set RPATH so the binary finds libSDL2.so at runtime
+    set_target_properties(grvep_sim PROPERTIES
+        BUILD_RPATH "${SDL2_LIB};/usr/lib/x86_64-linux-gnu"
+        INSTALL_RPATH "${SDL2_LIB}"
+    )
+endif()

@@ -58,6 +58,13 @@ typedef uint32_t dword;
 #define GPIO_NUM_41  41
 #define GPIO_NUM_42  42
 
+#ifdef _WIN32
+// <windows.h> (pulled in transitively via AMY's amy.h on this target) declares an
+// INPUT struct/typedef (for SendInput(), unrelated to and unluckily same-named as
+// Arduino's pinMode() constant below) — clear it first so our #define doesn't clash.
+#undef INPUT
+#undef OUTPUT
+#endif
 #define INPUT  0
 #define OUTPUT 1
 #define INPUT_PULLUP 2

@@ -153,7 +153,11 @@ public:
     bool exists(const String& path) { return exists(path.c_str()); }
 
     bool mkdir(const char* path) {
+#ifdef _WIN32
+        return ::mkdir(sdAbsPath(path).c_str()) == 0;  // mingw's mkdir() takes no mode arg
+#else
         return ::mkdir(sdAbsPath(path).c_str(), 0755) == 0;
+#endif
     }
     bool remove(const char* path) {
         return ::remove(sdAbsPath(path).c_str()) == 0;
@@ -166,7 +170,11 @@ private:
     bool _init() {
         std::string root = simSdRoot();
         struct stat st;
+#ifdef _WIN32
+        if (::stat(root.c_str(), &st) != 0) ::mkdir(root.c_str());
+#else
         if (::stat(root.c_str(), &st) != 0) ::mkdir(root.c_str(), 0755);
+#endif
         printf("[sim] SD card → %s\n", root.c_str());
         return true;
     }

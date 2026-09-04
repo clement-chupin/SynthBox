@@ -13,6 +13,7 @@ float g_simSlider[16] = {
     0.50f, 0.50f, 0.50f, 0.50f,
     0.50f, 0.50f, 0.50f, 0.50f,
 };
+volatile bool g_simImportTap = false;
 
 // Arduino HAL singletons
 #include "hal/Arduino.h"
