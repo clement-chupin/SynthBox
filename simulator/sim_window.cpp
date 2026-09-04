@@ -40,49 +40,67 @@ static CRGB keyLedColor(uint8_t row, uint8_t col) {
 // Forward from sim_keyboard.cpp
 void simKeyPress(uint8_t row, uint8_t col, bool pressed);
 
-// ---- Window size ----
-#define WIN_W  820
-#define WIN_H  560
+// ---- Window ----
+#define WIN_W       820
+#define WIN_H       460
 
-// ---- OLED (128×128 ×3 = 384×384) ----
-#define OLED_SCALE 3
-#define OLED_X     10
-#define OLED_Y     10
-#define OLED_W     (128 * OLED_SCALE)
-#define OLED_H     (128 * OLED_SCALE)
+// ============================================================
+// Layout: two vertical panels
+//   Left  (0..SPLIT_X)     : OLED screen centered
+//   Right (SPLIT_X..WIN_W) : top = keyboard, bottom = controls
+// ============================================================
+#define SPLIT_X     410
 
-// ---- Keyboard (4 note rows + 1 menu row) ----
-// Positioned to the right of the OLED
-#define KBD_X      (OLED_X + OLED_W + 18)
-#define KBD_Y      10
-#define KEY_W      36
-#define KEY_H      30
-#define KEY_GAP    3
-#define KBD_ROWS   5
-#define KBD_COLS   8
+// ---- Left panel: OLED (centered in the 410×560 area) ----
+#define OLED_SCALE  3
+#define OLED_W      (128 * OLED_SCALE)            // 384
+#define OLED_H      (128 * OLED_SCALE)            // 384
+#define OLED_X      ((SPLIT_X - OLED_W) / 2)     // 13
+#define OLED_Y      ((WIN_H   - OLED_H) / 2)     // 88
 
-// ---- Pot sliders ----
-#define POT_COUNT  7
-#define POT_W      14
-#define POT_H      80
+// ---- Right panel top: Keyboard (finger-friendly keys) ----
+#define KBD_X       (SPLIT_X + 7)    // 417
+#define KBD_Y       10
+#define KBD_ROWS    5
+#define KBD_COLS    8
+#define KEY_W       46    // 8 cols × (46+4) - 4 = 396px ≤ 403px available
+#define KEY_H       42
+#define KEY_GAP     4
+// Keyboard total height: 5*(42+4)-4 = 226px → bottom at y=236
 
-// Main pots (0,1,2) — VOL / SHAPE / BPM — left group
-#define MPOT_X     (OLED_X)
-#define MPOT_Y     (OLED_Y + OLED_H + 20)
-#define MPOT_GAP   30
-#define MPOT_COUNT 3
+// ---- Right panel bottom: Controls (pots + joystick) ----
+#define CTRL_Y      (KBD_Y + KBD_ROWS*(KEY_H+KEY_GAP) - KEY_GAP + 14)  // 250
 
-// ---- Joystick (between the two pot groups) ----
-#define JOY_CX     (MPOT_X + MPOT_COUNT * MPOT_GAP + 46)
-#define JOY_CY     (MPOT_Y + POT_H / 2)
-#define JOY_R      32
-#define JOY_KNOB_R  9
+#define POT_W       14
+#define POT_H       110    // tall enough for comfortable finger drag
+#define POT_COUNT   7
 
-// Secondary pots (3,4,5,6) — FX params — right of joystick
-#define SPOT_X     (JOY_CX + JOY_R + 18)
-#define SPOT_Y     MPOT_Y
-#define SPOT_GAP   26
-#define SPOT_COUNT 4
+// Main pots (VOL/SHAPE/BPM) — left side of ctrl area
+#define MPOT_X      (SPLIT_X + 8)          // 418
+#define MPOT_Y      (CTRL_Y + 8)           // 258
+#define MPOT_GAP    32
+#define MPOT_COUNT  3
+// Pots at x: 418, 450, 482 — right edge: 482+14=496
+
+// Joystick — center of ctrl area
+#define JOY_CX      (MPOT_X + MPOT_COUNT * MPOT_GAP + 50)  // 564
+#define JOY_CY      (MPOT_Y + POT_H / 2)                   // 313
+#define JOY_R       36
+#define JOY_KNOB_R  10
+// Joystick span: 528..600
+
+// JOY_SW on-screen button (Android: rendered and hit-tested; desktop: invisible but position used for SPOT_X)
+#define JBTN_X      (JOY_CX + JOY_R + 10)    // 610
+#define JBTN_Y      (JOY_CY - 24)             // 289
+#define JBTN_W      60
+#define JBTN_H      48
+
+// Secondary pots (FX params) — right side of ctrl area
+#define SPOT_X      (JBTN_X + JBTN_W + 8)    // 678
+#define SPOT_Y      MPOT_Y
+#define SPOT_GAP    28
+#define SPOT_COUNT  4
+// Pots at x: 678, 706, 734, 762 — right edge: 776 ≤ 820 ✓
 
 // ---- PC keyboard → GrvEP key mapping ----
 // Uses SDL_Scancode (physical key position, layout-independent: AZERTY/QWERTY/etc.)
@@ -152,11 +170,63 @@ static SDL_Window*   s_win     = nullptr;
 static SDL_Renderer* s_rend    = nullptr;
 static SDL_Texture*  s_oledTex = nullptr;
 
-// Mouse drag
+// Mouse drag (desktop) / single-touch controls (Android pots/joy)
 static int   s_dragPot = -1;
 static bool  s_dragJoy = false;
 static bool  s_keyDown[KBD_ROWS][KBD_COLS] = {};
 static int   s_mouseRow = -1, s_mouseCol = -1;
+
+// JOY_SW on-screen button — shared state for both desktop and Android
+static bool  s_jbtnDown = false;
+
+static bool jbtnHitTest(int lx, int ly) {
+    return lx >= JBTN_X && lx < JBTN_X + JBTN_W &&
+           ly >= JBTN_Y && ly < JBTN_Y + JBTN_H;
+}
+
+// ---- Android multi-touch finger tracking ----
+#ifdef __ANDROID__
+
+#define MAX_FINGERS 10
+struct FingerTarget {
+    SDL_FingerID id;
+    enum Kind { NONE, KEY, JOY, JBTN, POT } kind;
+    int  row, col;    // KEY
+    int  potIdx;      // POT
+    float lastX, lastY; // JOY & POT — physical pixel position
+};
+static FingerTarget s_fingers[MAX_FINGERS] = {};
+
+static FingerTarget* fingerFind(SDL_FingerID id) {
+    for (int i = 0; i < MAX_FINGERS; i++)
+        if (s_fingers[i].kind != FingerTarget::NONE && s_fingers[i].id == id)
+            return &s_fingers[i];
+    return nullptr;
+}
+static FingerTarget* fingerAlloc(SDL_FingerID id) {
+    for (int i = 0; i < MAX_FINGERS; i++)
+        if (s_fingers[i].kind == FingerTarget::NONE) {
+            s_fingers[i] = {};
+            s_fingers[i].id = id;
+            return &s_fingers[i];
+        }
+    return nullptr;
+}
+
+// Convert normalized finger [0..1] to logical window coordinates [0..WIN_W/WIN_H]
+// taking SDL's letterbox (from SDL_RenderSetLogicalSize) into account.
+static float s_lboxScale = 1.0f;  // physical pixels per logical pixel (from letterbox)
+
+static void fingerToLogical(SDL_TouchFingerEvent const& tf, int* lx, int* ly) {
+    int pw, ph;
+    SDL_GetWindowSize(s_win, &pw, &ph);
+    float physX = tf.x * pw, physY = tf.y * ph;
+    float fx, fy;
+    SDL_RenderWindowToLogical(s_rend, (int)physX, (int)physY, &fx, &fy);
+    *lx = (int)fx; *ly = (int)fy;
+}
+
+#endif // __ANDROID__
 
 // ---- OLED rendering ----
 static void drawOled() {
@@ -330,11 +400,36 @@ static void renderJoystick() {
             }
 }
 
-// ---- Help text ----
-static void renderHelp() {
-    // We don't have font rendering in SDL without SDL_ttf.
-    // Draw small indicator dots next to keyboard rows.
-    // Just draw colored row labels using thin lines.
+// ---- JOY_SW button (desktop + Android) ----
+static void renderJoyBtn() {
+    // Outer fill
+    uint8_t r = s_jbtnDown ? 240 : 180;
+    uint8_t g = s_jbtnDown ?  80 :  60;
+    uint8_t b = s_jbtnDown ?  40 :  20;
+    SDL_Rect btn = {JBTN_X, JBTN_Y, JBTN_W, JBTN_H};
+    SDL_SetRenderDrawColor(s_rend, r/3, g/3, b/3, 255);
+    SDL_RenderFillRect(s_rend, &btn);
+    SDL_SetRenderDrawColor(s_rend, r, g, b, 255);
+    SDL_RenderDrawRect(s_rend, &btn);
+    // Inner border for depth
+    SDL_Rect inner = {JBTN_X+3, JBTN_Y+3, JBTN_W-6, JBTN_H-6};
+    SDL_SetRenderDrawColor(s_rend, r, g, b, 180);
+    SDL_RenderDrawRect(s_rend, &inner);
+    // Draw "OK" as simple geometric shapes (no SDL_ttf)
+    int cx = JBTN_X + JBTN_W / 2, cy = JBTN_Y + JBTN_H / 2;
+    // "O" — circle approximated as squares
+    int rr = 12;
+    SDL_SetRenderDrawColor(s_rend, 255, 220, 180, 255);
+    for (int dy = -rr; dy <= rr; dy++)
+        for (int dx = -rr; dx <= rr; dx++) {
+            int d2 = dx*dx + dy*dy;
+            if (d2 >= (rr-3)*(rr-3) && d2 <= rr*rr)
+                SDL_RenderDrawPoint(s_rend, cx - 20 + dx, cy + dy);
+        }
+    // "K" — three lines (vertical bar + two diagonals)
+    SDL_RenderDrawLine(s_rend, cx+4, cy-rr+2, cx+4, cy+rr-2); // vertical
+    SDL_RenderDrawLine(s_rend, cx+4, cy,       cx+20, cy-rr+2); // upper diagonal
+    SDL_RenderDrawLine(s_rend, cx+4, cy,       cx+20, cy+rr-2); // lower diagonal
 }
 
 // ---- Hit tests ----
@@ -378,16 +473,43 @@ bool simWindowInit() {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return false;
     }
+#ifdef __ANDROID__
+    // Force landscape on Android, disable touch-to-mouse (we handle SDL_FINGER directly)
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+    // Fullscreen window — actual resolution determined by device
+    s_win = SDL_CreateWindow("GrvEP",
+        SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+        0, 0, SDL_WINDOW_FULLSCREEN_DESKTOP);
+#else
     s_win = SDL_CreateWindow("GrvEP Simulator",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WIN_W, WIN_H, SDL_WINDOW_SHOWN);
+        WIN_W, WIN_H, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+#endif
     if (!s_win) {
         fprintf(stderr, "CreateWindow: %s\n", SDL_GetError());
         return false;
     }
+    // Disable text input mode so the input method (IBus/Fcitx) does not intercept
+    // extended Latin keys (é, è, etc.) and swallow their SDL_KEYDOWN events.
+    SDL_StopTextInput();
     s_rend = SDL_CreateRenderer(s_win, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!s_rend) return false;
+
+    // Map our fixed logical canvas onto whatever the window size is (letterboxed).
+    // Mouse coords must be converted via SDL_RenderWindowToLogical (done in event handlers).
+    SDL_RenderSetLogicalSize(s_rend, WIN_W, WIN_H);
+
+#ifdef __ANDROID__
+    // Compute letterbox scale for converting physical finger deltas to logical units
+    {
+        int pw, ph;
+        SDL_GetWindowSize(s_win, &pw, &ph);
+        float sx = (float)pw / WIN_W, sy = (float)ph / WIN_H;
+        s_lboxScale = (sx < sy) ? sx : sy;
+    }
+#endif
 
     // ARGB8888: 0xFF000000 = opaque black, 0xFFFFFFFF = opaque white
     s_oledTex = SDL_CreateTexture(s_rend,
@@ -402,6 +524,25 @@ void simWindowDestroy() {
     if (s_rend)    { SDL_DestroyRenderer(s_rend); s_rend = nullptr; }
     if (s_win)     { SDL_DestroyWindow(s_win); s_win = nullptr; }
     SDL_Quit();
+}
+
+// Manual window→logical conversion that mirrors SDL_RenderSetLogicalSize letterboxing.
+// Avoids SDL_RenderWindowToLogical quirks on some platforms/DPI settings.
+static float getLetterboxScale() {
+    int winW, winH;
+    SDL_GetWindowSize(s_win, &winW, &winH);
+    float sx = (float)winW / WIN_W, sy = (float)winH / WIN_H;
+    return fminf(sx, sy);
+}
+
+static void windowToLogical(int wx, int wy, int* lx, int* ly) {
+    int winW, winH;
+    SDL_GetWindowSize(s_win, &winW, &winH);
+    float scale = getLetterboxScale();
+    int offsetX = (winW - (int)(WIN_W * scale)) / 2;
+    int offsetY = (winH - (int)(WIN_H * scale)) / 2;
+    *lx = (int)((wx - offsetX) / scale);
+    *ly = (int)((wy - offsetY) / scale);
 }
 
 bool simWindowPollEvents() {
@@ -422,6 +563,18 @@ bool simWindowPollEvents() {
             case SDL_SCANCODE_RIGHT: s_arrowRight = true; updateJoyFromKeys(); break;
             case SDL_SCANCODE_UP:    s_arrowUp    = true; updateJoyFromKeys(); break;
             case SDL_SCANCODE_DOWN:  s_arrowDown  = true; updateJoyFromKeys(); break;
+            // Numpad as redundant joystick (layout: 8=up, 2=down, 4=left, 6=right, 5=center, diagonals=7/9/1/3)
+            case SDL_SCANCODE_KP_4: s_arrowLeft  = true;  s_arrowRight = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_6: s_arrowRight = true;  s_arrowLeft  = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_8: s_arrowUp    = true;  s_arrowDown  = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_2: s_arrowDown  = true;  s_arrowUp    = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_7: s_arrowLeft  = true;  s_arrowRight = false; s_arrowUp   = true;  s_arrowDown = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_9: s_arrowRight = true;  s_arrowLeft  = false; s_arrowUp   = true;  s_arrowDown = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_1: s_arrowLeft  = true;  s_arrowRight = false; s_arrowDown = true;  s_arrowUp   = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_3: s_arrowRight = true;  s_arrowLeft  = false; s_arrowDown = true;  s_arrowUp   = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_5:
+                s_arrowLeft = s_arrowRight = s_arrowUp = s_arrowDown = false;
+                updateJoyFromKeys(); break;
             case SDL_SCANCODE_SPACE:
             case SDL_SCANCODE_RETURN: g_simJoySW = true; break;
             case SDL_SCANCODE_TAB:
@@ -440,6 +593,8 @@ bool simWindowPollEvents() {
                             simKeyPress(r, c, true);
                         }
                         found = true;
+                        fprintf(stderr, "[sim] key DOWN: scancode=%d sym=0x%x → row=%d col=%d (scancode match)\n",
+                                (int)e.key.keysym.scancode, (unsigned)e.key.keysym.sym, r, c);
                         break;
                     }
                 }
@@ -453,12 +608,14 @@ bool simWindowPollEvents() {
                                 simKeyPress(r, c, true);
                             }
                             found = true;
+                            fprintf(stderr, "[sim] key DOWN: scancode=%d sym=0x%x → row=%d col=%d (keycode match)\n",
+                                    (int)e.key.keysym.scancode, (unsigned)e.key.keysym.sym, r, c);
                             break;
                         }
                     }
                 }
                 if (!found) {
-                    fprintf(stderr, "[sim] unrecognized key: scancode=%d sym=0x%x\n",
+                    fprintf(stderr, "[sim] key DOWN UNRECOGNIZED: scancode=%d sym=0x%x\n",
                             (int)e.key.keysym.scancode, (unsigned)e.key.keysym.sym);
                 }
                 break;
@@ -472,6 +629,15 @@ bool simWindowPollEvents() {
             case SDL_SCANCODE_RIGHT: s_arrowRight = false; updateJoyFromKeys(); break;
             case SDL_SCANCODE_UP:    s_arrowUp    = false; updateJoyFromKeys(); break;
             case SDL_SCANCODE_DOWN:  s_arrowDown  = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_4: s_arrowLeft  = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_6: s_arrowRight = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_8: s_arrowUp    = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_2: s_arrowDown  = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_7: s_arrowLeft  = false; s_arrowUp   = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_9: s_arrowRight = false; s_arrowUp   = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_1: s_arrowLeft  = false; s_arrowDown = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_3: s_arrowRight = false; s_arrowDown = false; updateJoyFromKeys(); break;
+            case SDL_SCANCODE_KP_5: break; // center handled on press
             case SDL_SCANCODE_SPACE:
             case SDL_SCANCODE_RETURN: g_simJoySW = false; break;
             default: {
@@ -506,10 +672,14 @@ bool simWindowPollEvents() {
 
         // ---- Mouse ----
         case SDL_MOUSEBUTTONDOWN: {
-            int mx = e.button.x, my = e.button.y;
+            int mx, my;
+            windowToLogical(e.button.x, e.button.y, &mx, &my);
             int r, c, pidx;
             if (e.button.button == SDL_BUTTON_LEFT) {
-                if (keyHitTest(mx, my, &r, &c)) {
+                if (jbtnHitTest(mx, my)) {
+                    g_simJoySW = true;
+                    s_jbtnDown = true;
+                } else if (keyHitTest(mx, my, &r, &c)) {
                     s_mouseRow = r; s_mouseCol = c;
                     if (!s_keyDown[r][c]) {
                         s_keyDown[r][c] = true;
@@ -531,6 +701,10 @@ bool simWindowPollEvents() {
 
         case SDL_MOUSEBUTTONUP:
             if (e.button.button == SDL_BUTTON_LEFT) {
+                if (s_jbtnDown) {
+                    g_simJoySW = false;
+                    s_jbtnDown = false;
+                }
                 if (s_mouseRow >= 0) {
                     if (s_keyDown[s_mouseRow][s_mouseCol]) {
                         s_keyDown[s_mouseRow][s_mouseCol] = false;
@@ -553,23 +727,28 @@ bool simWindowPollEvents() {
             }
             break;
 
-        case SDL_MOUSEMOTION:
+        case SDL_MOUSEMOTION: {
+            // Relative mouse deltas are in physical pixels; divide by letterbox scale to get logical.
+            float sc = getLetterboxScale();
             if (s_dragPot >= 0 && s_dragPot < POT_COUNT && s_dragPot < 16) {
-                float delta = -(float)e.motion.yrel / (float)(POT_H - POT_W);
+                float delta = -(float)e.motion.yrel / sc / (float)(POT_H - POT_W);
                 g_simSlider[s_dragPot] = fmaxf(0.0f,
                     fminf(1.0f, g_simSlider[s_dragPot] + delta));
             }
             if (s_dragJoy) {
-                float dx = (float)e.motion.xrel / (float)JOY_R;
-                float dy = -(float)e.motion.yrel / (float)JOY_R;
+                float dx = (float)e.motion.xrel / sc / (float)JOY_R;
+                float dy = -(float)e.motion.yrel / sc / (float)JOY_R;
                 g_simJoyX = fmaxf(-1.0f, fminf(1.0f, g_simJoyX + dx));
                 g_simJoyY = fmaxf(-1.0f, fminf(1.0f, g_simJoyY + dy));
             }
             break;
+        }
 
         case SDL_MOUSEWHEEL: {
+            int wx, wy;
+            SDL_GetMouseState(&wx, &wy);
             int mx, my;
-            SDL_GetMouseState(&mx, &my);
+            windowToLogical(wx, wy, &mx, &my);
             int pidx;
             if (potHitTest(mx, my, &pidx) && pidx < 16) {
                 float delta = e.wheel.y * 0.025f;
@@ -579,9 +758,110 @@ bool simWindowPollEvents() {
             break;
         }
 
+        // ---- Android multi-touch (handles all input on mobile) ----
+#ifdef __ANDROID__
+        case SDL_FINGERDOWN: {
+            int lx, ly;
+            fingerToLogical(e.tfinger, &lx, &ly);
+            FingerTarget* ft = fingerAlloc(e.tfinger.fingerId);
+            if (!ft) break;
+            ft->kind = FingerTarget::NONE;
+            int r, c, pidx;
+            if (keyHitTest(lx, ly, &r, &c)) {
+                ft->kind = FingerTarget::KEY;
+                ft->row = r; ft->col = c;
+                if (!s_keyDown[r][c]) {
+                    s_keyDown[r][c] = true;
+                    simKeyPress(r, c, true);
+                }
+            } else if (jbtnHitTest(lx, ly)) {
+                ft->kind = FingerTarget::JBTN;
+                g_simJoySW = true;
+                s_jbtnDown = true;
+            } else if (joyHitTest(lx, ly)) {
+                ft->kind = FingerTarget::JOY;
+                int pw, ph; SDL_GetWindowSize(s_win, &pw, &ph);
+                ft->lastX = e.tfinger.x * pw;
+                ft->lastY = e.tfinger.y * ph;
+            } else if (potHitTest(lx, ly, &pidx)) {
+                ft->kind = FingerTarget::POT;
+                ft->potIdx = pidx;
+                int pw, ph; SDL_GetWindowSize(s_win, &pw, &ph);
+                ft->lastY = e.tfinger.y * ph;
+                // Jump pot to touched position
+                SDL_Rect knob, track;
+                potRect(pidx, &knob, &track);
+                float rel = 1.0f - (float)(ly - track.y) / (float)track.h;
+                g_simSlider[pidx] = fmaxf(0.0f, fminf(1.0f, rel));
+            }
+            break;
+        }
+        case SDL_FINGERUP: {
+            FingerTarget* ft = fingerFind(e.tfinger.fingerId);
+            if (!ft) break;
+            if (ft->kind == FingerTarget::KEY) {
+                if (s_keyDown[ft->row][ft->col]) {
+                    s_keyDown[ft->row][ft->col] = false;
+                    simKeyPress(ft->row, ft->col, false);
+                }
+            } else if (ft->kind == FingerTarget::JBTN) {
+                g_simJoySW = false;
+                s_jbtnDown = false;
+            } else if (ft->kind == FingerTarget::JOY) {
+                g_simJoyX = 0.0f;
+                g_simJoyY = 0.0f;
+            }
+            ft->kind = FingerTarget::NONE;
+            break;
+        }
+        case SDL_FINGERMOTION: {
+            FingerTarget* ft = fingerFind(e.tfinger.fingerId);
+            if (!ft) break;
+            int pw, ph; SDL_GetWindowSize(s_win, &pw, &ph);
+            float physX = e.tfinger.x * pw, physY = e.tfinger.y * ph;
+            if (ft->kind == FingerTarget::JOY) {
+                float dx = (physX - ft->lastX) / (JOY_R * s_lboxScale);
+                float dy = -(physY - ft->lastY) / (JOY_R * s_lboxScale);
+                g_simJoyX = fmaxf(-1.0f, fminf(1.0f, g_simJoyX + dx));
+                g_simJoyY = fmaxf(-1.0f, fminf(1.0f, g_simJoyY + dy));
+                ft->lastX = physX; ft->lastY = physY;
+            } else if (ft->kind == FingerTarget::POT) {
+                float dy = -(physY - ft->lastY) / (POT_H * s_lboxScale);
+                g_simSlider[ft->potIdx] = fmaxf(0.0f,
+                    fminf(1.0f, g_simSlider[ft->potIdx] + dy));
+                ft->lastY = physY;
+            }
+            break;
+        }
+#endif // __ANDROID__
+
         } // switch
     }
     return true;
+}
+
+static void renderPanels() {
+    // Left panel background
+    SDL_Rect lp = {0, 0, SPLIT_X, WIN_H};
+    SDL_SetRenderDrawColor(s_rend, 16, 16, 20, 255);
+    SDL_RenderFillRect(s_rend, &lp);
+
+    // Right panel top (keyboard area)
+    SDL_Rect rt = {SPLIT_X, 0, WIN_W - SPLIT_X, CTRL_Y};
+    SDL_SetRenderDrawColor(s_rend, 20, 20, 26, 255);
+    SDL_RenderFillRect(s_rend, &rt);
+
+    // Right panel bottom (ctrl area)
+    SDL_Rect rb = {SPLIT_X, CTRL_Y, WIN_W - SPLIT_X, WIN_H - CTRL_Y};
+    SDL_SetRenderDrawColor(s_rend, 18, 22, 28, 255);
+    SDL_RenderFillRect(s_rend, &rb);
+
+    // Vertical divider
+    SDL_SetRenderDrawColor(s_rend, 50, 50, 60, 255);
+    SDL_RenderDrawLine(s_rend, SPLIT_X, 0, SPLIT_X, WIN_H);
+
+    // Horizontal divider (right panel)
+    SDL_RenderDrawLine(s_rend, SPLIT_X, CTRL_Y, WIN_W, CTRL_Y);
 }
 
 void simWindowRender() {
@@ -590,10 +870,12 @@ void simWindowRender() {
     SDL_SetRenderDrawColor(s_rend, 18, 18, 22, 255);
     SDL_RenderClear(s_rend);
 
+    renderPanels();
     renderOled();
     renderKeyboard();
     renderPots();
     renderJoystick();
+    renderJoyBtn();
 
     SDL_RenderPresent(s_rend);
 }

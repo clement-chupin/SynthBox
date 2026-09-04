@@ -1,0 +1,57 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace "com.grvep.simulator"
+    compileSdkVersion 33
+
+    ndkVersion "26.1.10909125"
+
+    defaultConfig {
+        applicationId "com.grvep.simulator"
+        minSdkVersion 21
+        targetSdkVersion 33
+        versionCode 1
+        versionName "1.0"
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DANDROID_STL=c++_shared",
+                          "-DANDROID_ARM_NEON=TRUE"
+                // Only arm64-v8a for modern phones
+                abiFilters "arm64-v8a"
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            jniDebuggable true
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
+        }
+    }
+
+    sourceSets {
+        main {
+            // Include SDL2 Java sources bundled with the project
+            java.srcDirs = ['src/main/java']
+        }
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    // No external dependencies — fully native
+}

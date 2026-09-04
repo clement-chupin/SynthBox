@@ -1,6 +1,12 @@
 // sim_main.cpp — entry point for the GrvEP PC simulator
 // Calls the real setup() in a pthread, then runs the SDL event loop.
 
+// SDL_main.h must be included before main() is defined.
+// On Android it applies: #define main SDL_main
+// so SDLActivity can find the SDL_main symbol in libmain.so.
+// On Linux/Desktop this include is harmless (no rename occurs).
+#include <SDL2/SDL.h>
+
 #include "sim_state.h"
 #include <pthread.h>
 #include <unistd.h>

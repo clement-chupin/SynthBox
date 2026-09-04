@@ -18,6 +18,7 @@ void audioTrackerInit();           // initialize one AMY synth channel per track
 void audioTrackerNoteOn(uint8_t trackIdx, uint8_t midiNote, float vel);
 void audioTrackerNoteOff(uint8_t trackIdx, uint8_t midiNote);
 void audioRestoreShapeFilter(SynthShape shape); // restore native filter after FX filter off
+void audioGetNativeCutoff(SynthShape shape, float& cc, float& res); // native cutoff/res for a shape (patch-aware)
 void audioSetVolume(float vol);
 void audioSetFilter(float cutoffHz, float resonance);
 void audioSetAllFilters(float cutoffHz, float resonance); // LPF on synth + all sample/seq oscs (0=open)
@@ -26,6 +27,7 @@ void audioSetFilterFreq(float cutoffHz, float resonance); // update cutoff/reso 
 void audioSetGranular2FilterFreq(float cutoffHz, float resonance); // smooth update for currently-playing GR2 oscillators
 void audioSetPCMFilter(float cutoffHz, float resonance);  // future PCM triggers only (0=off)
 void audioSetFmParams(float depth, float cutoffHz, float resonance);
+void audioSetFmDepth(float depth);  // feedback only for SHAPE_SAW_FM (ALGO), no filter reset
 void audioStopAllSamples();  // velocity=0 on all PCM oscillators (call when leaving sample/seq mode)
 
 // Effects (bus 0)
@@ -35,6 +37,7 @@ void audioSetDelay(float level, float delay_ms, float feedback, float filter_coe
 void audioSetOverdrive(float drive);
 void audioSetDistortion(float drive, float tone);
 void audioSetEq(float low, float mid, float high);  // 3-band EQ: 1.0=flat, >1 boost, <1 cut
+void audioSetWavefold(float gain);  // global wavefold on bus 0: 1.0=dry, >1 folds (gain = 1/threshold)
 
 // Preview: aborts any in-progress load, loads file into preview preset and plays.
 void audioLoadAndPlay(const char* path, uint16_t preset, float vel);
@@ -64,6 +67,34 @@ void audioClearAllKeys();  // abort pending loads and mark all keys unloaded
 void audioLoadDrumSamples();
 void audioPlayDrumPad(uint8_t col, float vel);
 const char* audioDrumPadLabel(uint8_t col);
+
+// ==================== STONE (sample tone) ====================
+// One SD sample played pitched across the keyboard, like a normal synth voice. Polyphony
+// is a small round-robin over fixed, directly-addressed oscillators (not an AMY channel).
+// audioStoneInit: reset voice-tracking state (call once on entering MODE_STONE).
+// audioLoadStone: background load into the sample slot (aborts any in-flight load, like preview).
+// audioIsStoneReady: true once the background load completed successfully.
+void audioStoneInit();
+void audioLoadStone(const char* path);
+bool audioIsStoneReady();
+void audioStoneNoteOn(uint8_t note, float velocity);
+void audioStoneNoteOff(uint8_t note);
+void audioStoneAllNotesOff();
+// Advances any releasing STONE voices' software fade-out; call every ~10ms from
+// main.cpp's loop() (cheap no-op when nothing is releasing).
+void audioStoneFadeTick();
+// Waveform (128 peak bins) from the pristine loaded buffer, for OLED display.
+bool audioComputeStoneWaveform(uint8_t* waveform128);
+// Re-windows the played sample to [startFrac,endFrac] (0..1) of the loaded buffer —
+// start/end/position/size editing, granular2-style. Safe to call while notes sound.
+// loopMode should match audioStoneSetLoopMode()'s current setting (registers extra
+// safety headroom so a live-looping voice doesn't glitch while the window is dragged).
+void audioStoneApplyWindow(float startFrac, float endFrac, bool loopMode = false);
+// Loop mode: when on, newly-triggered notes loop within the current [start,end]
+// window instead of playing through once. Toggle from UI; takes effect on the next
+// note-on (does not retroactively change already-sounding voices).
+void audioStoneSetLoopMode(bool loop);
+bool audioStoneGetLoopMode();
 
 // Legacy wrappers (delegate to audioLoadAndPlay with vel=0)
 bool audioLoadFromSD(const char* path, uint16_t preset);
@@ -115,7 +146,8 @@ void audioLoadGranular2Source(const char* path, uint8_t sampleIdx);
 bool audioIsGranular2Ready(uint8_t sampleIdx);
 uint8_t audioComputeGranular2Slices(uint8_t sampleIdx, uint8_t nSlices, uint8_t* waveform128);
 void audioApplyGranular2Splits(uint8_t sampleIdx, float* splits, int N, bool lopMode = false);
-void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, bool reverse, float vel, uint8_t playMode = 0, uint16_t attackMs = 5);
+// amyTime: AMY sysclock timestamp (ms) at which playback should start; UINT32_MAX = immediate.
+void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, bool reverse, float vel, uint8_t playMode = 0, uint16_t attackMs = 5, uint32_t amyTime = UINT32_MAX);
 // FUL mode: startFrac = splits[sliceIdx] (fwd) or 1-splits[sliceIdx+1] (rev)
 void audioPlayGranular2Ful(uint8_t oscIdx, uint8_t sampleIdx, bool reverse, float vel, float startFrac);
 void audioStopGranular2(uint8_t oscIdx);

@@ -11,6 +11,9 @@
 #include <string>
 #include "Arduino.h"
 #include "SPI.h"
+#ifdef __ANDROID__
+#include <SDL2/SDL.h>
+#endif
 
 #define FILE_READ   "r"
 #define FILE_WRITE  "w"
@@ -20,6 +23,16 @@
 #define O_CREAT 4
 
 static inline std::string simSdRoot() {
+#ifdef __ANDROID__
+    // HOME is never set for an Android app process, so the desktop fallback
+    // below resolves to an undefined/likely-unwritable "./Music" here. Use the
+    // app's own external files dir instead — always available, no permissions
+    // needed. This is also where the SAF import (GrvActivity.java) copies
+    // picked-folder files into, so imported files land exactly where the rest
+    // of the app already expects its "SD card" to be.
+    const char* ext = SDL_AndroidGetExternalStoragePath();
+    if (ext && ext[0]) return std::string(ext);
+#endif
     const char* home = getenv("HOME");
     return std::string(home ? home : ".") + "/Music";
 }
@@ -86,7 +99,15 @@ public:
     uint32_t size()     const { return (uint32_t)_size; }
     uint32_t position() const { return _fp ? (uint32_t)ftell(_fp) : 0; }
     bool seek(uint32_t pos)   { return _fp ? (fseek(_fp, pos, SEEK_SET) == 0) : false; }
-    bool available()          { return _fp && !feof(_fp); }
+    // Matches the real Arduino File::available() contract: remaining byte count (not a
+    // boolean) — callers like the WAV/MP3 chunk parsers compare it against thresholds
+    // (e.g. "> 8" to ensure a full chunk header is left to read).
+    int available() {
+        if (!_fp) return 0;
+        long cur = ftell(_fp);
+        long remain = (long)_size - cur;
+        return remain > 0 ? (int)remain : 0;
+    }
 
 private:
     FILE*       _fp;

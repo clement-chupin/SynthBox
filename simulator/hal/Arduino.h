@@ -19,6 +19,11 @@ extern float g_simJoyY;   // -1.0 .. 1.0
 extern bool  g_simJoySW;  // true = pressed
 extern float g_simSlider[16]; // 0.0 .. 1.0
 
+// ---- ESP32 PSRAM attribute (no-op on simulator) ----
+#ifndef EXT_RAM_ATTR
+#define EXT_RAM_ATTR
+#endif
+
 // ---- Types ----
 typedef uint8_t  byte;
 typedef bool     boolean;
@@ -266,7 +271,8 @@ extern EspClass ESP;
 #define MALLOC_CAP_SPIRAM   (1 << 3)
 #define MALLOC_CAP_INTERNAL (1 << 0)
 #define MALLOC_CAP_8BIT     (1 << 2)
-static inline size_t heap_caps_get_free_size(uint32_t) { return 4 * 1024 * 1024; }
+static inline size_t heap_caps_get_free_size(uint32_t) { return 512u * 1024u * 1024u; }
+static inline size_t heap_caps_get_largest_free_block(uint32_t) { return 512u * 1024u * 1024u; }
 static inline void*  heap_caps_malloc(size_t sz, uint32_t) { return malloc(sz); }
 static inline void   heap_caps_free(void* p) { free(p); }
 

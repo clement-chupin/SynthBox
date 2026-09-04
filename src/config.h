@@ -11,8 +11,7 @@ enum AppMode : uint8_t {
     MODE_LIGHTPLAY, // live light ripple mode
     MODE_BATTERY,
     MODE_SYSINFO,   // cyberpunk HUD — system info / visual test
-    MODE_HYBRID,    // synth note + assigned sample triggered simultaneously
-    MODE_MOD2,      // PolyAnalog-inspired: waveform morph, power-law filter, LFO dest toggle
+    MODE_MOD2,      // modular analog synth: algorithm browser + P4-P7 modulation
     MODE_GRANULAR2, // granular2: multi-sample (2 or 4), fwd+rev only, per-sample split control
     MODE_MIDI,      // USB MIDI device: keyboard → NoteOn/Off, host → LED feedback (LaunchPad)
     MODE_TRACKER,   // 32-step quantized recorder: left 4×4 = instruments, right 4×4 = notes
@@ -22,6 +21,19 @@ enum AppMode : uint8_t {
     MODE_SS2,       // 16-step sample sequencer: 16 slots, per-step alteration, shared clock
     MODE_ANIM,      // visual animations: wave / bars / techno / acid / 8bit
     MODE_I303,      // polyphonic TB-303: 6-voice chord/melody with full 303S sound engine
+    MODE_VID,       // video player: 128×128 1bpp .bvid files from SD card
+    MODE_LANIM,     // LED animations: flash, rainbow, chase, noise, organic — pot-controlled
+    MODE_EXP,       // experimental theremin: joystick Y=pitch X=texture, keys=modifiers
+    MODE_EXP2,      // polybounce: balls in rotating hexagon, bounces trigger notes
+    MODE_EXP3,      // orbital: planets orbit star, passing trigger zone plays notes
+    MODE_303S2,     // live 303 recorder: last 13 played notes loop at BPM
+    MODE_POKEMON,   // theremin-like pokemon mode: 25 pokemon, each with AMY synthesis timbre
+    MODE_MODULAR,   // 6-encoder modular: OSC/filter/env/LFO + joystick velocity
+    MODE_GEST,      // sequencer manager: 4×8 pattern grid, volume pots, copy/paste, LOOP/LIVE
+    MODE_PCMCLEAN,  // SD cache cleaner: recursively delete all .pcm/.pcm16 cache files
+    MODE_STONE,     // sample tone: one SD sample pitched across the keyboard; JY=browse P2=cycle folder
+    MODE_DR2,       // hierarchical drum sequencer: 64 steps addressed as beat.step.micro (4.4.4)
+    MODE_IMPORT,    // Android-only: SAF folder picker, imports phone files onto the SD root
     MODE_COUNT
 };
 
@@ -30,19 +42,37 @@ enum AppMode : uint8_t {
 enum MenuItem : uint8_t {
     MENU_SYNTH, MENU_OMNI, MENU_SAMPLE,
     MENU_LIGHT, MENU_LIGHTPLAY, MENU_SD,
-    MENU_ABOUT, MENU_HYBRID, MENU_MOD2,
+    MENU_ABOUT, MENU_MOD2,
     MENU_GRANULAR2, MENU_MIDI, MENU_TRACKER,
     MENU_DRUM2, MENU_SYSEQ, MENU_303S,
     MENU_SS2, MENU_ANIM, MENU_I303,
+    MENU_VID,
+    MENU_LANIM,
+    MENU_EXP,
+    MENU_EXP2,
+    MENU_EXP3,
+    MENU_303S2,
+    MENU_POKEMON,
+    MENU_MODULAR,
+    MENU_GEST,
+    MENU_PCMCLEAN,
+    MENU_STONE,
+    MENU_DR2,
+    MENU_IMPORT,
     MENU_ITEM_COUNT
 };
 static const char* menuLabels[] = {
     "SYNTH","OMNI","SAMPL",
     "LIGHT","LPLY","DIAG",
-    "BATT","HYBRD","MODUL",
+    "BATT","MOD2",
     "GRANU","MIDI","TRKR",
     "DRUMS","SYNS","303S",
-    "SAMPS","ANIM","I303"
+    "SAMPS","ANIM","I303",
+    "VIDEO","LANIM","EXP",
+    "EXP2","EXP3","303S",
+    "PKMN","MODUL","GEST",
+    "PURGPCM","STONE","GEST2",
+    "IMPORT"
 };
 #define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
 
@@ -150,6 +180,25 @@ static const char* fxNames[] = {"LPF","DRIVE","DELAY","REVERB"};
 #define SAMPLE_OSC_BASE     182  // AMY oscillators 182-213 for key sample playback (above SYNTH_CH range 125-148 and GRANULAR 150-181)
 #define SAMPLE_KEY_COUNT     32  // 4×8 keys, each can hold one RAM-loaded sample
 
+// ==================== STONE (sample tone) ====================
+// One SD sample, pitched across the keyboard like a normal synth voice: AMY reads the
+// PCM preset's midinote (always 69, native rate) vs the event's midi_note to compute
+// the playback speed ratio, exactly like a classic sampler root-key mapping.
+// Uses fixed, directly-addressed oscillators (own round-robin polyphony) rather than an
+// AMY multi-voice channel (e.synth=N + num_voices): the dynamic voice allocator pulls from
+// a shared oscillator pool that isn't aware of the fixed ranges other subsystems address
+// directly (GRANULAR_OSC_BASE, SAMPLE_OSC_BASE, DRUM_OSC_BASE, AMY_OSC_DRUM_BASE) — with
+// enough channels already competing for that pool, a new channel can land on and corrupt
+// one of those fixed oscillators. Fixed osc addressing (this pattern, same as SAMPLE/
+// GRANULAR/DRUM) sidesteps that collision entirely.
+#define STONE_PRESET     361   // AMY preset slot actually played from; re-windowed in place via
+                                // pcm_register_extern16 to point into STONE_SOURCE_PRESET's buffer
+                                // (start/end window editing, main.cpp audioStoneApplyWindow() calls).
+#define STONE_VOICES       6   // polyphony (round-robin across fixed oscillators)
+#define STONE_OSC_BASE   240   // AMY oscillators 240-245 (250 max_oscs; clear of all other fixed ranges)
+#define STONE_SOURCE_PRESET 362  // pristine 16-bit full-length buffer loaded from disk (pointer/length
+                                 // database only, never played directly) — mirrors GRAN2_SOURCE_BASE.
+
 // ==================== GRANULAR ====================
 // Row layout (8-slice mode): R0=one-shot px, R1=px+px+1, R2=sx→end, R3=px reversed
 // GRANULAR_SOURCE_PRESET: raw decoded sample (waveform display)
@@ -208,16 +257,51 @@ static const char* fxNames[] = {"LPF","DRIVE","DELAY","REVERB"};
 #define SS2_SLOTS    16
 #define SS2_KEY_BASE  0   // keyIdx 0-15
 
-// MOD2 waveform morph: 3 zones across encoder range
-static const SynthShape mod2ShapeSteps[] = {
-    SHAPE_SAW, SHAPE_SUPERSAW, SHAPE_SQUARE, SHAPE_SINE,
-    SHAPE_ACID, SHAPE_BASS, SHAPE_PLUCK, SHAPE_HOOVER
+// ==================== MOD2 — Modular Synthesizer Algorithms ====================
+// Each algorithm is a distinct synthesis topology with 4 exposed patch parameters (P4-P7).
+// P2 = algo selection (discrete steps), B3 = visual algo browser overlay.
+
+struct Mod2ParamDef {
+    const char* name;   // ≤4 chars for OLED display
+    float       mn;     // minimum real value
+    float       mx;     // maximum real value
+    float       dflt;   // default (normalized 0-1)
 };
-static const char* mod2ShapeStepNames[] = {"SAW","SSAW","SQR","SIN","ACID","BASS","PLCK","HOVR"};
-#define MOD2_SHAPE_COUNT 8
+
+struct Mod2AlgoDef {
+    const char*    name;   // ≤4 chars
+    const char*    desc;   // short description (≤20 chars)
+    SynthShape     shape;  // base AMY synthesis shape
+    Mod2ParamDef   p[4];   // P4, P5, P6, P7 descriptors
+};
+
+static const Mod2AlgoDef kMod2Algos[] = {
+    //  name   desc                shape           P4                   P5                   P6                   P7
+    { "VCO ", "SAW+filter+drive", SHAPE_SAW,
+      {{"Cut",80,8000,0.50f}, {"Res",0.5f,12,0.08f}, {"Drv",1.0f,4.0f,0.0f}, {"Dcy",10,2000,0.25f}} },
+
+    { "DUO ", "Dual SAW+reverb",  SHAPE_SUPERSAW,
+      {{"Cut",80,8000,0.50f}, {"Res",0.5f,8,0.08f},  {"Sat",1.0f,4.0f,0.0f}, {"Rvb",0,1,0.0f}} },
+
+    { "FM2 ", "FM algo+reverb+chorus", SHAPE_SAW_FM,
+      {{"Dpt",0,7,1.4f},      {"Rvb",0,1,0.15f},     {"Chr",0,1,0.0f},      {"Drv",1.0f,3.0f,0.0f}} },
+
+    { "ACID", "303 acid resonance",SHAPE_SAW,
+      {{"Cut",80,2000,0.30f}, {"Res",2.0f,16,0.30f}, {"Dcy",20,800,0.35f},  {"Drv",1.0f,3.0f,0.0f}} },
+
+    { "PAD ", "Supersaw+chorus",   SHAPE_SUPERSAW,
+      {{"Cut",200,8000,0.70f},{"Chr",0,1,0.30f},     {"Rvb",0,1,0.40f},     {"Sat",0,2.0f,0.0f}} },
+
+    { "PLCK", "Pluck+brightness",  SHAPE_PLUCK,
+      {{"Brg",500,8000,0.65f},{"Res",0.5f,4,0.08f}, {"Drv",1.0f,3.0f,0.0f},{"Dcy",20,500,0.20f}} },
+
+    { "LEAD", "Hoover+hard drive", SHAPE_HOOVER,
+      {{"Drv",1.0f,8.0f,0.25f},{"Cut",200,8000,0.50f},{"Res",0.5f,8,0.10f},{"Dpt",0,1,0.20f}} },
+};
+#define MOD2_ALGO_COUNT  7
 
 // MOD2 LFO combined mode: destination × waveform shape
-// Btn1 cycles all 13 modes: Off, then Pitch×6 shapes, then Filter×6 shapes
+// B4 cycles 7 modes: Off, Pitch×3 shapes, Filter×3 shapes
 #define MOD2_LFO_MODE_COUNT 13
 // dest: 0=None 1=Pitch 2=Filter
 static const uint8_t mod2LfoModeDest[]  = {0, 1,1,1,1,1,1, 2,2,2,2,2,2};
@@ -234,25 +318,29 @@ enum Mod2PlayMode : uint8_t { MOD2_POLY=0, MOD2_MONO, MOD2_SLIDE, MOD2_PLAY_COUN
 static const char* mod2PlayModeNames[] = {"Poly","Mono","Slid"};
 
 static const char* btnLabels[][4] = {
-    {"FX","Scl/Arp","Env","Instr"},  // SYNTH
-    {"Shape","Mix","Sus","Oct"},     // OMNI
-    {"Patt","Play","Clr","Bank"},    // SAMPLE
-    {"Spd","Sprd","Brt","Sat"},      // LIGHT
-    {"","","",""},                   // LIGHTPLAY
-    {"","","",""},                   // BATTERY
-    {"","","",""},                   // SYSINFO
-    {"Scale","Env","Mix","Oct"},     // HYBRID
-    {"OSC","Env","Flt","Oct"},       // MODULAR
-    {"Ptch-","Ptch+","","Oct"},      // MOD2
-    {"LFO","Mode","Oct",""},         // 303
-    {"FX","Wv/Arp","Sus","Tone"},    // GRANULAR
-    {"","","",""},                   // GRANULAR2
-    {"","","",""},                   // MIDI
-    {"","","",""},                   // TRACKER
-    {"FX","Ply","Rec","Seq"},        // DRUM2
-    {"FX","Ply","Env","Seq"},        // SYSEQ (SYNS)
-    {"FX","Ply","Opt","Seq"},        // 303S
-    {"Bck","FX","Map","Seq"},        // SS2 (SAMPS)
-    {"","","",""},                   // ANIM
-    {"FX","Wv","Sld","Oct"},         // I303
+    {"FX","Scl/Arp","Env","Instr"},  // SYNTH      (0)
+    {"Shape","Mix","Sus","Oct"},     // OMNI       (1)
+    {"Patt","Play","Clr","Bank"},    // SAMPLE     (2)
+    {"Spd","Sprd","Brt","Sat"},      // LIGHT      (3)
+    {"","","",""},                   // LIGHTPLAY  (4)
+    {"","","",""},                   // BATTERY    (5)
+    {"","","",""},                   // SYSINFO    (6)
+    {"FX","Env","Algo","Md"},        // MOD2       (7)
+    {"","","",""},                   // GRANULAR2  (8)
+    {"","","",""},                   // MIDI       (9)
+    {"","","",""},                   // TRACKER    (10)
+    {"FX","Ply","Rec","Seq"},        // DRUM2      (11)
+    {"FX","Ply","Env","Seq"},        // SYSEQ      (12)
+    {"FX","Ply","Opt","Seq"},        // 303S       (13)
+    {"Bck","FX","Map","Seq"},        // SS2        (14)
+    {"","","",""},                   // ANIM       (15)
+    {"FX","Wv","Sld","Oct"},         // I303       (16)
+    {"","","",""},                   // VID        (17)
+    {"","","",""},                   // LANIM      (18)
+    {"","","",""},                   // EXP        (19)
+    {"","","",""},                   // EXP2       (20)
+    {"","","",""},                   // EXP3       (21)
+    {"","","",""},                   // 303S2      (22)
+    {"","","",""},                   // POKEMON    (23)
+    {"OSC","Env","Flt","Oct"},       // MODULAR    (24)
 };

@@ -10,3 +10,16 @@
 .vscode/ipch
 .clang_complete
 compile_commands.json
+
+# Desktop simulator build artifacts
+simulator/build/
+
+# Android native (SDL2) build artifacts — see android-native/.gitignore for details
+android-native/app/build/
+android-native/app/.cxx/
+android-native/.gradle/
+android-native/local.properties
+android-native/SDL2/
+
+# Keep only the packaged APK to publish
+!releases/*.apk

@@ -53,3 +53,7 @@ static inline uint32_t xTaskGetTickCount() {
 static inline void taskYIELD() { sched_yield(); }
 static inline void taskENTER_CRITICAL() {}
 static inline void taskEXIT_CRITICAL() {}
+
+// Task notification stubs (no-op in simulator)
+static inline void xTaskNotifyGive(TaskHandle_t) {}
+static inline uint32_t ulTaskNotifyTake(int, uint32_t) { return 1; }
