@@ -33,7 +33,17 @@ static inline std::string simSdRoot() {
     const char* ext = SDL_AndroidGetExternalStoragePath();
     if (ext && ext[0]) return std::string(ext);
 #endif
+#ifdef _WIN32
+    // HOME isn't a thing on Windows — that's the POSIX/Linux convention this fell
+    // back to (silently landing on ".\Music", relative to wherever the .exe happened
+    // to be launched from, which is empty and not where anyone would expect their
+    // files) instead of the user's actual profile folder. USERPROFILE is the right
+    // equivalent (e.g. C:\Users\<name>), giving the same "<home>/Music" convention
+    // as Linux/Android — put files in %USERPROFILE%\Music.
+    const char* home = getenv("USERPROFILE");
+#else
     const char* home = getenv("HOME");
+#endif
     return std::string(home ? home : ".") + "/Music";
 }
 

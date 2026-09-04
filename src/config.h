@@ -68,7 +68,7 @@ static const char* menuLabels[] = {
     "GRANU","MIDI","TRKR",
     "DRUMS","SYNS","303S",
     "SAMPS","ANIM","I303",
-    "VIDEO","LANIM","EXP",
+    "MEDIA","LANIM","EXP",
     "EXP2","EXP3","303S",
     "PKMN","MODUL","GEST",
     "PURGPCM","STONE","GEST2",

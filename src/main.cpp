@@ -1151,6 +1151,10 @@ static uint32_t vidFrameCount  = 0;
 static uint32_t vidCurrentFrame = 0;
 static uint32_t vidLastFrameMs = 0;
 static EXT_RAM_ATTR uint8_t  vidFrameBuf[128 * 128 / 8];  // 2048 bytes in PSRAM
+// MEDIA mode (MODE_VID) .wav/.mp3 preview playback — same PCM_PREVIEW_PRESET/
+// audioLoadAndPlay() mechanism MODE_SAMPLE's browser already uses.
+static bool     mediaAudioPlaying = false;
+static String   mediaAudioPath;
 
 // ==================== DRANI STATE ====================
 // Folder of .bvid images: first = base layer, next 8 = per-drum overlays.
@@ -1435,6 +1439,10 @@ bool isImgFile(const char* name) {
     return ext && (strcasecmp(ext,".jpg")==0 || strcasecmp(ext,".jpeg")==0 || strcasecmp(ext,".png")==0);
 }
 bool isVidOrImgFile(const char* name) { return isVidFile(name) || isImgFile(name); }
+// MEDIA mode's own browser filter — everything MODE_VID can open (.bvid/.png/.jpg/.jpeg
+// plus .wav/.mp3). Deliberately separate from isVidOrImgFile(): MODE_DRUM2's animation-
+// folder browser reuses isVidOrImgFile() too and must NOT gain audio files.
+bool isMediaFile(const char* name) { return isVidOrImgFile(name) || isAudioFile(name); }
 
 // Floyd-Steinberg-dithers `gray` (srcW x srcH, 1 byte/pixel) into a centered,
 // letterboxed 128x128 1bpp frame (MSB-first per byte, row-major) — a C++ port of
@@ -1851,7 +1859,7 @@ void switchMode(AppMode newMode) {
     { static const char* kVizMode[MODE_COUNT]={
           "SYNTH","OMNI","SAMPL","LIGHT","LPLY",
           "BATT","DIAG","MOD2","GRANU",
-          "MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303","VID","LANIM",
+          "MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303","MEDIA","LANIM",
           "EXP","EXP2","EXP3","303S","PKMN","MODUL","GEST",
           "PURGPCM","STONE","GEST2","IMPORT"};
       // This array must have exactly MODE_COUNT entries in AppMode order — the
@@ -1864,8 +1872,9 @@ void switchMode(AppMode newMode) {
     if (currentMode==MODE_VID && newMode!=MODE_VID) {
         if (vidFileOpen) { vidFile.close(); vidFileOpen=false; }
         vidPlaying=false;
+        if (mediaAudioPlaying) { audioStopSamplePreset(PCM_PREVIEW_PRESET); mediaAudioPlaying=false; }
     }
-    if (newMode==MODE_VID   && sdReady) sdListDir("/", isVidOrImgFile);
+    if (newMode==MODE_VID   && sdReady) sdListDir("/", isMediaFile);
     if (newMode==MODE_PCMCLEAN) { pcmCleanPhase=0; pcmCleanDeleted=0; pcmCleanScanned=0; pcmCleanRunning=false; }
     if (newMode==MODE_IMPORT)   { importPhase=0; importDone=0; importTotal=0; }
     if (newMode==MODE_STONE) {
@@ -2546,14 +2555,17 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                         break;
                     }
                     case MODE_VID: {
-                        if (vidPlaying) {
+                        if (mediaAudioPlaying) {
+                            audioStopSamplePreset(PCM_PREVIEW_PRESET); mediaAudioPlaying=false;
+                            sdListDir(sdPath.c_str(), isMediaFile);
+                        } else if (vidPlaying) {
                             vidFile.close(); vidFileOpen=false; vidPlaying=false;
-                            sdListDir(sdPath.c_str(), isVidOrImgFile);
+                            sdListDir(sdPath.c_str(), isMediaFile);
                         } else if (sdPath == "/") {
                             audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true;
                         } else {
                             int ls=sdPath.lastIndexOf('/',sdPath.length()-2);
-                            sdListDir(ls<=0?"/":sdPath.substring(0,ls+1), isVidOrImgFile);
+                            sdListDir(ls<=0?"/":sdPath.substring(0,ls+1), isMediaFile);
                         }
                         break;
                     }
@@ -5573,15 +5585,27 @@ void drawScreen(bool blockWait) {
                 oled.drawStr(0, 127, "B1=nxt B3=prv P1=spd P2");
                 break;
             }
-            // ---- VID ----
+            // ---- MEDIA (formerly VIDEO) — plays .bvid/.png/.jpg/.jpeg as before, plus
+            // .wav/.mp3 preview playback via the same PCM_PREVIEW_PRESET mechanism
+            // MODE_SAMPLE's browser already uses. ----
             case MODE_VID: {
                 if (vidPlaying && vidFileOpen) {
                     // Full-screen 1bpp video — drawBitmap: MSB of each byte = leftmost pixel
                     oled.drawBitmap(0, 0, 16, 128, vidFrameBuf);
+                } else if (mediaAudioPlaying) {
+                    oled.setFont(u8g2_font_4x6_tf);
+                    oled.drawStr(0, 7, "MEDIA - playing audio");
+                    oled.drawHLine(0, 9, 128);
+                    oled.setFont(u8g2_font_5x7_tf);
+                    { int ls = mediaAudioPath.lastIndexOf('/');
+                      String fn = ls >= 0 ? mediaAudioPath.substring(ls + 1) : mediaAudioPath;
+                      oled.drawStr(0, 55, fn.c_str()); }
+                    oled.setFont(u8g2_font_4x6_tf);
+                    oled.drawStr(0, 122, "B1/click = stop");
                 } else {
                     oled.setFont(u8g2_font_4x6_tf);
                     char pb[32];
-                    snprintf(pb, sizeof(pb), "VIDEO %.22s", sdPath.c_str());
+                    snprintf(pb, sizeof(pb), "MEDIA %.22s", sdPath.c_str());
                     oled.drawStr(0, 7, pb);
                     oled.drawHLine(0, 9, 128);
                     if (!sdReady) {
@@ -8220,17 +8244,27 @@ void loop() {
                 joyLongFired = true; // consume press; long-press to menu via B1 long-press
             }
         } else if (currentMode==MODE_VID && sdReady) {
-            if (vidPlaying) {
+            if (mediaAudioPlaying) {
+                // Click while playing audio → stop, return to browser
+                audioStopSamplePreset(PCM_PREVIEW_PRESET); mediaAudioPlaying=false;
+                sdListDir(sdPath.c_str(), isMediaFile);
+            } else if (vidPlaying) {
                 // Click while playing → pause / stop, return to browser
                 vidFile.close(); vidFileOpen=false; vidPlaying=false;
-                sdListDir(sdPath.c_str(), isVidOrImgFile);
+                sdListDir(sdPath.c_str(), isMediaFile);
             } else if (sdCursor < sdFileCount) {
                 if (sdFiles[sdCursor]=="..") {
                     if (sdPath=="/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true; }
-                    else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1), isVidOrImgFile); }
+                    else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1), isMediaFile); }
                 } else if (sdFileIsDir[sdCursor]) {
                     String np=sdPath; if(!np.endsWith("/"))np+="/"; np+=sdFiles[sdCursor];
-                    sdListDir(np, isVidOrImgFile);
+                    sdListDir(np, isMediaFile);
+                } else if (isAudioFile(sdFiles[sdCursor].c_str())) {
+                    String fp = buildSdFilePath();
+                    audioLoadAndPlay(fp.c_str(), PCM_PREVIEW_PRESET, volume);
+                    mediaAudioPath = fp;
+                    mediaAudioPlaying = true;
+                    Serial.printf("MEDIA: playing %s\n", fp.c_str());
                 } else if (isVidOrImgFile(sdFiles[sdCursor].c_str())) {
                     String fp = buildSdFilePath();
                     String playPath = fp;
@@ -10442,7 +10476,7 @@ void loop() {
         bool needsSdNav = currentMode==MODE_SAMPLE
                        || currentMode==MODE_GRANULAR2
                        || currentMode==MODE_STONE
-                       || (currentMode==MODE_VID && !vidPlaying)
+                       || (currentMode==MODE_VID && !vidPlaying && !mediaAudioPlaying)
                        || (currentMode==MODE_DRUM2 && drum2View==2 && draniBrowse);
         if(needsSdNav&&!menuOpen&&sdReady){
             static unsigned long lastSdNav=0;
