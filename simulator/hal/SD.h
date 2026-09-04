@@ -14,6 +14,17 @@
 #ifdef __ANDROID__
 #include <SDL2/SDL.h>
 #endif
+#ifdef _WIN32
+// Arduino.h (included above) already defined INPUT/OUTPUT as pinMode() constants —
+// windows.h's own same-named INPUT struct (SendInput()) would otherwise get corrupted
+// by macro substitution here, same issue as AMY-Arduino.h's amy.h include; see there.
+#undef INPUT
+#undef OUTPUT
+#include <shlobj.h>   // SHGetKnownFolderPath/FOLDERID_Music
+#include <windows.h>  // WideCharToMultiByte
+#define INPUT  0
+#define OUTPUT 1
+#endif
 
 #define FILE_READ   "r"
 #define FILE_WRITE  "w"
@@ -34,12 +45,26 @@ static inline std::string simSdRoot() {
     if (ext && ext[0]) return std::string(ext);
 #endif
 #ifdef _WIN32
-    // HOME isn't a thing on Windows — that's the POSIX/Linux convention this fell
-    // back to (silently landing on ".\Music", relative to wherever the .exe happened
-    // to be launched from, which is empty and not where anyone would expect their
-    // files) instead of the user's actual profile folder. USERPROFILE is the right
-    // equivalent (e.g. C:\Users\<name>), giving the same "<home>/Music" convention
-    // as Linux/Android — put files in %USERPROFILE%\Music.
+    // Ask Windows directly for the user's actual Music folder (SHGetKnownFolderPath /
+    // FOLDERID_Music) instead of assuming "%USERPROFILE%\Music" — on any machine with
+    // OneDrive "Folder Backup" enabled (the default on most Windows 10/11 setups signed
+    // into a Microsoft account), the real, Explorer-visible Music folder is silently
+    // redirected to somewhere under %USERPROFILE%\OneDrive\Music instead, leaving the
+    // raw profile path empty or nonexistent — this API resolves wherever it actually is.
+    {
+        PWSTR wpath = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Music, 0, nullptr, &wpath)) && wpath) {
+            int need = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, nullptr, 0, nullptr, nullptr);
+            std::string result;
+            if (need > 1) {
+                result.resize(need - 1);
+                WideCharToMultiByte(CP_UTF8, 0, wpath, -1, &result[0], need, nullptr, nullptr);
+            }
+            CoTaskMemFree(wpath);
+            if (!result.empty()) return result;
+        }
+    }
+    // Fallback if the API above ever fails: raw profile path + \Music.
     const char* home = getenv("USERPROFILE");
 #else
     const char* home = getenv("HOME");

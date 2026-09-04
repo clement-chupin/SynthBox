@@ -70,6 +70,9 @@ fichier à copier sur une machine Windows et à double-cliquer, sans installatio
 Un exécutable déjà compilé est disponible dans
 [releases/GrvEP-windows.exe](releases/GrvEP-windows.exe).
 
+La « carte SD » simulée pointe vers `%USERPROFILE%\Music` (ex. `C:\Users\<toi>\Music`) —
+mêmes fichiers/sous-dossiers qu'on y placerait sur Linux/Android dans `~/Music`.
+
 Limitation connue : la lecture de fichiers `.mp3` n'est pas disponible dans le build Windows
 (le simulateur Linux s'appuie sur `libmpg123` via `dlopen`, sans équivalent simple côté
 Windows) — les échantillons `.wav` et tout le reste du firmware ne sont pas affectés.

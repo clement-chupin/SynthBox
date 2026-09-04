@@ -18,7 +18,11 @@ extern "C" {
 #undef INPUT
 #undef OUTPUT
 #endif
-#include "/home/cchupin/projects/other_projects/amy/src/amy.h"
+// Relative to this file (simulator/hal/), other_projects/amy is a sibling directory
+// of GrvEP itself — i.e. this expects <GrvEP's parent>/other_projects/amy to exist.
+// Portable across machines as long as that sibling layout is kept; see platformio.ini's
+// matching ${PROJECT_DIR}/../other_projects/amy for the ESP32 build's own lib_deps entry.
+#include "../../../other_projects/amy/src/amy.h"
 #ifdef _WIN32
 #define INPUT  0
 #define OUTPUT 1

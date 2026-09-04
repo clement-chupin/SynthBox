@@ -26,7 +26,16 @@ extern float g_simSlider[16]; // 0.0 .. 1.0
 
 // ---- Types ----
 typedef uint8_t  byte;
+#ifndef _WIN32
+// Windows' own RPC/COM headers (pulled in transitively via SD.h's shlobj.h, needed
+// there for SHGetKnownFolderPath) already declare a `boolean` typedef (as unsigned
+// char) — a conflicting second typedef here would be a hard error, and unlike a
+// #define this can't just be #undef'd around the include. Nothing in this codebase
+// actually uses the identifier `boolean` (grepped main.cpp/audio_engine.cpp/AMY/U8g2 —
+// no hits), so just don't shadow it on this target; Windows' own definition covers
+// any transitive use just as well.
 typedef bool     boolean;
+#endif
 typedef uint16_t word;
 typedef uint32_t dword;
 
