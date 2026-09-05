@@ -1,15 +1,16 @@
-// sim_mp3dec.cpp — Helix MP3 API implementation using libmpg123 (via dlopen)
+// sim_mp3dec.cpp — Helix MP3 API implementation (libmpg123 via dlopen on Linux/
+// Android, bundled minimp3 on Windows — see the per-platform comments below).
 //
 // audio_engine.cpp uses the Helix streaming API (MP3InitDecoder / MP3Decode / etc.).
 // On the real device this comes from chmorgan/esp-libhelix-mp3.
-// In the simulator we bridge to libmpg123.so.0 which is available on most Linux systems.
 //
 // API contract with audio_engine.cpp:
 //   MP3Decode(dec, &ptr, &bytesLeft, frameBuf, 0):
-//     - Feeds ALL remaining bytes to mpg123 (sets bytesLeft=0 so caller refills next time)
+//     - Advances ptr/bytesLeft by however many input bytes this call consumed
 //     - Returns ERR_MP3_NONE(0) with decoded PCM in frameBuf + outputSamps set
-//     - Returns ERR_MP3_MAINDATA_UNDERFLOW(-2) when more input needed (loop continues,
-//       caller's bytesLeft<MAINBUF_SIZE triggers refill, then we feed again)
+//     - Returns ERR_MP3_INDATA_UNDERFLOW(-1) when the caller should refill from disk
+//       before retrying, ERR_MP3_MAINDATA_UNDERFLOW(-2) when it should just retry at
+//       the new (already-advanced) position without refilling
 //   MP3GetLastFrameInfo: returns sample-rate/channels/outputSamps from last decode
 
 #include "hal/mp3dec.h"
@@ -23,20 +24,73 @@
 #ifdef _WIN32
 // Windows build: no dlopen()/libmpg123.so equivalent to reach for here — unlike
 // Linux, there's no system library a plain end-user's machine can be expected to
-// already have installed, and statically bundling a full MP3 decoder is a separate
-// undertaking. MP3 sample playback is therefore unavailable in the Windows build for
-// now (WAV samples, and everything else, are unaffected); all the Helix API entry
-// points below just report "no decoder" instead of decoding.
-extern "C" HMP3Decoder MP3InitDecoder(void) { return nullptr; }
-extern "C" void MP3FreeDecoder(HMP3Decoder) {}
+// already have installed. Instead we bundle minimp3 (single-header, public domain/
+// CC0, https://github.com/lieff/minimp3) directly into the .exe and adapt its
+// per-frame API to the same Helix-style contract audio_engine.cpp already speaks —
+// no changes needed on the caller side, same as the Linux dlopen bridge below.
+#define MINIMP3_IMPLEMENTATION
+#include "hal/third_party/minimp3.h"
+
+struct SimMP3State {
+    mp3dec_t dec;
+    int channels;
+    int samprate;
+    int outputSamps;  // interleaved sample count from the last successful decode
+};
+
+extern "C" HMP3Decoder MP3InitDecoder(void) {
+    SimMP3State* s = new SimMP3State{};
+    mp3dec_init(&s->dec);
+    return (HMP3Decoder)s;
+}
+extern "C" void MP3FreeDecoder(HMP3Decoder hDec) { delete (SimMP3State*)hDec; }
+
 extern "C" int MP3FindSyncWord(unsigned char* buf, int nBytes) {
     for (int i = 0; i < nBytes - 1; i++)
         if (buf[i] == 0xFF && (buf[i+1] & 0xE0) == 0xE0) return i;
     return -1;
 }
-extern "C" int MP3Decode(HMP3Decoder, unsigned char**, int*, short*, int) { return ERR_MP3_NULL_POINTER; }
-extern "C" void MP3GetLastFrameInfo(HMP3Decoder, MP3FrameInfo* info) { if (info) *info = {}; }
-extern "C" int MP3GetNextFrameInfo(HMP3Decoder, MP3FrameInfo* info, unsigned char*) {
+
+extern "C" int MP3Decode(HMP3Decoder hDec, unsigned char** inbuf, int* bytesLeft,
+                         short* outbuf, int /*useSize*/) {
+    if (!hDec || !inbuf || !bytesLeft || !outbuf) return ERR_MP3_NULL_POINTER;
+    if (*bytesLeft <= 0) return ERR_MP3_INDATA_UNDERFLOW;
+    SimMP3State* s = (SimMP3State*)hDec;
+
+    mp3dec_frame_info_t info = {};
+    int samples = mp3dec_decode_frame(&s->dec, *inbuf, *bytesLeft, outbuf, &info);
+    // frame_bytes is how many input bytes this call consumed — always advance past
+    // them, even on failure: 0 valid frame found (need more data appended before
+    // retrying) still reports the junk prefix it scanned past as frame_bytes.
+    *inbuf     += info.frame_bytes;
+    *bytesLeft -= info.frame_bytes;
+
+    if (samples <= 0) {
+        // frame_bytes==0: no frame header found anywhere in the window given — truly
+        // need more bytes refilled before another attempt. frame_bytes>0: skipped
+        // padding/junk (e.g. an ID3 tag) — already advanced past it, so the caller
+        // should retry immediately at the new position rather than block on a refill.
+        return info.frame_bytes == 0 ? ERR_MP3_INDATA_UNDERFLOW : ERR_MP3_MAINDATA_UNDERFLOW;
+    }
+    s->channels    = info.channels;
+    s->samprate    = info.hz;
+    s->outputSamps = samples * info.channels;
+    return ERR_MP3_NONE;
+}
+
+extern "C" void MP3GetLastFrameInfo(HMP3Decoder hDec, MP3FrameInfo* info) {
+    if (!hDec || !info) return;
+    SimMP3State* s = (SimMP3State*)hDec;
+    info->bitrate       = 128;
+    info->nChans        = s->channels ? s->channels : 2;
+    info->samprate      = s->samprate ? s->samprate : 44100;
+    info->bitsPerSample = 16;
+    info->outputSamps   = s->outputSamps;
+    info->layer         = 3;
+    info->version       = 0;
+}
+
+extern "C" int MP3GetNextFrameInfo(HMP3Decoder /*hDec*/, MP3FrameInfo* info, unsigned char* /*buf*/) {
     if (info) *info = {};
     return ERR_MP3_INDATA_UNDERFLOW;
 }

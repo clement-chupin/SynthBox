@@ -78,9 +78,9 @@ Une fenêtre console s'ouvre à côté de l'appli et affiche en direct tous les 
 (chargement SD, conversion d'images, erreurs `IMG:`/`WAV:`/`CACHE:`/etc.) — pratique pour
 diagnostiquer un souci de lecture de fichier ; fermer cette fenêtre ferme aussi l'appli.
 
-Limitation connue : la lecture de fichiers `.mp3` n'est pas disponible dans le build Windows
-(le simulateur Linux s'appuie sur `libmpg123` via `dlopen`, sans équivalent simple côté
-Windows) — les échantillons `.wav` et tout le reste du firmware ne sont pas affectés.
+La lecture de fichiers `.mp3` fonctionne aussi sous Windows (décodeur `minimp3` embarqué
+directement dans l'exécutable, aucune installation requise) — voir
+[simulator/sim_mp3dec.cpp](simulator/sim_mp3dec.cpp).
 
 ## Build et installation de l'APK Android
 
