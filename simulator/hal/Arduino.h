@@ -249,34 +249,44 @@ public:
 // a lock, two threads' calls can genuinely interleave mid-line (most visible on the
 // Windows debug console, which showed lines splicing together character-by-character).
 // A single mutex around each call restores whole-call atomicity across threads.
+//
+// IMPORTANT: every internal call below must use ::printf/::putchar/::fputs (global-
+// scope qualified), never the bare name — HardwareSerial has its own member named
+// printf(), and unqualified lookup inside a member function finds that member first
+// and stops there (member names hide same-named globals), so an unqualified
+// printf(...) call from e.g. println() silently calls this->printf(...) instead of
+// the C library. That recursion into printf() would try to lock _m a second time on
+// the same thread — an instant self-deadlock on a non-recursive std::mutex, which is
+// exactly what happened here (froze on the very first Serial.println in setup(),
+// before anything could render — the "black screen, no interaction" symptom).
 class HardwareSerial {
     std::mutex _m;
 public:
     void begin(long) {}
-    void print(const char* s)   { std::lock_guard<std::mutex> lk(_m); fputs(s, stdout); }
-    void print(const String& s) { std::lock_guard<std::mutex> lk(_m); fputs(s.c_str(), stdout); }
-    void print(int v)           { std::lock_guard<std::mutex> lk(_m); printf("%d", v); }
-    void print(unsigned int v)  { std::lock_guard<std::mutex> lk(_m); printf("%u", v); }
-    void print(long v)          { std::lock_guard<std::mutex> lk(_m); printf("%ld", v); }
-    void print(unsigned long v) { std::lock_guard<std::mutex> lk(_m); printf("%lu", v); }
-    void print(float v)         { std::lock_guard<std::mutex> lk(_m); printf("%g", v); }
-    void print(double v)        { std::lock_guard<std::mutex> lk(_m); printf("%g", v); }
-    void print(char c)          { std::lock_guard<std::mutex> lk(_m); putchar(c); }
-    void println(const char* s) { std::lock_guard<std::mutex> lk(_m); printf("%s\n", s); }
-    void println(const String& s){ std::lock_guard<std::mutex> lk(_m); printf("%s\n", s.c_str()); }
-    void println(int v)         { std::lock_guard<std::mutex> lk(_m); printf("%d\n", v); }
-    void println(unsigned int v){ std::lock_guard<std::mutex> lk(_m); printf("%u\n", v); }
-    void println(long v)        { std::lock_guard<std::mutex> lk(_m); printf("%ld\n", v); }
-    void println(unsigned long v){ std::lock_guard<std::mutex> lk(_m); printf("%lu\n", v); }
-    void println(float v)       { std::lock_guard<std::mutex> lk(_m); printf("%g\n", v); }
-    void println(double v)      { std::lock_guard<std::mutex> lk(_m); printf("%g\n", v); }
-    void println(char c)        { std::lock_guard<std::mutex> lk(_m); printf("%c\n", c); }
-    void println()              { std::lock_guard<std::mutex> lk(_m); putchar('\n'); }
+    void print(const char* s)   { std::lock_guard<std::mutex> lk(_m); ::fputs(s, stdout); }
+    void print(const String& s) { std::lock_guard<std::mutex> lk(_m); ::fputs(s.c_str(), stdout); }
+    void print(int v)           { std::lock_guard<std::mutex> lk(_m); ::printf("%d", v); }
+    void print(unsigned int v)  { std::lock_guard<std::mutex> lk(_m); ::printf("%u", v); }
+    void print(long v)          { std::lock_guard<std::mutex> lk(_m); ::printf("%ld", v); }
+    void print(unsigned long v) { std::lock_guard<std::mutex> lk(_m); ::printf("%lu", v); }
+    void print(float v)         { std::lock_guard<std::mutex> lk(_m); ::printf("%g", v); }
+    void print(double v)        { std::lock_guard<std::mutex> lk(_m); ::printf("%g", v); }
+    void print(char c)          { std::lock_guard<std::mutex> lk(_m); ::putchar(c); }
+    void println(const char* s) { std::lock_guard<std::mutex> lk(_m); ::printf("%s\n", s); }
+    void println(const String& s){ std::lock_guard<std::mutex> lk(_m); ::printf("%s\n", s.c_str()); }
+    void println(int v)         { std::lock_guard<std::mutex> lk(_m); ::printf("%d\n", v); }
+    void println(unsigned int v){ std::lock_guard<std::mutex> lk(_m); ::printf("%u\n", v); }
+    void println(long v)        { std::lock_guard<std::mutex> lk(_m); ::printf("%ld\n", v); }
+    void println(unsigned long v){ std::lock_guard<std::mutex> lk(_m); ::printf("%lu\n", v); }
+    void println(float v)       { std::lock_guard<std::mutex> lk(_m); ::printf("%g\n", v); }
+    void println(double v)      { std::lock_guard<std::mutex> lk(_m); ::printf("%g\n", v); }
+    void println(char c)        { std::lock_guard<std::mutex> lk(_m); ::printf("%c\n", c); }
+    void println()              { std::lock_guard<std::mutex> lk(_m); ::putchar('\n'); }
     void printf(const char* fmt, ...) {
         std::lock_guard<std::mutex> lk(_m);
-        va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap);
+        va_list ap; va_start(ap, fmt); ::vprintf(fmt, ap); va_end(ap);
     }
-    void flush() { std::lock_guard<std::mutex> lk(_m); fflush(stdout); }
+    void flush() { std::lock_guard<std::mutex> lk(_m); ::fflush(stdout); }
     operator bool() const { return true; }
 };
 extern HardwareSerial Serial;
