@@ -2301,7 +2301,13 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
     bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET || s_overlay == OVERLAY_SYSEQ || s_overlay == OVERLAY_SEQB2);
     // FX overlay needs 3 columns (col5-7) when FX_COUNT > 8; others use 2 (col6-7) or 4 (col4-7)
     uint8_t colMin = is4col ? 4u : (s_overlay == OVERLAY_FX && FX_COUNT > 8 ? 5u : 6u);
-    if (col < colMin) { s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0; return; }
+    if (col < colMin) {
+        // OVERLAY_FX: a key outside its selection columns is someone playing a note to
+        // hear the effect (now allowed through to handleNoteKeyAudio, see there) — don't
+        // close the overlay out from under them just for touching the keybed.
+        if (s_overlay != OVERLAY_FX) { s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0; }
+        return;
+    }
 
     // colRank: col7→0, col6→1, col5→2, col4→3
     uint8_t opt = (uint8_t)((3 - row) + (uint8_t)(7 - col) * 4);
@@ -2751,17 +2757,13 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_ENV) s_overlay=OVERLAY_ENV; }
             break;
         case MODE_STONE:
+            // B3 single-click toggles NRM/LOOP directly (was double-click, with a
+            // single-click panic-stop fallback — dropped the panic-stop binding since
+            // double-clicking a small key reliably enough to always land within the
+            // detection window was the actual complaint).
             if (btn==2) {
-                static uint32_t _stoneB3Last = 0;
-                uint32_t _now = millis();
-                bool isDbl = (_now - _stoneB3Last) < 350;
-                _stoneB3Last = isDbl ? 0 : _now;
-                if (isDbl) {
-                    stoneLoopMode = !stoneLoopMode;
-                    audioStoneSetLoopMode(stoneLoopMode);
-                } else {
-                    audioStoneAllNotesOff();  // panic stop
-                }
+                stoneLoopMode = !stoneLoopMode;
+                audioStoneSetLoopMode(stoneLoopMode);
             }
             if (btn==3) noteMap.nextOctave();
             break;
@@ -4129,11 +4131,10 @@ void drawScreen(bool blockWait) {
                                 o2 += snprintf(l2 + o2, sizeof(l2) - o2, " %.3s=%s", pp[i].name, pp[i].val);
                             oled.drawStr(0, 118, l2 + 1);
                         } else {
-                            oled.drawStr(0, 118, "JY=browse Clk=load 2xB3=Loop");
+                            oled.drawStr(0, 118, "JY=browse Clk=load B3=Loop");
                         }
                     } else {
-                        oled.drawStr(0, 111, "P4-7=St/En/Pos/Size  P2=cycle");
-                        oled.drawStr(0, 118, "JY=browse Clk=load 2xB3=Loop");
+                        oled.drawStr(0, 118, "JY=browse Clk=load B3=Loop");
                     }
                 }
                 break;
@@ -6930,7 +6931,14 @@ static inline void playDrum(uint8_t pi, float v, uint8_t pitch, float dec) {
 // so events are processed as soon as AMY fill buffer (23) yields.
 static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
 {
-    if (menuOpen || !audioReady || s_overlay != OVERLAY_NONE) return;
+    // OVERLAY_FX is deliberately exempted: it's designed to "stay open for multi-toggle"
+    // (see overlayKeyPress's OVERLAY_FX case) so pots can keep adjusting an FX's params
+    // while it's open — but with every overlay silently blocking note playback here, a
+    // user could never actually HEAR the effect while dialing it in, since pressing a
+    // note key produced no sound at all (and, via overlayKeyPress's colMin check below,
+    // silently closed the overlay too — so by the time a pot got touched, the overlay
+    // was already gone and pots fell back to whatever the mode's own params are).
+    if (menuOpen || !audioReady || (s_overlay != OVERLAY_NONE && s_overlay != OVERLAY_FX)) return;
     switch(currentMode){
         case MODE_SYNTH:{
             uint8_t note;
@@ -9673,6 +9681,44 @@ void loop() {
                     break;
                 }
                 case MODE_STONE: {
+                    // FX overlay open: pots 4-7 belong to the active FX's own params instead
+                    // of the sample window — same established pattern every other synth-like
+                    // mode already uses (see case MODE_303S above). Was previously entirely
+                    // missing for STONE, so FX params were unreachable via pots once an FX
+                    // was toggled on — the OLED already showed them (GRANULAR2-modeled
+                    // footer), just nothing moved them.
+                    if (s_overlay == OVERLAY_FX) {
+                        if (fxList[fxSelected].active) {
+                            static float lp_stoneFx[4] = {-1,-1,-1,-1};
+                            static uint8_t lpStoneFxSel = 0xFF;
+                            if (lpStoneFxSel != fxSelected || fxPotNeedSync) {
+                                for (int p = 0; p < 4; p++) lp_stoneFx[p] = pots[3+p].value;
+                                lpStoneFxSel = fxSelected; fxPotNeedSync = false;
+                            }
+                            bool fxChanged = false;
+                            for (int p = 0; p < 4; p++) {
+                                if (fxList[fxSelected].paramNames[p][0] == '\0') continue;
+                                if (fabsf(pots[3+p].value - lp_stoneFx[p]) > 0.001f) {
+                                    float mn = fxList[fxSelected].paramMin[p];
+                                    float mx = fxList[fxSelected].paramMax[p];
+                                    if (fxSelected==0 && p==0)
+                                        fxList[0].params[0] = mn*powf(mx/mn, pots[3].value);
+                                    else if (fxSelected==0 && p==3) {
+                                        fxList[0].params[3] = floorf(pots[3+p].value*3.9999f);
+                                        s_filtMetaChanged = true;
+                                    } else {
+                                        fxList[fxSelected].params[p] = mn+(mx-mn)*pots[3+p].value;
+                                        if (fxSelected==0) s_filtMetaChanged = true;
+                                    }
+                                    lp_stoneFx[p] = pots[3+p].value;
+                                    fxChanged = true;
+                                }
+                            }
+                            if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
+                            else if (fxChanged && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
+                        }
+                        break;
+                    }
                     // P2: auto-cycle through the audio files in the currently browsed folder
                     if (stoneAudioCount > 0 && fabsf(pots[1].value-lp_stoneP2)>0.01f) {
                         uint8_t idx = (uint8_t)(pots[1].value * ((float)stoneAudioCount - 0.01f));
@@ -9692,7 +9738,7 @@ void loop() {
                     if (audioIsStoneReady() && !stoneWin.computed) {
                         audioComputeStoneWaveform(stoneWin.waveform);
                         stoneWin.computed = true;
-                        audioStoneApplyWindow(stoneWin.start, stoneWin.end);
+                        audioStoneApplyWindow(stoneWin.start, stoneWin.end, stoneLoopMode);
                     }
                     // P4-P7 = start/end/shift/zoom, applied as unclamped raw deltas straight onto
                     // stoneWin's own start/end — same corrected model as GEST2's per-pad pot control
@@ -10484,7 +10530,8 @@ void loop() {
             bool gran2AnyComputed = false;
             if (currentMode==MODE_GRANULAR2) for (uint8_t _s=0;_s<GRAN2_MAX_SAMPLES;_s++) if (gran2[_s].computed) { gran2AnyComputed=true; break; }
             uint8_t visLines=(currentMode==MODE_GRANULAR2&&!gran2AnyComputed)?13
-                            :(currentMode==MODE_GRANULAR2)?7:8;
+                            :(currentMode==MODE_GRANULAR2)?7
+                            :(currentMode==MODE_STONE)?7:8;
             if(millis()-lastSdNav>=150){
                 if(ny<-0.3f&&sdCursor>0){sdCursor--;if(sdCursor<sdScroll)sdScroll=sdCursor;lastSdNav=millis();}
                 if(ny>0.3f&&sdCursor<sdFileCount-1){sdCursor++;if(sdCursor>=(int)(sdScroll+visLines))sdScroll=sdCursor-visLines+1;lastSdNav=millis();}

@@ -23,13 +23,9 @@ bool keyState[KBD_ROWS][KBD_COLS] = {};
 // Re-enable with a value > POLL_INTERVAL_MS only if phantom notes accumulate over time.
 #define POLL_INTERVAL_MS      2    // 500Hz — 2ms poll + ~4ms TCA scan = ~6ms worst-case
 #define SWDEBOUNCE_MS         0    // 0 = disabled
-#define KEY_TIMEOUT_MS     30000   // 30s: safety release for physically stuck keys only
-#define KEY_TIMEOUT_FAST_MS 3000   // 3s: after FIFO overflow (may have missed a RELEASE event)
-#define FAST_TIMEOUT_WINDOW 5000
 #define TCA_WATCHDOG_MS     500   // re-verify TCA config twice per second
 #define I2C_FAIL_THRESHOLD    5   // consecutive read failures → bus recovery
 
-static uint32_t keyPressTime[KBD_ROWS][KBD_COLS]      = {};
 static uint32_t keyLastChangeTime[KBD_ROWS][KBD_COLS]  = {};
 
 // Monitoring: poll interval statistics, reset each second by kbdGetStats().
@@ -37,8 +33,6 @@ static volatile uint32_t s_kbdPollCount   = 0;
 static volatile uint32_t s_kbdMaxInterval = 0;
 static volatile uint32_t s_kbdLastPollMs  = 0;
 static NoteKeyCallback s_noteKeyCb = nullptr;
-static bool     overflowOccurred = false;  // false until first real overflow (avoids millis()=0 false trigger)
-static uint32_t lastOverflowTime = 0;
 static uint32_t lastTcaWatchdog  = 0;
 static uint8_t  i2cFailCount     = 0;
 
@@ -94,7 +88,6 @@ static void releaseAllKeys()
                 keyState[r][c] = false;
                 enqueueEvent(r, c, false);
             }
-    memset(keyPressTime,      0, sizeof(keyPressTime));
     memset(keyLastChangeTime, 0, sizeof(keyLastChangeTime));
 }
 
@@ -134,7 +127,6 @@ static void recoverI2CBus()
 
     releaseAllKeys();
     i2cFailCount    = 0;
-    overflowOccurred = false;
     Serial.println("[KBD] I2C recovery done");
 }
 
@@ -177,7 +169,6 @@ void setupKeyboard()
     uint8_t pull3 = tcaReadReg(TCA_GPIO_PULL3); pull3 |=  0x03; tcaWriteReg(TCA_GPIO_PULL3, pull3);
 
     memset(keyState, 0, sizeof(keyState));
-    memset(keyPressTime, 0, sizeof(keyPressTime));
     queueHead = 0; queueTail = 0;
 
     // Drain any events queued before init
@@ -242,8 +233,6 @@ void pollKeyboard()
     // FIFO overflow flag
     uint8_t intStat = tcaReadReg(TCA_INT_STAT);
     if (intStat & TCA_OVR_FLOW_BIT) {
-        overflowOccurred = true;
-        lastOverflowTime = now;
         tcaWriteReg(TCA_INT_STAT, TCA_OVR_FLOW_BIT);
     }
 
@@ -278,7 +267,6 @@ void pollKeyboard()
 #endif
                 if (snFin[r][c] && !keyState[r][c]) {
                     keyState[r][c]          = true;
-                    keyPressTime[r][c]      = now;
                     keyLastChangeTime[r][c]  = now;
                     enqueueEvent(r, c, true);
                     if (s_noteKeyCb && (uint8_t)r < KBD_NOTE_ROWS)
@@ -293,18 +281,6 @@ void pollKeyboard()
             }
         }
     }
-
-    // Safety timeout: auto-release any key stuck beyond threshold.
-    // recentOverflow only active after a real overflow has been detected — avoids
-    // the millis()=0 false trigger that was releasing keys after ~500ms at startup.
-    bool recentOverflow = overflowOccurred && (now - lastOverflowTime) < FAST_TIMEOUT_WINDOW;
-    uint32_t timeout = recentOverflow ? KEY_TIMEOUT_FAST_MS : KEY_TIMEOUT_MS;
-    for (int r = 0; r < KBD_ROWS; r++)
-        for (int c = 0; c < KBD_COLS; c++)
-            if (keyState[r][c] && (now - keyPressTime[r][c] > timeout)) {
-                keyState[r][c] = false;
-                enqueueEvent(r, c, false);
-            }
 }
 
 // Returns accumulated poll stats since the last call, then resets them.

@@ -55,7 +55,7 @@ Le binaire est produit dans `simulator/build/grvep_sim`.
 ## Build d'un .exe Windows (cross-compilation depuis Linux)
 
 Un exécutable Windows tout-en-un (statiquement lié : ni SDL2.dll, ni libstdc++/libwinpthread
-à côté, pas de fenêtre console) peut être compilé depuis Linux via MinGW-w64 :
+à côté) peut être compilé depuis Linux via MinGW-w64 :
 
 ```bash
 cd simulator
@@ -70,8 +70,13 @@ fichier à copier sur une machine Windows et à double-cliquer, sans installatio
 Un exécutable déjà compilé est disponible dans
 [releases/GrvEP-windows.exe](releases/GrvEP-windows.exe).
 
-La « carte SD » simulée pointe vers `%USERPROFILE%\Music` (ex. `C:\Users\<toi>\Music`) —
-mêmes fichiers/sous-dossiers qu'on y placerait sur Linux/Android dans `~/Music`.
+La « carte SD » simulée pointe vers le vrai dossier Musique de l'utilisateur Windows (résolu
+via l'API `SHGetKnownFolderPath`, donc correct même si OneDrive redirige ce dossier ailleurs)
+— mêmes fichiers/sous-dossiers qu'on y placerait sur Linux/Android dans `~/Music`.
+
+Une fenêtre console s'ouvre à côté de l'appli et affiche en direct tous les messages de debug
+(chargement SD, conversion d'images, erreurs `IMG:`/`WAV:`/`CACHE:`/etc.) — pratique pour
+diagnostiquer un souci de lecture de fichier ; fermer cette fenêtre ferme aussi l'appli.
 
 Limitation connue : la lecture de fichiers `.mp3` n'est pas disponible dans le build Windows
 (le simulateur Linux s'appuie sur `libmpg123` via `dlopen`, sans équivalent simple côté

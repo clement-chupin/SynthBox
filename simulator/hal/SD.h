@@ -26,9 +26,15 @@
 #define OUTPUT 1
 #endif
 
-#define FILE_READ   "r"
-#define FILE_WRITE  "w"
-#define FILE_APPEND "a"
+// "b" (binary mode) matters only on Windows — its CRT's text mode does CRLF<->LF
+// translation and treats byte 0x1A as a mid-stream EOF marker, silently corrupting/
+// truncating any binary file (.wav/.png/.jpg/.bvid/.mp3) that happens to contain
+// those byte patterns. POSIX (Linux/Android) has no text/binary distinction at all —
+// "r"/"rb" are identical there — so this is a free, harmless no-op everywhere except
+// Windows, where it was the actual cause of samples/images failing to load correctly.
+#define FILE_READ   "rb"
+#define FILE_WRITE  "wb"
+#define FILE_APPEND "ab"
 #define O_READ  1
 #define O_WRITE 2
 #define O_CREAT 4
@@ -106,7 +112,7 @@ public:
                 DIR* d = opendir(child.c_str());
                 return File(child.c_str(), true, d);
             }
-            FILE* fp = fopen(child.c_str(), "r");
+            FILE* fp = fopen(child.c_str(), "rb");
             return File(child.c_str(), fp, (size_t)st.st_size);
         }
         return File();

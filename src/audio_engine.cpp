@@ -294,11 +294,23 @@ void audioStoneFadeTick() {
         e.osc = (uint16_t)(STONE_OSC_BASE + i);
         if (elapsed >= STONE_FADE_MS) {
             s_stoneFading[i] = false;
-            e.velocity = 0;  // real note-off now that the voice is already silent
+            e.velocity = 0;  // real note-off now that the voice is already faded down
+            amy_add_event(&e);
+            // Loop mode: pcm_note_off() only disables looping on the FIRST note-off and
+            // needs a second to force an immediate stop (same fix as
+            // audioStoneAllNotesOff()) — without this, a released looping voice just
+            // keeps playing forward through the rest of the (loop-extended) registered
+            // buffer at whatever near-silent level the fade left it at, which can take
+            // several audible seconds for a long sample. Harmless no-op for a non-
+            // looping voice (already stopped by the first event).
+            amy_event e2 = amy_default_event();
+            e2.osc = (uint16_t)(STONE_OSC_BASE + i);
+            e2.velocity = 0;
+            amy_add_event(&e2);
         } else {
             e.amp_coefs[COEF_CONST] = 1.0f - (float)elapsed / (float)STONE_FADE_MS;
+            amy_add_event(&e);
         }
-        amy_add_event(&e);
     }
 }
 
@@ -1127,24 +1139,50 @@ static uint32_t psramMaxFrames() {
     uint32_t m = free / 4;  // half free PSRAM in int16_t frames
     return (m < PCM_MIN_FRAMES) ? PCM_MIN_FRAMES : m;
 }
+// Wider budget for isGran16 presets (STONE_SOURCE_PRESET / GRAN2_SOURCE_BASE / legacy
+// GRANULAR_SOURCE_PRESET) only: unlike every other preset type, these have NO cheaper
+// fallback tier at all (no flash cache, no 8-bit SD cache — svcTryFlash/svcTryCache are
+// skipped for them entirely, see the isGran16 branch in svcLoadWav/svcLoadMp3 below), so
+// a sample that's merely somewhat larger than psramMaxFrames() allows gets needlessly
+// truncated/rejected where MODE_SAMPLE's non-Gran16 path would have had cache tiers to
+// fall back on instead. Deliberately NOT changing psramMaxFrames() itself — the non-
+// Gran16 path's risk profile (it still has flash/8-bit-cache fallbacks) doesn't need to
+// change, only the tier that has nothing else to lean on.
+static uint32_t granMaxFrames() {
+    uint32_t free = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    uint32_t m = free / 2;  // int16_t frames
+    return (m < PCM_MIN_FRAMES) ? PCM_MIN_FRAMES : m;
+}
 // Try pcm_load, halving frame count on each failure until PCM_MIN_FRAMES.
 // Modifies `frames` to reflect the actually allocated size (may be less than requested).
+//
+// PCM_MIN_FRAMES is a floor for the SHRINKING behavior (don't keep halving forever) —
+// it must NOT gate the very first attempt. A `while (frames >= PCM_MIN_FRAMES)` loop
+// does exactly that though: a short sample that legitimately needs fewer frames than
+// PCM_MIN_FRAMES (e.g. a <1s WAV resampling to under 20000 frames at the 20kHz target
+// rate) never even calls pcm_load() once — the loop condition is already false — and
+// this returns nullptr unconditionally, regardless of how much free PSRAM exists. This
+// was the actual cause of "alloc fail" reports showing huge largest_free_block values
+// for tiny requests: pcm_load() was never being called at all, not failing.
 static int16_t* pcm_load_best_effort(uint16_t preset, uint32_t& frames,
                                       uint32_t halfRate, uint8_t channels,
                                       uint8_t midiNote, uint8_t loopStart, int32_t loopEnd) {
-    while (frames >= PCM_MIN_FRAMES) {
+    while (true) {
         int16_t* buf = pcm_load(preset, frames, halfRate, channels, midiNote, loopStart, loopEnd);
         if (buf) return buf;
+        if (frames <= PCM_MIN_FRAMES) break;  // already at/below the floor, nothing smaller to try
         // Total free can look huge while the largest CONTIGUOUS block (what a single
         // malloc actually needs) is much smaller — print both, not just total, so a
         // fragmentation-driven failure (small request failing despite lots of free
         // PSRAM) is immediately diagnosable instead of looking impossible.
+        uint32_t next = frames / 2;
+        if (next < PCM_MIN_FRAMES) next = PCM_MIN_FRAMES;  // don't overshoot below the floor
         Serial.printf("[PCM] alloc %lu fr failed (PSRAM free=%lu largest_block=%lu), retrying at %lu\n",
                       (unsigned long)frames,
                       (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                       (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
-                      (unsigned long)(frames / 2));
-        frames /= 2;
+                      (unsigned long)next);
+        frames = next;
     }
     return nullptr;
 }
@@ -1570,9 +1608,10 @@ static bool svcTryCache16(const char* path, uint16_t preset, uint8_t osc, float 
     if (!f) return false;
 
     PcmCacheHdr h;
-    // Reserve at most half of free PSRAM (each frame = 2 bytes for int16_t).
-    uint32_t maxLoad = (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 4);
-    if (maxLoad < PCM_MIN_FRAMES) maxLoad = PCM_MIN_FRAMES;
+    // Only ever called for isGran16 presets (STONE/GRANULAR2/legacy GRANULAR source) —
+    // they have no cheaper fallback tier at all, so use the wider budget (see
+    // granMaxFrames()'s comment) rather than the general-purpose psramMaxFrames().
+    uint32_t maxLoad = granMaxFrames();
     bool valid = ((uint32_t)f.read((uint8_t*)&h, sizeof(h)) == sizeof(h))
               && (memcmp(h.magic, "G16C", 4) == 0)
               && (h.srcSize == srcSize)
@@ -1730,7 +1769,7 @@ static bool svcLoadWav(const char* path, uint16_t preset, uint8_t osc, float vel
     float    ratio    = (float)fileSR / (float)PCM_TARGET_RATE;
     uint32_t totalOut = (uint32_t)((float)totalIn / ratio);
     {
-        uint32_t mf = psramMaxFrames();
+        uint32_t mf = isGran16 ? granMaxFrames() : psramMaxFrames();
         if (totalOut > mf) { totalOut = mf; totalIn = (uint32_t)(mf * ratio) + 1; }
     }
 
@@ -1845,7 +1884,7 @@ static bool svcLoadMp3(const char* path, uint16_t preset, uint8_t osc, float vel
     uint32_t sampleRate = 44100;
     uint8_t  numCh = 2;
     bool     gotInfo = false;
-    uint32_t estimatedTotal = psramMaxFrames();
+    uint32_t estimatedTotal = isGran16 ? granMaxFrames() : psramMaxFrames();
 
     uint8_t* ptr = inBuf; int bytesLeft = 0; bool eof = false;
     auto refill = [&]() {
@@ -2086,7 +2125,7 @@ void bgServiceTask(void* /*param*/) {
         }
         if (ok && !s_svcAbort && req.preset == STONE_SOURCE_PRESET) {
             s_stoneLoaded = true;
-            audioStoneApplyWindow(0.0f, 1.0f);  // default: full-range window over the freshly loaded sample
+            audioStoneApplyWindow(0.0f, 1.0f, s_stoneLoop);  // full-range window; reflect current loop mode immediately, not just on the next pot nudge
         }
         s_currentOsc = 0xFF;
         s_svcDone    = true;
