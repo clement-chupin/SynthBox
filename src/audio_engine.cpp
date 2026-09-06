@@ -78,6 +78,10 @@ static bool    s_synthChIsPatch = false; // true when SYNTH_CH has an AMY preset
 static float   s_patchVolumeScale = 1.0f; // per-patch amplitude compensation (J:ORG is intrinsically loud)
 // Set to true when any filter FX writes filter_freq_coefs to SYNTH_CH for a patch.
 static bool    s_patchFilterModified = false;
+// AMY patch_number currently on SYNTH_CH (only meaningful while s_synthChIsPatch),
+// tracked so a filter FX can restore the patch's own native filter later — this is
+// the raw AMY patch index (e.g. 7 for J:PNO), NOT the SynthShape enum value.
+static int16_t s_currentPatchNumber = -1;
 
 // Native filter parameters for Juno patches (extracted from AMY patches.h v0F/R fields).
 // DX7 patches (128+) use FILTER_NONE and are unaffected by coef changes, so they're not listed.
@@ -457,6 +461,22 @@ void audioSetAllFilters(float cutoffHz, float resonance) {
         e.resonance = bypass ? 1.0f : resonance;
         amy_add_event(&e);
         if (!bypass && s_synthChIsPatch) s_patchFilterModified = true;
+    } else if (s_patchFilterModified) {
+        // Bypass AND a patch whose filter WAS previously modified by an earlier
+        // (non-bypass) call — e.g. cutoff was turned down at some point then back up
+        // to "wide open". The branch above is skipped entirely in this case (that's
+        // the whole point of the "skip SYNTH_CH event for patches" bypass), which
+        // used to leave the patch stuck on that earlier, lower cutoff forever: wide
+        // open no longer meant "no filtering" once the patch's filter had ever been
+        // touched. Explicitly restore its native filter here instead of doing nothing.
+        s_patchFilterModified = false;
+        float cc, res;
+        getPatchNativeFilter(s_currentPatchNumber, cc, res);
+        amy_event e = amy_default_event();
+        e.synth = SYNTH_CH;
+        e.filter_freq_coefs[COEF_CONST] = cc;
+        e.resonance = res;
+        amy_add_event(&e);
     }
     s_pcmLPFCutoff = bypass ? 0.0f : cutoffHz;
     s_pcmLPFReso   = bypass ? 1.5f : resonance;
@@ -501,6 +521,21 @@ void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType) {
         e.resonance = bypass ? 1.0f : resonance;
         amy_add_event(&e);
         if (!bypass && s_synthChIsPatch) s_patchFilterModified = true;
+    } else if (s_patchFilterModified) {
+        // Bypass AND a patch whose filter WAS previously modified by an earlier
+        // (non-bypass) call — e.g. cutoff was turned down at some point then back up
+        // to "wide open". The branch above is skipped entirely in this case, which
+        // used to leave the patch stuck on that earlier, lower cutoff forever: wide
+        // open no longer meant "no filtering" once the patch's filter had ever been
+        // touched. Explicitly restore its native filter here instead of doing nothing.
+        s_patchFilterModified = false;
+        float cc, res;
+        getPatchNativeFilter(s_currentPatchNumber, cc, res);
+        amy_event e = amy_default_event();
+        e.synth = SYNTH_CH;
+        e.filter_freq_coefs[COEF_CONST] = cc;
+        e.resonance = res;
+        amy_add_event(&e);
     }
     s_pcmLPFCutoff = bypass ? 0.0f : cutoffHz;
     s_pcmLPFReso   = bypass ? 1.5f : resonance;
@@ -524,13 +559,40 @@ void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType) {
 // Update only the cutoff/resonance of an already-active LPF — does NOT send filter_type.
 // Sending filter_type on every smooth-tick tick causes AMY to re-init the biquad state,
 // which is heard as an audible "pop" or "reset" on each encoder step.
+//
+// This is what the FILT cutoff pot's per-10ms anti-zipper smoothing tick actually
+// calls (see main.cpp's "Smooth FILT cutoff application" block) — unlike
+// audioSetAllFilters(T)(), it had NO bypass awareness at all: it unconditionally
+// wrote filter_freq_coefs/resonance to SYNTH_CH on every tick, so a patch (JUNO/DX7)
+// got its native filter permanently overwritten the moment the cutoff pot was
+// touched at all, with nothing to undo it once the pot settled back at "wide open"
+// (18kHz) — the exact "LPF changes an instrument's texture even with cutoff wide
+// open" bug, and the dominant path for it since this runs continuously while turning
+// the pot, not just once on toggling FILT on/off.
 void audioSetFilterFreq(float cutoffHz, float resonance) {
     if (!audioReady) return;
+    bool bypass = (cutoffHz <= 10.0f || cutoffHz >= 18000.0f);
+    if (bypass && s_synthChIsPatch) {
+        if (s_patchFilterModified) {
+            s_patchFilterModified = false;
+            float cc, res;
+            getPatchNativeFilter(s_currentPatchNumber, cc, res);
+            amy_event e = amy_default_event();
+            e.synth = SYNTH_CH;
+            e.filter_freq_coefs[COEF_CONST] = cc;
+            e.resonance = res;
+            amy_add_event(&e);
+        }
+        s_pcmLPFCutoff = 0.0f;
+        s_pcmLPFReso   = 1.5f;
+        return;
+    }
     amy_event e = amy_default_event();
     e.synth = SYNTH_CH;
     e.filter_freq_coefs[COEF_CONST] = cutoffHz;
     e.resonance = resonance;
     amy_add_event(&e);
+    if (s_synthChIsPatch) s_patchFilterModified = true;
     s_pcmLPFCutoff = cutoffHz;
     s_pcmLPFReso   = resonance;
 }
@@ -661,6 +723,7 @@ void audioSetShapeOnSynth(SynthShape shape, uint8_t synthCh) {
     if (synthCh == SYNTH_CH) {
         s_noiseShape = (shape==SHAPE_NOISE_WHITE || shape==SHAPE_NOISE_PINK || shape==SHAPE_NOISE_BROWN);
         s_synthChIsPatch = (shapePatch[(uint8_t)shape] >= 0);
+        s_currentPatchNumber = shapePatch[(uint8_t)shape];
         if (!s_synthChIsPatch) s_patchVolumeScale = 1.0f;
         s_patchFilterModified = false; // new shape = clean filter state
     }
@@ -693,15 +756,30 @@ void audioSetShapeOnSynth(SynthShape shape, uint8_t synthCh) {
             case SHAPE_SQUARE:       e.wave = PULSE;    break;
             case SHAPE_SINE:         e.wave = SINE;     break;
             case SHAPE_PLUCK:        e.wave = KS;       break;
-            case SHAPE_NOISE_WHITE:  e.wave = NOISE;    break;
+            // NOISE shapes: force oscs_per_voice=1 (overriding the general custom-waveform
+            // default of 2 set just above). A second AMY oscillator per voice is a detuned-
+            // unison thickening technique meaningful for pitched waves (e.g. SAW/SQUARE
+            // sound fuller with two slightly-detuned copies) — it doesn't add anything for
+            // NOISE (already full-spectrum) and, worse, produces a spurious narrow resonant
+            // peak in the noise spectrum: with no patch_number to supply per-oscillator
+            // deltas for the 2nd oscillator of each voice, AMY's multi-osc allocation leaves
+            // it in a state that isn't a second independent noise generator, and summing it
+            // with the first creates a discrete peak no amount of FILT cutoff can remove
+            // (confirmed via the simulator's EQ/spectrogram windows: identical peak with
+            // num_voices=1, present only when oscs_per_voice=2, gone at oscs_per_voice=1
+            // regardless of num_voices — isolating the 2nd-oscillator-per-voice mechanism,
+            // not polyphony, as the cause).
+            case SHAPE_NOISE_WHITE:  e.wave = NOISE; e.oscs_per_voice = 1; break;
             case SHAPE_NOISE_PINK:
                 e.wave = NOISE;
+                e.oscs_per_voice = 1;
                 e.filter_type = FILTER_LPF;
                 e.filter_freq_coefs[COEF_CONST] = 2000.0f;
                 e.resonance = 1.0f;
                 break;
             case SHAPE_NOISE_BROWN:
                 e.wave = NOISE;
+                e.oscs_per_voice = 1;
                 e.filter_type = FILTER_LPF;
                 e.filter_freq_coefs[COEF_CONST] = 400.0f;
                 e.resonance = 0.7f;
@@ -2308,6 +2386,12 @@ extern "C" float amy_wavefold_gain_bus0;  // defined in amy.c; global REP FX on 
 extern "C" float amy_ladder_on;         // defined in amy.c; 0=bypass, 1=engaged
 extern "C" float amy_ladder_cutoff;     // defined in amy.c; Hz
 extern "C" float amy_ladder_resonance;  // defined in amy.c; feedback gain into tanh(), no hard ceiling
+extern "C" float amy_ringmod_on;        // defined in amy.c; 0=bypass, 1=engaged
+extern "C" float amy_ringmod_freq;      // defined in amy.c; carrier Hz
+extern "C" float amy_ringmod_mix;       // defined in amy.c; 0=dry, 1=fully ring-modulated
+extern "C" float amy_comp_on;           // defined in amy.c; 0=bypass, 1=engaged
+extern "C" float amy_comp_threshold;    // defined in amy.c; linear (bus headroom, not dBFS)
+extern "C" float amy_comp_ratio;        // defined in amy.c; 1.0=no compression, higher=more limiting
 
 void audioT303Init(float cutoff, float reso, float envMod, float decay, uint8_t amyWave) {
     if (!audioReady) return;
@@ -2544,6 +2628,31 @@ void audioSetLadderFilter(float cutoffHz, float resonance, bool on) {
     amy_ladder_on        = on ? 1.0f : 0.0f;
     amy_ladder_cutoff     = cutoffHz;
     amy_ladder_resonance  = resonance;
+}
+
+void audioSetRingmod(float freqHz, float mix, bool on) {
+    amy_ringmod_on   = on ? 1.0f : 0.0f;
+    amy_ringmod_freq = freqHz;
+    amy_ringmod_mix  = mix;
+}
+
+void audioSetCompressor(float threshold, float ratio, bool on) {
+    amy_comp_on        = on ? 1.0f : 0.0f;
+    amy_comp_threshold = threshold;
+    amy_comp_ratio     = ratio;
+}
+
+// AUTOPAN FX: per-oscillator equal-power pan (AMY's msynth->pan, real stereo — the
+// board's I2S output is genuinely stereo, see i2s.c's I2S_SLOT_MODE_STEREO). 0=full
+// left, 0.5=center, 1=full right. Applied to the two channels most modes actually
+// play notes on; other channels (T303/tracker/etc.) stay centered — this mirrors
+// how audioSetVolume only ever targets SYNTH_CH plus T303's shared bus.
+void audioSetPan(float pan) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = SYNTH_CH;
+    e.pan_coefs[COEF_CONST] = pan;
+    amy_add_event(&e);
 }
 
 // Symmetric wavefolder for TRI/SAW2/SQ2: depth 0→1 maps gain 1x→32x (extreme folds).

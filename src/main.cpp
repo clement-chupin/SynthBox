@@ -1259,8 +1259,42 @@ FxEffect fxList[] = {
      {"Bits","Cut","",""},
      {2.0f,   0.0f, 0.0f, 0.0f},
      {8.0f, 8000.0f, 0.0f, 0.0f}},
+    // TREMOLO: volume LFO — software 10ms tick (same pattern as the LFO filter-mod
+    // slot above, just modulating the volume pot's output instead of cutoff).
+    {"TREMOLO",  false, {5.0f, 0.6f, 0.0f, 0.0f},
+     {"Rate","Dep","",""},
+     {0.1f, 0.0f, 0.0f, 0.0f},
+     {20.0f, 1.0f, 0.0f, 0.0f}},
+    // AUTOPAN: stereo pan LFO — same software-tick approach as TREMOLO, driving
+    // audioSetPan() (real per-oscillator equal-power pan; the board's I2S output is
+    // genuinely stereo, see i2s.c's I2S_SLOT_MODE_STEREO) instead of volume.
+    {"AUTOPAN",  false, {2.0f, 0.7f, 0.0f, 0.0f},
+     {"Rate","Dep","",""},
+     {0.1f, 0.0f, 0.0f, 0.0f},
+     {10.0f, 1.0f, 0.0f, 0.0f}},
+    // OVERDRIVE: single-knob filter drive (LPF sweep, cutoff 3500→1000Hz + resonance
+    // 1.5→4.0 as Drv rises) — simpler/gentler character than FILT's full 4-type/2-
+    // param filter or DISTORT's BPF-peak crunch; audioSetOverdrive() already existed
+    // in audio_engine.cpp but had never been wired to an FX slot.
+    {"OVERDRV",  false, {0.4f, 0.0f, 0.0f, 0.0f},
+     {"Drv","","",""},
+     {0.0f, 0.0f, 0.0f, 0.0f},
+     {1.0f, 0.0f, 0.0f, 0.0f}},
+    // RINGMOD: multiplies the signal by a sine carrier (bus-0 DSP in amy.c) — metallic/
+    // bell-like inharmonic sidebands. Mix blends carrier-multiplied signal back with
+    // dry so low Mix values give a subtle sheen rather than full ring-mod clang.
+    {"RINGMOD",  false, {200.0f, 0.5f, 0.0f, 0.0f},
+     {"Freq","Mix","",""},
+     {20.0f, 0.0f, 0.0f, 0.0f},
+     {2000.0f, 1.0f, 0.0f, 0.0f}},
+    // COMPRESSOR: feedforward peak-envelope gain reduction (bus-0 DSP in amy.c, fixed
+    // 5ms/80ms attack/release) — glue/limiting over everything else on the bus.
+    {"COMPRESS", false, {0.5f, 4.0f, 0.0f, 0.0f},
+     {"Thresh","Ratio","",""},
+     {0.05f, 1.0f, 0.0f, 0.0f},
+     {1.0f, 20.0f, 0.0f, 0.0f}},
 };
-static const uint8_t FX_COUNT = 11;
+static const uint8_t FX_COUNT = 16;
 
 // Noms des types de filtre FILT — LPF, HPF, BPF
 static const char* kFiltTypN[] = {"LPF","HPF","BPF","LDR"};
@@ -1301,7 +1335,7 @@ void applyFxEffect(uint8_t fx) {
     // Helper: no FX filter active → safe to restore shape's native filter coefficients
     // BITCRS counts as filter-user when its Cut param is set (params[1] > 200Hz)
     auto noFilterFx = [&]() {
-        return !fxList[0].active && !fxList[1].active && !fxList[6].active
+        return !fxList[0].active && !fxList[1].active && !fxList[6].active && !fxList[13].active
                && !(fxList[10].active && fxList[10].params[1] > 200.0f);
     };
     switch (fx) {
@@ -1318,7 +1352,7 @@ void applyFxEffect(uint8_t fx) {
             // amy.c's bus-0 processing block for the actual "exotic" nonlinear rolloff.
             audioSetAllFiltersT(on && !ladder ? cut : 0.0f, on && !ladder ? res : 1.5f,
                                 (on && !ladder) ? kFiltAMY[ti] : FILTER_LPF24);
-            audioSetLadderFilter(cut, res * 2.0f, on && ladder);  // *2: wider effective resonance range than the shared 0-3 param slot, safe since the ladder's tanh feedback can't blow up regardless of gain
+            audioSetLadderFilter(cut, res * 3.5f, on && ladder);  // *3.5: wider effective resonance range than the shared 0-3 param slot (more headroom for acid-style self-oscillation), safe since the ladder's tanh feedback can't blow up regardless of gain
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
             // audioSetAllFiltersT() above reaches every channel including T303_CH, so
             // turning the FX LPF off leaves the 303 stuck on the FX's last cutoff/type
@@ -1397,6 +1431,23 @@ void applyFxEffect(uint8_t fx) {
             }
             break;
         }
+        case 11:  // TREMOLO — handled in the 10ms loop (volume LFO), same as LFO/case 6
+            break;
+        case 12:  // AUTOPAN — handled in the 10ms loop (pan LFO), same as LFO/case 6
+            break;
+        case 13:  // OVERDRIVE — single-knob filter drive
+            Serial.printf("FX13 OVERDRV %s drv=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
+            audioSetOverdrive(on ? e.params[0] : 0.0f);
+            if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
+            break;
+        case 14:  // RINGMOD — bus-0 sine-carrier amplitude modulation
+            Serial.printf("FX14 RINGMOD %s freq=%.0f mix=%.2f\n", on?"ON":"off", e.params[0], e.params[1]);
+            audioSetRingmod(e.params[0], e.params[1], on);
+            break;
+        case 15:  // COMPRESSOR — bus-0 feedforward peak compressor
+            Serial.printf("FX15 COMPRESS %s thr=%.2f ratio=%.1f\n", on?"ON":"off", e.params[0], e.params[1]);
+            audioSetCompressor(e.params[0], e.params[1], on);
+            break;
     }
 }
 
@@ -2443,9 +2494,9 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
         return;
     }
 
-    bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET || s_overlay == OVERLAY_SYSEQ || s_overlay == OVERLAY_SEQB2);
-    // FX overlay needs 3 columns (col5-7) when FX_COUNT > 8; others use 2 (col6-7) or 4 (col4-7)
-    uint8_t colMin = is4col ? 4u : (s_overlay == OVERLAY_FX && FX_COUNT > 8 ? 5u : 6u);
+    bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET || s_overlay == OVERLAY_SYSEQ || s_overlay == OVERLAY_SEQB2 || s_overlay == OVERLAY_FX);
+    // FX is now a full 4x4 grid (FX_COUNT=16) like the other is4col overlays; others use 2 (col6-7)
+    uint8_t colMin = is4col ? 4u : 6u;
     if (col < colMin) {
         // OVERLAY_FX: a key outside its selection columns is someone playing a note to
         // hear the effect (now allowed through to handleNoteKeyAudio, see there) — don't
@@ -3611,7 +3662,7 @@ void drawScreen(bool blockWait) {
     // 4-col overlays (SCALE_ARP, 303, 303_PRESET):  4×4 grid, 32×32px par case
     if (s_overlay != OVERLAY_NONE) {
         struct OvBox { char l1[12]; char l2[14]; char l3[14]; bool avail, sel; };
-        bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET || s_overlay == OVERLAY_SYSEQ || s_overlay == OVERLAY_SEQB2);
+        bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET || s_overlay == OVERLAY_SYSEQ || s_overlay == OVERLAY_SEQB2 || s_overlay == OVERLAY_FX);
         OvBox bx[16];
         memset(bx, 0, sizeof(bx));
 
@@ -3850,8 +3901,8 @@ void drawScreen(bool blockWait) {
             default: break;
         }
 
-        // Render: 4-col → 32px, 3-col → 42px, 2-col → 64px cells
-        int ncols = is4col ? 4 : (s_overlay == OVERLAY_FX && FX_COUNT > 8 ? 3 : 2);  // SEQB2 is 4-col via is4col
+        // Render: 4-col → 32px, 2-col → 64px cells
+        int ncols = is4col ? 4 : 2;
         int cw    = 128 / ncols;
         for (int i = 0; i < ncols * 4; i++) {
             int gc = i / 4, gr = i % 4;
@@ -6907,8 +6958,8 @@ static void updateLedsAndShow()
             }
         }
     } else if (s_overlay != OVERLAY_NONE) {
-        bool ovl4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET);
-        uint8_t nOpts = ovl4col ? 16 : (s_overlay == OVERLAY_FX && FX_COUNT > 8 ? 12 : 8);
+        bool ovl4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET || s_overlay == OVERLAY_FX);
+        uint8_t nOpts = ovl4col ? 16 : 8;
         for (uint8_t opt = 0; opt < nOpts; opt++) {
             uint8_t r = (uint8_t)(3 - (opt & 3));
             uint8_t colRank = opt >> 2;  // 0→col7, 1→col6, 2→col5, 3→col4
@@ -7074,16 +7125,49 @@ static inline void playDrum(uint8_t pi, float v, uint8_t pitch, float dec) {
 // Running on Core 1 keeps AMY state writes on the same core as before,
 // avoiding races with AMY render (Core 0). Priority 22 beats the main loop (1)
 // so events are processed as soon as AMY fill buffer (23) yields.
+// Whether it's safe to let note-row key presses reach handleNoteKeyAudio's per-mode
+// switch below while the FX overlay is open. For a plain instrument mode this just
+// previews a sound (harmless, even wanted — see the OVERLAY_FX exemption below). But
+// several modes reuse the SAME note-grid keys to edit a step-sequencer/pattern grid
+// (GEST picks a pattern slot and auto-saves the live one into it; DRUM2/303S/SS2's
+// SEQ view toggles a step) — for those, letting a key press through while adjusting
+// an FX silently mutates the sequence "underneath" the FX menu, which is exactly the
+// bug report this guards against. Modes not listed here (GEST, 303S2, SYSEQ, TRACKER,
+// DR2 chief among them) have no view where pressing a note key is side-effect-free,
+// so they're excluded entirely rather than guessing a safe sub-state.
+static bool notePreviewSafeDuringFxOverlay() {
+    switch (currentMode) {
+        case MODE_SYNTH: case MODE_STONE: case MODE_OMNI: case MODE_SAMPLE:
+        case MODE_I303:  case MODE_MOD2:  case MODE_MODULAR: case MODE_GRANULAR2:
+        case MODE_POKEMON:
+            return true;
+        case MODE_DRUM2: return drum2View != 1;   // PAD/ANIM views preview; SEQ view edits steps
+        case MODE_303S:  return !s303SeqView;      // PAD view previews; SEQ view edits steps
+        case MODE_SS2:   return !ss2SeqView;        // PAD view previews; SEQ view edits steps
+        default: return false;
+    }
+}
+
 static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
 {
-    // OVERLAY_FX is deliberately exempted: it's designed to "stay open for multi-toggle"
-    // (see overlayKeyPress's OVERLAY_FX case) so pots can keep adjusting an FX's params
-    // while it's open — but with every overlay silently blocking note playback here, a
-    // user could never actually HEAR the effect while dialing it in, since pressing a
-    // note key produced no sound at all (and, via overlayKeyPress's colMin check below,
-    // silently closed the overlay too — so by the time a pot got touched, the overlay
-    // was already gone and pots fell back to whatever the mode's own params are).
-    if (menuOpen || !audioReady || (s_overlay != OVERLAY_NONE && s_overlay != OVERLAY_FX)) return;
+    // OVERLAY_FX is deliberately exempted (for modes where it's safe — see
+    // notePreviewSafeDuringFxOverlay() above): it's designed to "stay open for
+    // multi-toggle" (see overlayKeyPress's OVERLAY_FX case) so pots can keep adjusting
+    // an FX's params while it's open — but with every overlay silently blocking note
+    // playback here, a user could never actually HEAR the effect while dialing it in,
+    // since pressing a note key produced no sound at all (and, via overlayKeyPress's
+    // colMin check below, silently closed the overlay too — so by the time a pot got
+    // touched, the overlay was already gone and pots fell back to whatever the mode's
+    // own params are).
+    // col>=4 is excluded even when otherwise "safe": those are the FX overlay's own
+    // 4x4 selection grid (16 slots, colMin=4 in overlayKeyPress) — a key press there
+    // is picking/toggling which FX is selected, not a performance gesture, so it
+    // shouldn't also fire whatever note that same physical key would play outside
+    // the overlay.
+    if (menuOpen || !audioReady ||
+        (s_overlay != OVERLAY_NONE &&
+         !(s_overlay == OVERLAY_FX && col < 4 && notePreviewSafeDuringFxOverlay())))
+        return;
     switch(currentMode){
         case MODE_SYNTH:{
             uint8_t note;
@@ -10111,6 +10195,43 @@ void loop() {
                 // last LFO filter position doesn't remain stuck (especially critical for patches).
                 lfoWasActive = false;
                 audioRestoreShapeFilter(currentShape);
+            }
+        }
+
+        // TREMOLO (10ms tick) — volume LFO, same shape as the filter-LFO tick above,
+        // just modulating the volume pot's own output instead of cutoff.
+        if(fxList[11].active&&audioReady){
+            static float tremPhase=0.0f;
+            static bool  tremWasActive=false;
+            float rate  = fxList[11].params[0];
+            float depth = fxList[11].params[1];
+            tremPhase += rate * 2.0f * (float)M_PI * 0.01f;
+            if(tremPhase > 2.0f*(float)M_PI) tremPhase -= 2.0f*(float)M_PI;
+            if(depth > 0.005f){
+                tremWasActive = true;
+                float tremMod = (1.0f + sinf(tremPhase)) * 0.5f;
+                audioSetVolume(volume * (1.0f - depth * tremMod));
+            } else if(tremWasActive){
+                tremWasActive = false;
+                audioSetVolume(volume);  // restore plain pot volume
+            }
+        }
+
+        // AUTOPAN (10ms tick) — stereo pan LFO, same shape as TREMOLO but driving pan.
+        if(fxList[12].active&&audioReady){
+            static float panPhase=0.0f;
+            static bool  panWasActive=false;
+            float rate  = fxList[12].params[0];
+            float depth = fxList[12].params[1];
+            panPhase += rate * 2.0f * (float)M_PI * 0.01f;
+            if(panPhase > 2.0f*(float)M_PI) panPhase -= 2.0f*(float)M_PI;
+            if(depth > 0.005f){
+                panWasActive = true;
+                float pan = 0.5f + 0.5f * depth * sinf(panPhase);
+                audioSetPan(pan);
+            } else if(panWasActive){
+                panWasActive = false;
+                audioSetPan(0.5f);  // recenter
             }
         }
 

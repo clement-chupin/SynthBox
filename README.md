@@ -52,6 +52,19 @@ DISPLAY=:1 ./build/grvep_sim
 
 Le binaire est produit dans `simulator/build/grvep_sim`.
 
+Deux fenêtres supplémentaires s'ouvrent automatiquement à côté (desktop uniquement,
+absentes sur Android), toutes deux basées sur le même flux audio réellement envoyé à
+la sortie (donc déjà passé par tous les FX actifs) :
+
+- « GrvEP - Spectrogramme » : waterfall défilant (historique dans le temps).
+- « GrvEP - EQ » : courbe unique en temps réel, des graves (gauche) aux aigus
+  (droite), comme un analyseur de spectre/EQ classique — plus directe que le
+  waterfall pour voir immédiatement l'effet d'un réglage.
+
+Les deux sont pratiques pour régler un filtre/EQ/FX à l'œil, notamment avec les
+instruments de bruit (catégorie NOISE : WHT/PINK/BRWN) dont le spectre plein-bande
+rend immédiatement visible la réponse en fréquence de l'effet.
+
 ## Build d'un .exe Windows (cross-compilation depuis Linux)
 
 Un exécutable Windows tout-en-un (statiquement lié : ni SDL2.dll, ni libstdc++/libwinpthread

@@ -728,6 +728,13 @@ bool simWindowPollEvents() {
                 g_simJoySW = false;
                 g_simJoyX = 0.0f;
                 g_simJoyY = 0.0f;
+                // Clearing s_dragPot/s_dragJoy here without also turning off relative
+                // mouse mode left it stuck on whenever a focus blip happened mid-drag
+                // (observed with a keyboard note key pressed while still dragging a pot):
+                // the later real mouse-up sees s_dragPot/s_dragJoy already -1/false and
+                // skips its own SDL_SetRelativeMouseMode(FALSE), leaving the cursor
+                // invisible and warp-locked to the window center from then on.
+                if (s_dragPot >= 0 || s_dragJoy) SDL_SetRelativeMouseMode(SDL_FALSE);
                 s_dragPot = -1;
                 s_dragJoy = false;
             }

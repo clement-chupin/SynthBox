@@ -69,6 +69,8 @@ set(SIM_SOURCES
     ${CMAKE_SOURCE_DIR}/sim_state.cpp
     ${CMAKE_SOURCE_DIR}/sim_window.cpp
     ${CMAKE_SOURCE_DIR}/sim_mp3dec.cpp
+    ${CMAKE_SOURCE_DIR}/sim_spectrogram.cpp
+    ${CMAKE_SOURCE_DIR}/sim_eq.cpp
 )
 
 add_executable(grvep_sim

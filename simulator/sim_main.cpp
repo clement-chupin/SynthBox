@@ -26,6 +26,20 @@ void simWindowDestroy();
 bool simWindowPollEvents();
 void simWindowRender();
 
+// sim_spectrogram API (desktop only — see sim_spectrogram.cpp)
+#ifndef __ANDROID__
+bool simSpectrogramInit();
+void simSpectrogramRender();
+void simSpectrogramDestroy();
+#endif
+
+// sim_eq API (desktop only — see sim_eq.cpp)
+#ifndef __ANDROID__
+bool simEqInit();
+void simEqRender();
+void simEqDestroy();
+#endif
+
 static volatile bool s_quit = false;
 
 static void* arduinoThread(void*) {
@@ -68,6 +82,12 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Failed to create window\n");
         return 1;
     }
+#ifndef __ANDROID__
+    if (!simSpectrogramInit())
+        fprintf(stderr, "Failed to create spectrogram window (continuing without it)\n");
+    if (!simEqInit())
+        fprintf(stderr, "Failed to create EQ window (continuing without it)\n");
+#endif
 
     // Start the Arduino setup()/loop() thread
     pthread_t tid;
@@ -84,10 +104,18 @@ int main(int argc, char* argv[]) {
             break;
         }
         simWindowRender();
+#ifndef __ANDROID__
+        simSpectrogramRender();
+        simEqRender();
+#endif
         // ~60 fps
         usleep(16000);
     }
 
+#ifndef __ANDROID__
+    simSpectrogramDestroy();
+    simEqDestroy();
+#endif
     simWindowDestroy();
     return 0;
 }

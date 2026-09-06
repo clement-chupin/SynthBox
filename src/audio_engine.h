@@ -46,6 +46,15 @@ void audioSetWavefold(float gain);  // global wavefold on bus 0: 1.0=dry, >1 fol
 // the useful range, higher self-oscillates harder.
 void audioSetLadderFilter(float cutoffHz, float resonance, bool on);
 
+// RINGMOD FX: multiplies bus 0 by a sine carrier. mix 0=dry, 1=fully ring-modulated.
+void audioSetRingmod(float freqHz, float mix, bool on);
+// COMPRESSOR FX: feedforward peak envelope follower, linked stereo. threshold is
+// linear (bus headroom, not dBFS); ratio 1.0=no compression, higher=more limiting.
+void audioSetCompressor(float threshold, float ratio, bool on);
+// AUTOPAN FX: per-oscillator equal-power pan, one-shot (call every tick to sweep it).
+// 0=full left, 0.5=center, 1=full right.
+void audioSetPan(float pan);
+
 // Preview: aborts any in-progress load, loads file into preview preset and plays.
 void audioLoadAndPlay(const char* path, uint16_t preset, float vel);
 
