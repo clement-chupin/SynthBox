@@ -292,16 +292,67 @@ static void renderOled() {
     SDL_RenderDrawRect(s_rend, &bg);
 }
 
-// ---- Keyboard rendering ----
-static const char* menuLabel(int col) {
-    switch (col) {
-        case 4: return "FX";
-        case 5: return "Arp";
-        case 6: return "Env";
-        case 7: return "Oct";
-    }
-    return "";
+// ---- Tiny on-screen labels (pots/menu buttons) ----
+// SDL2 alone has no font renderer here (see renderImportBtn()'s icon-only design,
+// forced by that same gap) — rather than inventing a second font system, this reuses
+// the real u8g2 4x6 font already linked in for the OLED (hal/U8g2lib.h).
+//
+// IMPORTANT: this must NOT be a second SimOled/U8G2_SH1107_128X128_F_HW_I2C instance.
+// That type's "_f" (full-buffer) setup function allocates its pixel buffer as a
+// function-local `static uint8_t buf[2048]` (see u8g2_m_16_16_f() in u8g2's
+// u8g2_d_memory.c) — every instance built via that SAME setup function shares that
+// SAME memory. A second instance silently aliased the real OLED's own framebuffer:
+// clearing/drawing into "our" buffer was actually clearing/drawing into the real
+// oled's buffer too, and the two threads (this SDL render loop vs. the arduinoThread
+// calling drawScreen()) raced over it — which is exactly what caused stray label text
+// ("BPM") to flash on the real OLED and the overall flicker. Building the u8g2
+// wrapper manually here (same calls u8g2_Setup_sh1107_i2c_128x128_f makes internally)
+// with our own dedicated static buffer keeps this instance fully independent.
+static u8g2_t  s_lblU8g2;
+static uint8_t s_lblBuf[2048];
+static bool    s_lblFontReady = false;
+
+static uint8_t u8x8_byte_null_lbl(u8x8_t*, uint8_t, uint8_t, void*) { return 1; }
+static uint8_t u8x8_gpio_delay_null_lbl(u8x8_t*, uint8_t, uint8_t, void*) { return 1; }
+
+static inline void ensureLabelFont() {
+    if (s_lblFontReady) return;
+    u8g2_SetupDisplay(&s_lblU8g2, u8x8_d_sh1107_128x128, u8x8_cad_ssd13xx_fast_i2c,
+                       u8x8_byte_null_lbl, u8x8_gpio_delay_null_lbl);
+    u8g2_SetupBuffer(&s_lblU8g2, s_lblBuf, 16, u8g2_ll_hvline_vertical_top_lsb, U8G2_R0);
+    u8g2_SetFont(&s_lblU8g2, u8g2_font_4x6_tf);
+    u8g2_SetFontPosTop(&s_lblU8g2);
+    s_lblFontReady = true;
 }
+static int labelWidth(const char* text) {
+    if (!text || !text[0]) return 0;
+    ensureLabelFont();
+    return (int)u8g2_GetStrWidth(&s_lblU8g2, text);
+}
+// Draws at screen (x,y) top-left, 1 font-pixel = 1 screen pixel — kept small on
+// purpose to fit the tight pot/key spacing. "-" means "no label for this control
+// in the current mode" (see sim_state.h) and is skipped rather than drawn literally.
+static void drawLabel(int x, int y, const char* text, SDL_Color col) {
+    if (!text || !text[0] || (text[0]=='-' && !text[1])) return;
+    ensureLabelFont();
+    u8g2_ClearBuffer(&s_lblU8g2);
+    u8g2_DrawStr(&s_lblU8g2, 0, 0, text);
+    int w = (int)u8g2_GetStrWidth(&s_lblU8g2, text);
+    if (w > 127) w = 127;
+    uint8_t* buf = u8g2_GetBufferPtr(&s_lblU8g2);  // tile row 0 = pixel rows y=0..7 (LSB=top)
+    SDL_SetRenderDrawColor(s_rend, col.r, col.g, col.b, col.a);
+    for (int c = 0; c < w; c++) {
+        uint8_t byte = buf[c];
+        for (int bit = 0; bit < 7; bit++) {
+            if ((byte >> bit) & 1) {
+                SDL_Rect px = {x + c, y + bit, 1, 1};
+                SDL_RenderFillRect(s_rend, &px);
+            }
+        }
+    }
+}
+
+// ---- Keyboard rendering ----
 
 static void renderKeyboard() {
     for (int row = 0; row < KBD_ROWS; row++) {
@@ -331,11 +382,30 @@ static void renderKeyboard() {
             else
                 SDL_SetRenderDrawColor(s_rend, 80, 80, 90, 255);
             SDL_RenderDrawRect(s_rend, &r);
+
+            // Menu row (B1-B4): show what each button currently does — main.cpp's
+            // ctrlLabelsFor() is the single source of truth (see sim_state.h), so this
+            // always matches the terminal's "B1 : ..." legend for the active mode.
+            // Column-to-button mapping is NOT col-4 directly: NoteMap::getMenuButton()
+            // returns rawBtn=col-4, then handleButton() remaps btn=3-rawBtn — so col4
+            // is actually B4, col7 is actually B1 (verified against the real "BTN
+            // raw=.. mapped=.." log). Using col-4 directly here showed each label on
+            // the wrong key (e.g. B1's label on the key that actually triggers B4) —
+            // reported as the labels looking mirrored, which they were.
+            if (row == 4) {
+                const char* lbl = "-";
+                switch (col) {
+                    case 4: lbl = g_ctrlB4; break;
+                    case 5: lbl = g_ctrlB3; break;
+                    case 6: lbl = g_ctrlB2; break;
+                    case 7: lbl = g_ctrlB1; break;
+                }
+                int w = labelWidth(lbl);
+                SDL_Color lc = {235, 235, 245, 255};
+                drawLabel(x + (KEY_W - w) / 2, y + (KEY_H - 7) / 2, lbl, lc);
+            }
         }
     }
-
-    // PC keyboard hint labels (row labels on the left)
-    // Small dots to show which physical keys correspond
 }
 
 // ---- Pot sliders ----
@@ -356,16 +426,20 @@ static void potRect(int i, SDL_Rect* knob, SDL_Rect* track) {
     if (knob)  { knob->x  = x;                knob->y  = ky; knob->w  = POT_W; knob->h  = POT_W; }
 }
 
+// Extra headroom above each pot's slider so its label (drawn above the knob) doesn't
+// sit flush against the group background's own top edge.
+#define POT_LABEL_H 9
+
 static void renderPots() {
     // Main group background (VOL / SHAPE / BPM)
     {
-        SDL_Rect bg = {MPOT_X - 4, MPOT_Y - 4, MPOT_COUNT * MPOT_GAP + 4, POT_H + 8};
+        SDL_Rect bg = {MPOT_X - 4, MPOT_Y - 4 - POT_LABEL_H, MPOT_COUNT * MPOT_GAP + 4, POT_H + 8 + POT_LABEL_H};
         SDL_SetRenderDrawColor(s_rend, 42, 38, 25, 255);
         SDL_RenderFillRect(s_rend, &bg);
     }
     // Secondary group background (FX params)
     {
-        SDL_Rect bg = {SPOT_X - 4, SPOT_Y - 4, SPOT_COUNT * SPOT_GAP + 4, POT_H + 8};
+        SDL_Rect bg = {SPOT_X - 4, SPOT_Y - 4 - POT_LABEL_H, SPOT_COUNT * SPOT_GAP + 4, POT_H + 8 + POT_LABEL_H};
         SDL_SetRenderDrawColor(s_rend, 22, 38, 42, 255);
         SDL_RenderFillRect(s_rend, &bg);
     }
@@ -389,6 +463,21 @@ static void renderPots() {
             isMain ? 210 : 210,
             isMain ? 130 : 185, 255);
         SDL_RenderDrawRect(s_rend, &knob);
+
+        // Label: P1/P3 are always VOL/BPM; P2/P4-P7 come from the current mode's
+        // live control labels (main.cpp's ctrlLabelsFor(), mirrored into sim_state.h).
+        const char* lbl = "-";
+        switch (i) {
+            case 0: lbl = "VOL";     break;
+            case 1: lbl = g_ctrlP2;  break;
+            case 2: lbl = "BPM";     break;
+            case 3: lbl = g_ctrlP4;  break;
+            case 4: lbl = g_ctrlP5;  break;
+            case 5: lbl = g_ctrlP6;  break;
+            case 6: lbl = g_ctrlP7;  break;
+        }
+        SDL_Color lc = {230, 230, 230, 255};
+        drawLabel(knob.x, track.y - POT_LABEL_H, lbl, lc);
     }
 }
 
@@ -496,8 +585,14 @@ static bool potHitTest(int mx, int my, int* idx) {
     for (int i = 0; i < POT_COUNT; i++) {
         SDL_Rect track, knob;
         potRect(i, &knob, &track);
-        if ((mx >= knob.x  && mx < knob.x  + knob.w  && my >= knob.y  && my < knob.y  + knob.h) ||
-            (mx >= track.x && mx < track.x + track.w && my >= track.y && my < track.y + track.h)) {
+        // Full column (knob width × full track height), not just the thin 4px-wide
+        // track or the knob's current y position — mouse-wheel scrolling to adjust a
+        // pot only worked when hovering a pixel-precise strip at the current knob
+        // height, since the track itself is barely wider than its own outline. Any
+        // point over the pot's visual slider area should count, for both drag-start
+        // and wheel-scroll.
+        int x0 = knob.x, y0 = track.y, w = knob.w, h = track.h;
+        if (mx >= x0 && mx < x0 + w && my >= y0 && my < y0 + h) {
             *idx = i;
             return true;
         }

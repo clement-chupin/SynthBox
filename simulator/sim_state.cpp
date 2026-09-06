@@ -15,6 +15,16 @@ float g_simSlider[16] = {
 };
 volatile bool g_simImportTap = false;
 
+const char* g_ctrlP2 = "-";
+const char* g_ctrlP4 = "-";
+const char* g_ctrlP5 = "-";
+const char* g_ctrlP6 = "-";
+const char* g_ctrlP7 = "-";
+const char* g_ctrlB1 = "-";
+const char* g_ctrlB2 = "-";
+const char* g_ctrlB3 = "-";
+const char* g_ctrlB4 = "-";
+
 // Arduino HAL singletons
 #include "hal/Arduino.h"
 HardwareSerial Serial;

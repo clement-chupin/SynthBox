@@ -1713,6 +1713,150 @@ static bool pcmCleanStep(uint8_t entriesPerCall = 6) {
     return false;
 }
 
+// ==================== CONTROL LABELS (simulator/terminal legend) ====================
+// P1 (pots[0]) and P3 (pots[2]) are Volume and BPM for every mode without exception
+// (see loop(): "Pot 0 = Volume (always)" / "Pot 2 (P3) = BPM (global, always)", both
+// applied unconditionally before the per-mode switch even runs) — always printed as
+// such below. Everything else is mode-specific and catalogued here per-mode instead
+// of duplicating a separate label table in the simulator: the simulator has no font
+// renderer to draw on-screen text with anyway, so this legend is meant to be read
+// off the terminal/debug console it already prints to (see winOpenDebugConsole() on
+// Windows) — one source of truth (this switch mirrors the actual pot/button dispatch
+// code), no separate mapping to keep in sync by hand. "-" means genuinely unused OR
+// simply not yet catalogued here — both read the same to keep this honest rather
+// than guessing; extend case-by-case as modes get audited.
+struct CtrlLabels {
+    const char* p2; const char* p4; const char* p5; const char* p6; const char* p7;
+    const char* b1; const char* b2; const char* b3; const char* b4;
+};
+
+// Real parameter name of the currently-selected FX's slot p (0-3), matching exactly
+// what the pot-dispatch code itself checks (fxList[fxSelected].paramNames[p]) before
+// letting a pot touch it — so whenever a mode routes P4-P7 to FX params, the label
+// shown is the ACTUAL parameter a pot nudge will change (e.g. "CUTOFF"/"RESO"), not a
+// generic placeholder.
+static const char* fxParamName(uint8_t p) {
+    const char* n = fxList[fxSelected].paramNames[p];
+    return (n && n[0]) ? n : "-";
+}
+static bool anyFxActive() {
+    for (uint8_t f = 0; f < FX_COUNT; f++) if (fxList[f].active) return true;
+    return false;
+}
+
+static CtrlLabels ctrlLabelsFor(AppMode m) {
+    switch (m) {
+        case MODE_SYSEQ:
+        case MODE_SYNTH: {
+            // SYSEQ falls through into SYNTH's own pot-dispatch case (identical P2/P4-P7
+            // handling) — only B1-B4 differ between the two modes.
+            const char* b1 = (m==MODE_SYNTH) ? "FX"   : "PLAY";
+            const char* b2 = (m==MODE_SYNTH) ? "ARP"  : "FX";
+            const char* b3 = (m==MODE_SYNTH) ? "ENV"  : "OPTS";
+            const char* b4 = (m==MODE_SYNTH) ? "INSTR": "CLEAR";
+            if (currentShape == SHAPE_SAW_FM)
+                return {"SHAPE", "DEPTH", "CUTOFF", "-", "-", b1, b2, b3, b4};
+            if (fxList[fxSelected].active)
+                return {"SHAPE", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), b1, b2, b3, b4};
+            return {"SHAPE", "-", "-", "-", "-", b1, b2, b3, b4};
+        }
+        case MODE_POKEMON:
+            if (fxList[fxSelected].active)
+                return {"PKMN", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "FX", "ARP", "ENV", "PKMN"};
+            return {"PKMN", "-", "-", "-", "-", "FX", "ARP", "ENV", "PKMN"};
+        case MODE_OMNI: {
+            bool fx = fxList[fxSelected].active;
+            return {"SHAPE", fx?fxParamName(0):"WAVE", fx?fxParamName(1):"-", fx?fxParamName(2):"-", fx?fxParamName(3):"-",
+                    "FX", "FX SEL", "-", "OCT"};
+        }
+        case MODE_I303:
+            // I303's pots have no FX-routing branch at all (unlike 303S/STONE) — P4-P7
+            // always control the 303 engine directly here.
+            return {"WAVE", "RESO", "ENVMOD", "SUSTAIN", "CUTOFF", "FX", "ARP", "ENV", "WAVE"};
+        case MODE_303S:
+            if (s_overlay == OVERLAY_FX && fxList[fxSelected].active)
+                return {"WAVE", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", "ACCENT/ALT", "SEQ/PAD"};
+            return {"WAVE", "RESO", "ENVMOD", "DECAY", "CUTOFF", "PLAY", "FX", "ACCENT/ALT", "SEQ/PAD"};
+        case MODE_303S2:
+            return {"WAVE", "RESO", "ENVMOD", "DECAY", "CUTOFF", "PLAY", "FX", "ACCENT", "CLEAR"};
+        case MODE_STONE:
+            if (s_overlay == OVERLAY_FX && fxList[fxSelected].active)
+                return {"CYCLE", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "FX", "ARP", "LOOP", "OCT"};
+            return {"CYCLE", "START", "END", "POS", "SIZE", "FX", "ARP", "LOOP", "OCT"};
+        case MODE_SAMPLE:
+            if (fxList[fxSelected].active)
+                return {"-", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "BACK", "FX", "AUTOMAP", "OPTS"};
+            return {"-", "-", "-", "-", "-", "BACK", "FX", "AUTOMAP", "OPTS"};
+        case MODE_GRANULAR2:
+            return {"-", "START", "END", "POS", "SIZE", "FX", "-", "-", "-"};
+        case MODE_SS2:
+            if (anyFxActive())
+                return {"-", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", "ALT/AUTOMAP", "SEQ/PAD"};
+            return {"-", "-", "-", "-", "-", "PLAY", "FX", "ALT/AUTOMAP", "SEQ/PAD"};
+        case MODE_DRUM2:
+            if (anyFxActive())
+                return {"-", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY/BACK", "FX", "REC/BROWSE", "VIEW"};
+            return {"-", "PITCH", "DECAY", "VOLUME", "-", "PLAY/BACK", "FX", "REC/BROWSE", "VIEW"};
+        case MODE_DR2:
+            if (anyFxActive())
+                return {"-", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", "LOOP/LIVE", "COPY/PASTE"};
+            if (dr2Instrument == DR2_INSTR_T303)
+                return {"WAVE", "RESO", "ENVMOD", "DECAY", "CUTOFF", "PLAY", "FX", "LOOP/LIVE", "COPY/PASTE"};
+            if (dr2Instrument == DR2_INSTR_SYNTH)
+                return {"-", "VOLUME", "-", "-", "-", "PLAY", "FX", "LOOP/LIVE", "COPY/PASTE"};
+            return {"-", "PITCH", "DECAY", "VOLUME", "-", "PLAY", "FX", "LOOP/LIVE", "COPY/PASTE"};  // DR2_INSTR_DRUMS
+        case MODE_GEST:
+            return {"-", "SEQVOL1", "SEQVOL2", "SEQVOL3", "SEQVOL4", "PLAY", "FX", "LOOP/LIVE", "COPY/PASTE"};
+        case MODE_MOD2: {
+            const Mod2AlgoDef& algo = kMod2Algos[mod2AlgoIdx];
+            // B4 is dead code upstream (handleButton's MOD2 case checks btn==4, which
+            // btn=3-rawBtn can never produce — see its own comment) so it genuinely does
+            // nothing right now; "-" reflects that rather than guessing a function for it.
+            return {"ALGO", algo.p[0].name, algo.p[1].name, algo.p[2].name, algo.p[3].name, "FX", "ENV", "ALGO", "-"};
+        }
+        case MODE_LIGHT:
+            return {"-", "N", "SPEED", "HUE", "INTENSITY", "-", "-", "-", "-"};
+        default:
+            return {"-", "-", "-", "-", "-", "-", "-", "-", "-"};
+    }
+}
+
+#ifdef SIMULATOR
+// Same-process mirror for the simulator's on-screen pot/button labels (see
+// sim_window.cpp) — reads this struct directly rather than re-parsing the terminal
+// print, since both live in the same binary here (unlike real ESP32 hardware, where
+// the terminal is genuinely the only place this reaches). Called far more often than
+// printCtrlLabels() itself (every ~150ms, see loop()) so the on-screen labels track
+// live state within a mode too — which FX param a pot touches, DRUM2's per-pad
+// pitch/decay/volume, etc. — not just what changes on a full mode switch.
+static void updateSimCtrlLabels(AppMode m) {
+    CtrlLabels L = ctrlLabelsFor(m);
+    extern const char* g_ctrlP2; extern const char* g_ctrlP4; extern const char* g_ctrlP5;
+    extern const char* g_ctrlP6; extern const char* g_ctrlP7; extern const char* g_ctrlB1;
+    extern const char* g_ctrlB2; extern const char* g_ctrlB3; extern const char* g_ctrlB4;
+    g_ctrlP2=L.p2; g_ctrlP4=L.p4; g_ctrlP5=L.p5; g_ctrlP6=L.p6; g_ctrlP7=L.p7;
+    g_ctrlB1=L.b1; g_ctrlB2=L.b2; g_ctrlB3=L.b3; g_ctrlB4=L.b4;
+}
+#endif
+
+static void printCtrlLabels(AppMode m) {
+    CtrlLabels L = ctrlLabelsFor(m);
+    Serial.println("P1 : VOL");
+    Serial.printf ("P2 : %s\n", L.p2);
+    Serial.println("P3 : BPM");
+    Serial.printf ("P4 : %s\n", L.p4);
+    Serial.printf ("P5 : %s\n", L.p5);
+    Serial.printf ("P6 : %s\n", L.p6);
+    Serial.printf ("P7 : %s\n", L.p7);
+    Serial.printf ("B1 : %s\n", L.b1);
+    Serial.printf ("B2 : %s\n", L.b2);
+    Serial.printf ("B3 : %s\n", L.b3);
+    Serial.printf ("B4 : %s\n", L.b4);
+#ifdef SIMULATOR
+    updateSimCtrlLabels(m);
+#endif
+}
+
 // ==================== MODE SWITCH ====================
 void drawScreen(bool blockWait = false);  // forward-decl
 static void mod2AlgoApply();              // forward-decl
@@ -1869,6 +2013,7 @@ void switchMode(AppMode newMode) {
       // extended when MODE_PCMCLEAN/STONE/DR2 were added, so switchMode() into
       // any of them printed a null string and took down Core 1.
       Serial.printf("M:%s\n", newMode<MODE_COUNT?kVizMode[newMode]:"?"); }
+    if (newMode < MODE_COUNT) printCtrlLabels(newMode);
     if (currentMode==MODE_VID && newMode!=MODE_VID) {
         if (vidFileOpen) { vidFile.close(); vidFileOpen=false; }
         vidPlaying=false;
@@ -8131,6 +8276,11 @@ void setup() {
     audioSetVolume(pots[0].value);
     memset(trkNotes, -1, sizeof(trkNotes));  // init tracker to empty (static 0-init would trigger step-0 notes)
     initGestPresets();
+
+    // Land on the main menu at boot instead of dropping straight into SYNTH —
+    // same state handleButton()'s long-press-B1 path sets when opening the menu.
+    menuOpen = true; menuRow = 0; menuCol = 0; menuOnTabBar = true;
+
     Serial.println("Ready");
 }
 
@@ -8138,6 +8288,39 @@ void setup() {
 void loop() {
     s_mainLoopCount++;
     amy_update();
+
+#ifndef SIMULATOR
+    // ---- SD CARD HOT-SWAP DETECTION ----
+    // SDFS::begin() (arduino-esp32's SD.cpp) is a no-op once mounted — it returns
+    // true immediately without touching the hardware again as long as its internal
+    // _pdrv stays set, and nothing else ever notices a card being pulled. So without
+    // this, removing/reinserting the card left sdReady stuck true against a card that
+    // no longer responds, requiring a full power cycle to re-run setup()'s one-shot
+    // SD.begin(). Gated on audioIsStreamingDone() so this never shares the SPI bus
+    // with an in-flight background sample load from bgServiceTask.
+    {
+        static uint32_t lastSdCheck = 0;
+        uint32_t nowSd = millis();
+        if (nowSd - lastSdCheck > 1000 && audioIsStreamingDone()) {
+            lastSdCheck = nowSd;
+            if (sdReady) {
+                // Cheap real I/O probe — fails immediately once the card is physically gone.
+                File f = SD.open("/");
+                if (f) {
+                    f.close();
+                } else {
+                    sdReady = false;
+                    SD.end();  // reset _pdrv so a later begin() actually re-probes
+                    Serial.println("SD: card lost");
+                }
+            } else if (SD.begin(SD_CS, SPI, 20000000)) {
+                sdReady = true;
+                Serial.println("SD: card detected");
+                sdListDir(sdPath.length() > 1 ? sdPath.c_str() : "/");
+            }
+        }
+    }
+#endif
 
     // Deferred mode switch posted by audioHandlerTask (thread-safe)
     if (gestDrillTarget != MODE_COUNT) {
@@ -10630,6 +10813,15 @@ void loop() {
     }
     { unsigned long scrMs = (bpm > 250) ? 200UL : 100UL;
       if(millis()-lastScr>=scrMs){lastScr=millis();drawScreen();} }
+
+#ifdef SIMULATOR
+    // ---- SIMULATOR ON-SCREEN LABELS (150ms) ----
+    // Keeps pot/button labels live within a mode (FX param names as FX gets toggled/
+    // switched, DRUM2's per-pad pitch/decay/volume, etc.) — printCtrlLabels() only
+    // fires on an actual mode switch, which alone isn't enough for these.
+    { static unsigned long lastLbl=0;
+      if(millis()-lastLbl>=150){lastLbl=millis();updateSimCtrlLabels(currentMode);} }
+#endif
 
     // ---- POWER (500ms) ----
     static unsigned long lastPwr=0;
