@@ -153,7 +153,14 @@ Grille de pas (typiquement 8 ou 16 pas sur 2 lignes), BPM, octave, slide/accent.
 
 ## 3. Template STANDALONE / PERFORMANCE
 
-> Modes : `EXP`, `EXP2`, `EXP3`
+> Modes : `EXP`, `EXP2`, `EXP3`, `LIFE`, `SWARM`
+
+`LIFE` et `SWARM` (Conway's-Game-of-Life sur la grille / boids flocking) suivent ce même
+template : grille de touches réinterprétée librement (cellule vivante/morte pour LIFE,
+spawn de boid pour SWARM — pas un clavier note-par-note classique), pots/joystick
+sémantique libre définie en tête de chaque bloc. `SWARM` réutilise volontairement la
+structure de balle/l'arène tournante/le clamp de vitesse déjà écrits pour `EXP2` plutôt
+que d'en réinventer une — voir `structure/SOFTWARE.md`, section « Modes expérimentaux ».
 
 Mode autonome de performance ou d'exploration ne nécessitant pas de grille-clavier fixe.
 L'interface est entièrement définie par le mode lui-même.

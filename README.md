@@ -2,16 +2,38 @@
 
 ![GrvEP](./images/image.png)
 
-GrvEP est une boîte à rythmes / synthétiseur portable basée sur un ESP32-S3 :
-séquenceurs de drums, synthés (soustractif, TB-303, PCM, granulaire, échantillonneur...),
-lecture de samples depuis une carte SD, écran OLED, clavier de 16 touches, joystick,
-potentiomètres et LEDs adressables (FastLED) pour le retour visuel.
+GrvEP est une boîte à rythmes / synthétiseur portable basée sur un ESP32-S3 : plus de 30
+modes — séquenceurs de drums, synthés (soustractif, FM, **wavetable**, TB-303, granulaire,
+échantillonneur...), et une famille de modes expérimentaux/génératifs (automate cellulaire,
+essaim de boids, thérémine, physique de balles...) — lecture de samples depuis une carte
+SD, écran OLED, clavier de 32 touches (4×8), joystick, 7 potentiomètres et LEDs
+adressables (FastLED) pour le retour visuel.
+
+**Nouveau utilisateur ?** Voir [docs/GUIDE_UTILISATEUR.md](docs/GUIDE_UTILISATEUR.md) —
+guide d'utilisation complet (contrôles, navigation, panorama des modes), convertible en
+PDF (`pandoc docs/GUIDE_UTILISATEUR.md -o guide.pdf --toc --pdf-engine=wkhtmltopdf`, ou
+avec un moteur LaTeX comme `xelatex` si installé).
 
 Le même code applicatif (`src/`) tourne sur trois cibles :
 
 - **ESP32-S3** — le matériel réel, via [PlatformIO](https://platformio.org/).
 - **Simulateur desktop Linux** — une reconstruction de la carte (écran, clavier, joystick, LEDs) en SDL2, pour développer/tester sans le matériel.
 - **APK Android** — le même simulateur SDL2, compilé nativement en C++ pour Android (pas de wrapper web).
+
+## Nouveautés récentes
+
+- **Automatisation des effets** — double-cliquer un effet actif dans la grille FX ouvre
+  un éditeur de modulation (LFO assignable à n'importe quel paramètre de l'effet,
+  profondeur/vitesse/forme d'onde/synchro BPM réglables aux pots).
+- **Synthé modulaire wavetable** (mode MODULAR, refonte complète) — deux oscillateurs
+  qui parcourent des wavetables AMY (5 tables embarquées, 64 formes d'onde chacune),
+  position de morphing indépendante par oscillateur, LFO de modulation, filtre partagé.
+- **Deux nouveaux modes génératifs** : **LIFE** (Jeu de la vie de Conway sur la grille
+  de touches — les naissances/morts de cellules déclenchent des notes) et **SWARM**
+  (essaim de boids avec cohésion/séparation/alignement, zone d'attraction pilotée au
+  joystick).
+- Détails complets dans [structure/SOFTWARE.md](structure/SOFTWARE.md) (architecture) et
+  [docs/GUIDE_UTILISATEUR.md](docs/GUIDE_UTILISATEUR.md) (utilisation).
 
 ## Build pour l'ESP32
 
