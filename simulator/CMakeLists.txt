@@ -105,6 +105,9 @@ target_include_directories(grvep_sim PRIVATE
 target_compile_definitions(grvep_sim PRIVATE
     SIMULATOR=1
     OOPSIE_LED_FLAG=1
+    # Enables render_wavetable() and the 5 built-in wavetables baked into
+    # pcm_samples_tiny.h (111/BRAIDS01/PPG_WA00/SINE2SAW/VIRAL) — used by the modular synth.
+    AMY_WAVETABLE=1
     # AMY platform (Linux, not ESP32)
     # Don't define ARDUINO — Amy checks !defined(ARDUINO) to use miniaudio
     $<$<BOOL:${WIN32}>:WIN32_LEAN_AND_MEAN>

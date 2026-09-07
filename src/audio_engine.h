@@ -203,3 +203,16 @@ void audioSW2AllNotesOff();                              // flush all sub-channe
 // ==================== DRUM2 (TR-808 style per-pad control) ====================
 // Like audioPlayDrumPad but with per-pad pitch (midiNote) and optional EG decay override.
 void audioDrum2Hit(uint8_t padIdx, float vel, uint8_t midiNote, float decayMs);
+
+// ==================== MODULAR SYNTH (MODE_MODULAR, wavetable dual-osc) ====================
+// Two dedicated dynamic channels (MOD3_OSCA_CH/MOD3_OSCB_CH, config.h) — not part of
+// SYNTH_CH — each wave=WAVETABLE. tableIdx (0-4) selects which of the 5 built-in
+// wavetables (111/BRAIDS01/PPG_WA00/SINE2SAW/VIRAL); pos01 is the continuous "Serum-style"
+// morph position within that table (AMY-native crossfade, see render_wavetable()).
+void audioModularOscInit(uint8_t ch, uint8_t tableIdx);
+void audioModularSetTable(uint8_t ch, uint8_t tableIdx);  // lighter: preset only, doesn't reset a held note
+void audioModularSetWtPos(uint8_t ch, float pos01);
+void audioModularNoteOn(uint8_t note, float vel, float detuneSemisB);
+void audioModularNoteOff(uint8_t note);
+void audioModularAllNotesOff();
+void audioModularSetFilter(float cutoffHz, float resonance);

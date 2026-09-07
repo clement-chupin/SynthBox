@@ -34,6 +34,8 @@ enum AppMode : uint8_t {
     MODE_STONE,     // sample tone: one SD sample pitched across the keyboard; JY=browse P2=cycle folder
     MODE_DR2,       // hierarchical drum sequencer: 64 steps addressed as beat.step.micro (4.4.4)
     MODE_IMPORT,    // Android-only: SAF folder picker, imports phone files onto the SD root
+    MODE_LIFE,      // Conway's-Game-of-Life on the key grid: column=pitch, birth=note-on
+    MODE_SWARM,     // boids flocking: joystick-steered attractor zone triggers notes
     MODE_COUNT
 };
 
@@ -59,6 +61,8 @@ enum MenuItem : uint8_t {
     MENU_STONE,
     MENU_DR2,
     MENU_IMPORT,
+    MENU_LIFE,
+    MENU_SWARM,
     MENU_ITEM_COUNT
 };
 static const char* menuLabels[] = {
@@ -72,7 +76,7 @@ static const char* menuLabels[] = {
     "EXP2","EXP3","303S",
     "PKMN","MODUL","GEST",
     "PURGPCM","STONE","GEST2",
-    "IMPORT"
+    "IMPORT","LIFE","SWRM"
 };
 #define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
 
@@ -167,6 +171,8 @@ static const char* fxNames[] = {"LPF","DRIVE","DELAY","REVERB"};
 #define T303_CH  2
 #define SW2_CH_BASE  10   // AMY synth channels 10-13 for SW2 ±1/±2 semitone layers
 #define SW2_VOICES    4   // polyphony per SW2 sub-channel
+#define MOD3_OSCA_CH 14   // modular synth (MODE_MODULAR) — osc A, dedicated dynamic channel
+#define MOD3_OSCB_CH 15   // modular synth — osc B (detuned via per-note pitch_bend)
 #define NUM_SYNTH_VOICES 8
 #define OSCS_PER_VOICE 2
 #define AMY_OSC_STRUM 50

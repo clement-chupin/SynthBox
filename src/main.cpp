@@ -100,10 +100,29 @@ static bool fxPotNeedSync = false;
 enum OverlayType : uint8_t {
     OVERLAY_NONE=0, OVERLAY_FX, OVERLAY_SCALE_ARP, OVERLAY_ENV,
     OVERLAY_INSTR, OVERLAY_SEQ_OPT, OVERLAY_SAMP_OPT, OVERLAY_303, OVERLAY_303_PRESET,
-    OVERLAY_SYSEQ, OVERLAY_SEQB2, OVERLAY_PKMN, OVERLAY_I303_WAVE, OVERLAY_MOD2_ALGO
+    OVERLAY_SYSEQ, OVERLAY_SEQB2, OVERLAY_PKMN, OVERLAY_I303_WAVE, OVERLAY_MOD2_ALGO,
+    OVERLAY_FX_MOD   // double-click an active FX slot in OVERLAY_FX to automate one of its params
 };
 static OverlayType    s_overlay        = OVERLAY_NONE;
 static unsigned long  s_overlayCloseAt = 0;   // millis() when overlay auto-closes (0=no pending close)
+
+// Shared double-click detection, replacing ~6 previously independently-duplicated
+// `static uint32_t lastMs; (millis()-lastMs)<350` sites. checkDoubleClickId additionally
+// requires the same identity (e.g. same row/col, same instrument index) as the previous
+// click, for sites that must not treat two clicks on DIFFERENT items as a double-click.
+static bool checkDoubleClick(uint32_t &lastMs, uint32_t windowMs=350) {
+    uint32_t now = millis();
+    bool isDbl = (now - lastMs) < windowMs;
+    lastMs = isDbl ? 0 : now; // consume on hit, so a rapid 3rd click isn't also a "double"
+    return isDbl;
+}
+static bool checkDoubleClickId(uint32_t &lastMs, uint8_t &lastA, uint8_t &lastB, uint8_t a, uint8_t b, uint32_t windowMs=350) {
+    uint32_t now = millis();
+    bool isDbl = (a==lastA && b==lastB) && (now-lastMs) < windowMs;
+    lastA=a; lastB=b;
+    lastMs = isDbl ? 0 : now;
+    return isDbl;
+}
 
 // SEQ play mode: Full=loops, CutBar=plays 8 steps once then stops, CutNote=stops prev on same track
 enum SeqPlayMode : uint8_t { SEQ_FULL=0, SEQ_CUT_BAR, SEQ_CUT_NOTE };
@@ -114,13 +133,18 @@ static const char* kSeqPlayModes[] = {"Full","CBar","CNot"};
 // Smoothed battery voltage (EMA updated every 10ms tick)
 static float s_battVSmooth = 8.0f;
 
-// MODULAR state — 6-encoder analog signal chain: OSC → FILTER → AMP, LFO → pitch
-static uint8_t  modShapeIdx  = 0;
-static uint8_t  modEnvIdx    = 0;
+// MODULAR state — wavetable dual-oscillator synth (Serum-inspired MVP): OSC A + OSC B
+// (AMY's WAVETABLE wave, independent morph position each, shared table + a small fixed
+// detune on B for thickness) -> shared filter -> LFO wobbling osc B's morph position for
+// that classic "evolving wavetable" motion. See audioModularOscInit() etc, audio_engine.cpp.
+static uint8_t  modOscTable  = 0;      // shared wavetable index for osc A+B (0-4)
+static float    modOscAPos   = 0.0f;   // osc A morph position (0-1)
+static float    modOscBPos   = 0.3f;   // osc B morph position, BASE value before LFO wobble
 static float    modCutoff    = 4000.0f;
 static float    modReso      = 1.5f;
-static float    modLfoRate   = 2.0f;
+static float    modLfoRate   = 0.3f;   // slow by default — evolving texture, not vibrato
 static float    modLfoDepth  = 0.0f;
+static const float MOD_OSCB_DETUNE_SEMIS = 0.08f; // subtle fixed detune for chorus-y thickness
 
 // MOD2 state — modular synthesizer with 8 algorithms
 static uint8_t      mod2AlgoIdx    = 0;          // index into kMod2Algos[]
@@ -740,9 +764,13 @@ static void pkmnApply() {
 
 // ==================== EXP STATE (MODE_EXP) ====================
 // Key grid: 8 columns × 4 rows. Each column = one modifier group (radio-select per row).
-// Col4 = FX is multi-toggle (expFxMask bitmask).
-// Default: col1=NRM env, col6=oct0, col7=x1 (mild texture on X axis), others=row0.
-static uint8_t  expColSel[KBD_COLS] = {0,1,0,1,0,1,2,1};
+// Col4 = FX is multi-toggle (expFxMask bitmask). Col3 = gate-length preset — indexes the
+// pre-existing kExpGateMs[] table below (SHT/MED/LNG/HLD), which was declared with a
+// ready-made comment explaining its 4 values but was never actually read anywhere until
+// this fix. Col7 is intentionally NOT written by key presses: its LED row is a live
+// arp-speed meter driven by expPosX, not a row-selector, so giving it selectable rows
+// would fight its own readout.
+static uint8_t  expColSel[KBD_COLS] = {0,1,0,0,0,1,2,1}; // col3=0(SHT=80ms), closest default to the old always-25ms rate limit
 static uint8_t  expFxMask   = 0;    // bit0=REV bit1=DLY bit2=CHR bit3=REP
 static float    expPosX     = 0.5f; // physics position 0..1 (0=left, 1=right)
 static float    expPosY     = 0.5f; // physics position 0..1 (0=top=high note, 1=bottom=low)
@@ -832,6 +860,43 @@ static uint8_t    exp3FxMask     = 0;     // bit0=REV bit1=DLY bit2=CHR
 static const float kExp3Radii[] = {12.0f, 24.0f, 36.0f, 48.0f};
 // Beats per full orbit for each orbit (inner=fast, outer=slow)
 static const float kExp3Beats[]  = {1.0f, 2.0f, 4.0f, 8.0f};
+
+// ==================== LIFE STATE (MODE_LIFE) ====================
+// Conway's Game of Life on the full 4x8 playable key grid (KBD_NOTE_ROWS x KBD_COLS,
+// same addressable space EXP/EXP2/EXP3 already use). Column = pitch (scale-quantized via
+// kExp2Scales[], reused verbatim), row = octave. Torus topology (wraps both axes) so a
+// small 4x8 grid doesn't have a permanently-dead border. Key press manually seeds/kills a
+// cell. Only birth/death EDGES trigger note-on/off (not every alive cell every tick), and
+// only one voice sounds per column at a time — this caps polyphony at KBD_COLS=8, safely
+// inside NUM_SYNTH_VOICES(8), so no dedicated oscillator range is needed.
+static bool     lifeGrid[KBD_NOTE_ROWS][KBD_COLS];
+static uint8_t  lifeColNote[KBD_COLS];       // currently-sounding MIDI note per column, 0xFF=none
+static uint32_t lifeLastStepMs = 0;
+static uint8_t  lifeRule       = 0;          // 0=classic B3/S23, 1=HighLife B36/S23
+static uint8_t  lifeTickDivIdx = 3;          // index into kDelaySubdiv[] — simulation tick rate
+static uint8_t  lifeScale      = 0;          // index into kExp2Scales[]
+static EnvPreset lifeEnv       = ENV_PLUCK;
+
+// ==================== SWARM STATE (MODE_SWARM) ====================
+// Boids flocking (cohesion/separation/alignment), explicitly reusing EXP2's ball struct
+// shape, polygon-arena containment, and speed-cap clamp (see the physics tick for what's
+// literally shared vs newly-written). A joystick-steered attractor point pulls the flock
+// and defines a small trigger radius: boids crossing into it fire a scale-quantized note.
+#define SWARM_MAX_BOIDS 8
+struct SwarmBoid { float x, y, vx, vy; bool active, inZone; };
+static SwarmBoid  swarmBoids[SWARM_MAX_BOIDS];
+static float      swarmHexAngle   = 0.0f;   // rotating arena angle (reused from EXP2)
+static float      swarmRotVel     = 0.01f;
+static uint8_t     swarmNumSides   = 6;
+static float      swarmFlockBal   = 0.5f;   // 0=max separation, 1=max cohesion
+static float      swarmSpeedCap   = 4.0f;
+static float      swarmAttractStr = 0.10f;
+static float      swarmZoneRadius = 10.0f;
+static uint8_t     swarmScale      = 0;
+static uint8_t     swarmOctave     = 0;
+static uint8_t     swarmBoidNote[SWARM_MAX_BOIDS];
+static uint32_t    swarmNoteOffMs[SWARM_MAX_BOIDS];
+static uint8_t     swarmFxMask     = 0;      // bit0=REV bit1=DLY bit2=CHR
 
 // ==================== GRANULAR2 STATE ====================
 struct Gran2State {
@@ -1020,6 +1085,80 @@ static uint8_t exp3ComputeNote(uint8_t ball, uint8_t orbitRow) {
     return (uint8_t)constrain(note, 12, 108);
 }
 
+// ==================== LIFE HELPERS ====================
+// col=keyboard column (0-7) → scale degree, row=keyboard row (0-3) → octave.
+static uint8_t lifeComputeNote(uint8_t row, uint8_t col) {
+    const uint8_t* sc = kExp2Scales[lifeScale % 4];
+    int note = 36 + (int)row * 12 + (int)sc[col % 8];
+    return (uint8_t)constrain(note, 12, 108);
+}
+
+static void lifeReseed(float density) {
+    for (int r = 0; r < KBD_NOTE_ROWS; r++)
+        for (int c = 0; c < KBD_COLS; c++)
+            lifeGrid[r][c] = ((float)random(0, 1000) / 1000.0f) < density;
+}
+
+// One Conway's-Game-of-Life simulation step, torus topology (wraps both axes so a small
+// 4x8 grid has no permanently-dead border). Only birth/death EDGES per column trigger
+// note-on/off — not every alive cell every tick — capping polyphony at KBD_COLS(8) voices.
+static void lifeStep() {
+    if (!audioReady) return;
+    bool next[KBD_NOTE_ROWS][KBD_COLS];
+    for (int r = 0; r < KBD_NOTE_ROWS; r++) {
+        for (int c = 0; c < KBD_COLS; c++) {
+            int n = 0;
+            for (int dr = -1; dr <= 1; dr++) {
+                for (int dc = -1; dc <= 1; dc++) {
+                    if (dr == 0 && dc == 0) continue;
+                    int rr = (r + dr + KBD_NOTE_ROWS) % KBD_NOTE_ROWS;
+                    int cc = (c + dc + KBD_COLS) % KBD_COLS;
+                    if (lifeGrid[rr][cc]) n++;
+                }
+            }
+            bool alive = lifeGrid[r][c];
+            if (alive) next[r][c] = (n == 2 || n == 3);
+            else       next[r][c] = (n == 3) || (lifeRule == 1 && n == 6);
+        }
+    }
+    for (int c = 0; c < KBD_COLS; c++) {
+        bool wasAlive = false, willBeAlive = false;
+        uint8_t firstAliveRow = 0;
+        for (int r = 0; r < KBD_NOTE_ROWS; r++) {
+            if (lifeGrid[r][c]) wasAlive = true;
+            if (next[r][c]) { if (!willBeAlive) firstAliveRow = (uint8_t)r; willBeAlive = true; }
+        }
+        if (willBeAlive && !wasAlive) {
+            uint8_t note = lifeComputeNote(firstAliveRow, (uint8_t)c);
+            lifeColNote[c] = note;
+            audioPostNote(note, 0.75f * volume);
+        } else if (!willBeAlive && wasAlive && lifeColNote[c] != 0xFF) {
+            audioPostNote(lifeColNote[c], 0.f);
+            lifeColNote[c] = 0xFF;
+        }
+    }
+    memcpy(lifeGrid, next, sizeof(lifeGrid));
+}
+
+// ==================== SWARM HELPERS ====================
+static void swarmApplyFx() {
+    audioSetReverb((swarmFxMask&0x01)?0.6f:0.0f, 0.78f, 0.45f, 2000.0f);
+    audioSetDelay ((swarmFxMask&0x02)?0.35f:0.0f, 420.0f, 0.4f, 0.75f);
+    audioSetChorus((swarmFxMask&0x04)?0.45f:0.0f, 0.7f, 0.25f);
+}
+static void swarmResetBoid(uint8_t i) {
+    float a = (float)i * (2.0f*(float)PI / (float)SWARM_MAX_BOIDS);
+    swarmBoids[i].x = cosf(a) * 15.0f; swarmBoids[i].y = sinf(a) * 15.0f;
+    swarmBoids[i].vx = cosf(a) * 0.5f; swarmBoids[i].vy = sinf(a) * 0.5f;
+    swarmBoids[i].active = true; swarmBoids[i].inZone = false;
+    swarmBoidNote[i] = 0xFF;
+}
+static uint8_t swarmComputeNote(uint8_t boid) {
+    const uint8_t* sc = kExp2Scales[swarmScale % 4];
+    int note = 60 + swarmOctave*12 + (int)sc[boid % 8];
+    return (uint8_t)constrain(note, 12, 108);
+}
+
 // Map (row, col) → (sampleIdx, sliceIdx, isReverse).
 // Physical layout (code row 0 = physical bottom; gc = 7-c so code col 7 = physical left):
 //   S0=physical TL (rows2-3, cols4-7), S1=physical TR (rows2-3, cols0-3)
@@ -1124,7 +1263,8 @@ static const MenuItem kMenuCatInstr[] = {
     MENU_SYNTH, MENU_STONE, MENU_OMNI, MENU_SAMPLE,
     MENU_MOD2, MENU_I303, MENU_MODULAR,
     MENU_GRANULAR2, MENU_EXP,
-    MENU_EXP2, MENU_EXP3, MENU_POKEMON
+    MENU_EXP2, MENU_EXP3, MENU_POKEMON,
+    MENU_LIFE, MENU_SWARM
 };
 static const MenuItem kMenuCatSeq[] = {
     MENU_DRUM2, MENU_DR2, MENU_303S2, MENU_SYSEQ, MENU_SS2, MENU_GEST
@@ -1133,7 +1273,7 @@ static const MenuItem kMenuCatAut[] = {
     MENU_LIGHT, MENU_LIGHTPLAY, MENU_ABOUT, MENU_SD, MENU_ANIM, MENU_VID, MENU_LANIM, MENU_PCMCLEAN, MENU_IMPORT, MENU_MIDI
 };
 static const MenuItem* kMenuCatItems[] = { kMenuCatInstr, kMenuCatSeq, kMenuCatAut };
-static const uint8_t kMenuCatSizes[] = { 12, 6, 10 };
+static const uint8_t kMenuCatSizes[] = { 14, 6, 10 };
 
 // ==================== VID STATE ====================
 struct __attribute__((packed)) BvidHeader {
@@ -1329,6 +1469,75 @@ void fxOrderRemove(uint8_t fx) {
     }
 }
 
+// ==================== MODULATION-SLOT ENGINE ====================
+// Generic LFO-style modulation, separate from and additive to the existing fxList[6]
+// (LFO), [11] (TREMOLO), [12] (AUTOPAN) slots — those stay exactly as they are (simple,
+// single-toggle, fixed-destination FX everyone already relies on). This engine exists for
+// what those can't do: automate an ARBITRARY fxList[] param via the FX-overlay double-click
+// UI, and drive the modular synth's small mod matrix. Modeled directly on the existing LFO
+// tick's shape (phase accumulator + depth gate + restore-on-deactivate), see the loop()
+// 10ms block below for the LFO/TREMOLO/AUTOPAN precedent this generalizes.
+enum ModWaveShape : uint8_t { MODSHAPE_SINE=0, MODSHAPE_TRI, MODSHAPE_SQR, MODSHAPE_SH, MODSHAPE_COUNT };
+static const char* kModShapeName[] = { "Sine","Tri","Sqr","S&H" };
+enum ModDestKind : uint8_t {
+    MODDEST_NONE = 0,
+    MODDEST_FX_PARAM,       // fxList[destA].params[destB]
+    MODDEST_MOD_PITCH_A,    // modular synth (Section 5) — osc A pitch (semitones)
+    MODDEST_MOD_PITCH_B,    // modular synth — osc B pitch (semitones)
+    MODDEST_MOD_WTPOS_A,    // modular synth — osc A wavetable position
+    MODDEST_MOD_WTPOS_B,    // modular synth — osc B wavetable position
+    MODDEST_MOD_FILTER,     // modular synth — filter cutoff
+    MODDEST_MOD_AMP         // modular synth — amplitude
+};
+struct ModSlot {
+    bool         active    = false;
+    ModWaveShape shape     = MODSHAPE_SINE;
+    bool         bpmSync   = false;
+    float        rateHz    = 2.0f;   // used when !bpmSync
+    uint8_t      bpmDivIdx = 4;      // index into kDelaySubdiv[] when bpmSync (4 = "1/4")
+    float        depth     = 0.0f;   // 0..1
+    ModDestKind  destKind  = MODDEST_NONE;
+    uint8_t      destA     = 0;      // FX_PARAM: fxList slot index
+    uint8_t      destB     = 0;      // FX_PARAM: param index 0-3
+    float        phase     = 0.0f;
+    float        shHold    = 0.0f;
+    bool         wasActive = false;  // restore-on-deactivate, same idiom as lfoWasActive etc.
+};
+#define MOD_SLOT_COUNT 6
+// Slots 0-3: general pool, dynamically assigned by FX double-click automation (Section 2).
+// Slot 4: reserved for the modular synth's single LFO source (Section 5).
+// Slot 5: spare headroom.
+ModSlot gModSlots[MOD_SLOT_COUNT];
+
+static float modWaveformSample(ModWaveShape shape, float phase, float shHold) {
+    switch (shape) {
+        case MODSHAPE_SINE: return sinf(phase);
+        case MODSHAPE_TRI:  return (phase < PI) ? (-1.0f + phase*2.0f/PI) : (3.0f - phase*2.0f/PI);
+        case MODSHAPE_SQR:  return (phase < PI) ? 1.0f : -1.0f;
+        case MODSHAPE_SH:   return shHold;
+        default: return 0.0f;
+    }
+}
+
+// Find a free general-purpose slot (0..3) for a new FX-param automation assignment, or -1.
+int8_t modSlotAllocFxParam() {
+    for (int8_t i = 0; i < 4; i++) if (!gModSlots[i].active) return i;
+    return -1;
+}
+// Find the slot (if any) already automating this exact (fx,param) pair.
+int8_t modSlotFindFxParam(uint8_t fx, uint8_t param) {
+    for (int8_t i = 0; i < 4; i++)
+        if (gModSlots[i].active && gModSlots[i].destKind==MODDEST_FX_PARAM
+            && gModSlots[i].destA==fx && gModSlots[i].destB==param) return i;
+    return -1;
+}
+
+// OVERLAY_FX_MOD state (double-click an active FX slot in OVERLAY_FX to enter).
+static uint8_t s_fxModEditParam = 0;   // which of fxList[fxSelected]'s params is being automated
+static int8_t  s_fxModEditSlot  = -1;  // gModSlots[] index owning this (fx,param); -1 = unassigned
+static uint32_t s_fxDblLastMs = 0;
+static uint8_t  s_fxDblLastOpt = 255;
+
 void applyFxEffect(uint8_t fx) {
     FxEffect &e = fxList[fx];
     bool on = e.active;
@@ -1448,6 +1657,59 @@ void applyFxEffect(uint8_t fx) {
             Serial.printf("FX15 COMPRESS %s thr=%.2f ratio=%.1f\n", on?"ON":"off", e.params[0], e.params[1]);
             audioSetCompressor(e.params[0], e.params[1], on);
             break;
+    }
+}
+
+// Apply one modulation sample. FX_PARAM uses an "apply then restore fxList[].params[],
+// call applyFxEffect()" trick: fxList[].params[] holds the user's pot-set "center" value,
+// which we temporarily overwrite, push through the normal FX-apply path (zero changes
+// needed to applyFxEffect() itself), then restore — so the center value the user dialed in
+// is never lost, only the AMY-facing state is momentarily modulated.
+static void modSlotApply(ModSlot &s, float sample) {
+    if (s.destKind == MODDEST_FX_PARAM) {
+        FxEffect &fx = fxList[s.destA];
+        float mn = fx.paramMin[s.destB], mx = fx.paramMax[s.destB];
+        float base = fx.params[s.destB];
+        float mod = constrain(base + s.depth*(mx-mn)*0.5f*sample, mn, mx);
+        fx.params[s.destB] = mod;
+        applyFxEffect(s.destA);
+        fx.params[s.destB] = base;
+    }
+    // MODDEST_MOD_WTPOS_B: the modular synth's one LFO destination for this MVP —
+    // wobbles osc B's wavetable morph position around its pot-set base (modOscBPos),
+    // giving the classic "evolving wavetable" motion. gModSlots[4] is reserved for this
+    // (see Section 1's declaration comment); other MODDEST_MOD_* destinations exist in
+    // the enum for a future deeper mod-matrix but aren't wired to anything yet.
+    else if (s.destKind == MODDEST_MOD_WTPOS_B) {
+        float pos = constrain(modOscBPos + s.depth * 0.5f * sample, 0.0f, 1.0f);
+        audioModularSetWtPos(MOD3_OSCB_CH, pos);
+    }
+}
+
+static void modSlotRestore(ModSlot &s) {
+    if (s.destKind == MODDEST_FX_PARAM) {
+        applyFxEffect(s.destA); // params[] already holds the true base value — just re-push it
+    } else if (s.destKind == MODDEST_MOD_WTPOS_B) {
+        audioModularSetWtPos(MOD3_OSCB_CH, modOscBPos); // restore to the pot's own base position
+    }
+}
+
+void modSlotsTick10ms() {
+    for (uint8_t i = 0; i < MOD_SLOT_COUNT; i++) {
+        ModSlot &s = gModSlots[i];
+        if (!s.active || s.depth < 0.005f) {
+            if (s.wasActive) { modSlotRestore(s); s.wasActive = false; }
+            continue;
+        }
+        float rateHz = s.bpmSync ? ((float)bpm / (60.0f * kDelaySubdiv[s.bpmDivIdx])) : s.rateHz;
+        s.phase += rateHz * 2.0f * (float)PI * 0.01f;
+        if (s.phase > 2.0f*(float)PI) {
+            s.phase -= 2.0f*(float)PI;
+            if (s.shape == MODSHAPE_SH) s.shHold = ((float)random(-1000,1001)) / 1000.0f;
+        }
+        float sample = modWaveformSample(s.shape, s.phase, s.shHold);
+        s.wasActive = true;
+        modSlotApply(s, sample);
     }
 }
 
@@ -2025,6 +2287,29 @@ void switchMode(AppMode newMode) {
             exp3ApplyFx(); audioSetFilter(0.0f,1.5f); audioSetWavefold(1.0f);
         } else { exp3FxMask=0; }
     }
+    if (currentMode==MODE_LIFE) {
+        if (audioReady) {
+            for (int c=0;c<KBD_COLS;c++) {
+                if (lifeColNote[c]!=0xFF) { audioNoteOff(lifeColNote[c]); lifeColNote[c]=0xFF; }
+            }
+            audioSetReverb(0,0.78f,0.45f,2000.0f); audioSetFilter(0.0f,1.5f);
+        }
+    }
+    if (currentMode==MODE_SWARM) {
+        if (audioReady) {
+            for (int b=0;b<SWARM_MAX_BOIDS;b++) {
+                if (swarmBoidNote[b]!=0xFF) audioNoteOff(swarmBoidNote[b]);
+                swarmNoteOffMs[b]=0; swarmBoidNote[b]=0xFF;
+            }
+            swarmFxMask=0;
+            swarmApplyFx(); audioSetFilter(0.0f,1.5f); audioSetWavefold(1.0f);
+        } else { swarmFxMask=0; }
+    }
+    if (currentMode==MODE_MODULAR) {
+        gModSlots[4].active = false;
+        gModSlots[4].destKind = MODDEST_NONE;
+        if (audioReady) { audioModularAllNotesOff(); audioModularSetFilter(0.0f, 1.5f); }
+    }
     // Drill transitions (GEST ↔ sequencer) must NOT silence audio — the sequencer clock
     // keeps running and killing notes causes audible glitches/pauses.
     bool isDrillTransition = gestDrillDown || gestDrillReturn;
@@ -2032,13 +2317,23 @@ void switchMode(AppMode newMode) {
         audioAllNotesOff();
         // Reset filter/wavefold only when leaving a non-sequencer instrument mode
         if (audioReady) {
+            // Was silently short by 4 entries (PCMCLEAN/STONE/DR2/IMPORT never added when
+            // they were introduced — harmless for a bool array, since C++ aggregate init
+            // zero-pads missing trailing entries to false, unlike kVizMode[]'s string array
+            // a few lines below whose same gap would crash on printf("%s", nullptr), which
+            // is why that one WAS kept correctly sized). That silent false-padding meant
+            // DR2 (a real sequencer, see its own "hierarchical drum sequencer" comment)
+            // defaulted to false, resetting the filter/wavefold on every exit from it like
+            // a plain instrument mode instead of preserving them like DRUM2/SYSEQ/etc. do.
             static const bool kIsSeq[MODE_COUNT] = {
                 false,false,false,false,false, // SYNTH,OMNI,SAMPLE,LIGHT,LIGHTPLAY
                 false,false,false,false,false, // BATTERY,SYSINFO,MOD2,GRANULAR2,MIDI
                 false,true, true, true, true,  // TRACKER,DRUM2,SYSEQ,303S,SS2
                 false,false,false,false,false, // ANIM,I103,VID,LANIM,EXP
                 false,false,true, false,false, // EXP2,EXP3,303S2,POKEMON,MODULAR
-                true                           // GEST
+                true,                          // GEST
+                false,false,true, false,       // PCMCLEAN,STONE,DR2,IMPORT
+                false,false                    // LIFE,SWARM
             };
             if (!kIsSeq[currentMode]) {
                 audioSetFilter(0.0f, 1.5f);
@@ -2056,7 +2351,7 @@ void switchMode(AppMode newMode) {
           "BATT","DIAG","MOD2","GRANU",
           "MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303","MEDIA","LANIM",
           "EXP","EXP2","EXP3","303S","PKMN","MODUL","GEST",
-          "PURGPCM","STONE","GEST2","IMPORT"};
+          "PURGPCM","STONE","GEST2","IMPORT","LIFE","SWARM"};
       // This array must have exactly MODE_COUNT entries in AppMode order — the
       // compiler silently pads any missing trailing ones with nullptr (no size
       // mismatch warning), and printf("%s", nullptr) crashes (LoadProhibited).
@@ -2096,9 +2391,17 @@ void switchMode(AppMode newMode) {
         mod2AlgoApply();
     }
     if (newMode==MODE_MODULAR && audioReady) {
-        audioSetShape((SynthShape)modShapeIdx);
-        audioSetEnvelope(envTable[modEnvIdx]);
-        audioSetFilter(modCutoff, modReso);
+        modOscTable = 0; modOscAPos = 0.0f; modOscBPos = 0.3f;
+        modCutoff = 4000.0f; modReso = 1.5f; modLfoRate = 0.3f; modLfoDepth = 0.0f;
+        audioModularOscInit(MOD3_OSCA_CH, modOscTable);
+        audioModularOscInit(MOD3_OSCB_CH, modOscTable);
+        audioModularSetWtPos(MOD3_OSCA_CH, modOscAPos);
+        audioModularSetWtPos(MOD3_OSCB_CH, modOscBPos);
+        audioModularSetFilter(modCutoff, modReso);
+        gModSlots[4] = ModSlot{}; // reset to defaults
+        gModSlots[4].destKind = MODDEST_MOD_WTPOS_B;
+        gModSlots[4].rateHz = modLfoRate;
+        gModSlots[4].active = true; // depth starts at 0 (modLfoDepth), so inert until P7 is raised
     }
     if (newMode==MODE_DRUM2) {
         if (!drum2Playing) { drum2Step=0; drum2LastStepMs=millis(); }  // keep step if already playing
@@ -2277,6 +2580,29 @@ void switchMode(AppMode newMode) {
         exp3ApplyFx();
         audioSetFilter(0.0f, 1.5f);
     }
+    if (newMode==MODE_LIFE && audioReady) {
+        lifeRule = 0; lifeTickDivIdx = 3; lifeScale = 0; lifeEnv = ENV_PLUCK;
+        lifeLastStepMs = millis();
+        for (int c=0;c<KBD_COLS;c++) lifeColNote[c] = 0xFF;
+        lifeReseed(0.3f);
+        audioSetShape(SHAPE_PLUCK);
+        audioSetEnvelope(envTable[lifeEnv]);
+        audioSetReverb(0.3f, 0.78f, 0.45f, 2000.0f);
+        audioSetFilter(0.0f, 1.5f);
+    }
+    if (newMode==MODE_SWARM && audioReady) {
+        swarmHexAngle = 0.0f; swarmRotVel = 0.01f; swarmNumSides = 6;
+        swarmFlockBal = 0.5f; swarmSpeedCap = 4.0f; swarmAttractStr = 0.10f; swarmZoneRadius = 10.0f;
+        swarmScale = 0; swarmOctave = 0; swarmFxMask = 0;
+        for (int b=0; b<SWARM_MAX_BOIDS; b++) {
+            swarmResetBoid((uint8_t)b);
+            swarmBoids[b].active = (b < 5); // start with 5 of 8 boids active
+        }
+        audioSetShape(SHAPE_SINE);
+        audioSetEnvelope(envTable[ENV_FAST]);
+        swarmApplyFx();
+        audioSetFilter(0.0f, 1.5f);
+    }
     if (newMode==MODE_GEST) {
         // Pickup: don't apply pot values immediately — wait for the pot to actually move
         for(int _p=0;_p<4;_p++) lpGestPots[_p] = pots[3+_p].value;
@@ -2356,6 +2682,8 @@ static void dispatchMenuItem(MenuItem item) {
         case MENU_IMPORT:    switchMode(MODE_IMPORT);    break;
         case MENU_STONE:     switchMode(MODE_STONE);     break;
         case MENU_DR2:       switchMode(MODE_DR2);       break;
+        case MENU_LIFE:      switchMode(MODE_LIFE);      break;
+        case MENU_SWARM:     switchMode(MODE_SWARM);     break;
         default: break;
     }
 }
@@ -2472,6 +2800,13 @@ static const int8_t kOctOpts[] = {-2, -1, 0, 1};
 void overlayKeyPress(uint8_t row, uint8_t col) {
     if (s_overlayCloseAt) return;
 
+    // FX automation editor: any key press closes back to OVERLAY_FX (param selection is
+    // via joystick X, not the key grid — see the joystick-nav block in loop()).
+    if (s_overlay == OVERLAY_FX_MOD) {
+        s_overlay = OVERLAY_FX; s_overlayCloseAt = 0;
+        return;
+    }
+
     // INSTR browser: note rows play normally (handled by handleNoteKeyAudio).
     // BTN row closes the browser and applies the selected instrument.
     if (s_overlay == OVERLAY_INSTR) {
@@ -2511,6 +2846,24 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
     switch (s_overlay) {
         case OVERLAY_FX:
             if (opt < FX_COUNT) {
+                // Double-clicking an ALREADY-active slot opens the automation editor
+                // instead of toggling it off — automating an inactive FX makes no sense,
+                // so this only intercepts the case where a toggle would be a no-op anyway
+                // from the user's perspective (they're not trying to turn it off).
+                {
+                    uint32_t now = millis();
+                    bool isDbl = fxList[opt].active && (opt == s_fxDblLastOpt) && ((now - s_fxDblLastMs) < 350);
+                    s_fxDblLastOpt = opt;
+                    s_fxDblLastMs = isDbl ? 0 : now;
+                    if (isDbl) {
+                        fxSelected = opt;
+                        s_fxModEditParam = 0;
+                        s_fxModEditSlot = modSlotFindFxParam(opt, 0);
+                        s_overlay = OVERLAY_FX_MOD;
+                        Serial.printf("OVL FX_MOD enter fx=%d\n", opt);
+                        return;
+                    }
+                }
                 fxSelected = opt;
                 fxList[opt].active = !fxList[opt].active;
                 if (fxList[opt].active) {
@@ -2751,7 +3104,8 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                     case MODE_POKEMON:
                     case MODE_I303:
                     case MODE_STONE:
-                    case MODE_OMNI: {
+                    case MODE_OMNI:
+                    case MODE_MODULAR: {  // newly wired in — was unreachable from this mode before
                         OverlayType old = s_overlay; s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
                         if (old != OVERLAY_FX) s_overlay = OVERLAY_FX;
                         break;
@@ -3236,8 +3590,11 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             if (btn==4) { mod2PlayMode=(Mod2PlayMode)((mod2PlayMode+1)%MOD2_PLAY_COUNT); }
             break;
         case MODE_MODULAR:
-            if (btn==1) { modEnvIdx=(modEnvIdx+1)%ENV_PRESET_COUNT; audioSetEnvelope(envTable[modEnvIdx]); }
-            if (btn==4) noteMap.nextOctave();
+            // B4 octave was dead code (`btn==4` can never fire — handleButton()'s
+            // `btn=3-rawBtn` only ever produces 0-3, the exact same pre-existing bug
+            // already fixed once for MOD2/STONE elsewhere in this file); fixed to
+            // `btn==3`, matching the working STONE precedent.
+            if (btn==3) noteMap.nextOctave();
             break;
         case MODE_GRANULAR2:
             // Btn2: cycle play mode NRM→LOP→FUL→SEQ→SQL→NRM
@@ -3586,6 +3943,42 @@ void drawScreen(bool blockWait) {
             if (sel || cur) oled.setDrawColor(1);
         }
         oled.drawVLine(33, 0, 128);
+        if (s_displayTaskHandle) xTaskNotifyGive(s_displayTaskHandle);
+        return;
+    }
+
+    // FX automation editor: FX name + which param, current depth/rate/shape/sync, and a
+    // live phase dot so the user can see the LFO actually running while they dial it in.
+    if (s_overlay == OVERLAY_FX_MOD) {
+        FxEffect &fx = fxList[fxSelected];
+        oled.setFont(u8g2_font_6x10_tf);
+        char hdr[24]; snprintf(hdr, sizeof(hdr), "%s > %s", fx.name, fx.paramNames[s_fxModEditParam]);
+        oled.drawStr(2, 11, hdr);
+        oled.drawHLine(0, 14, 128);
+
+        oled.setFont(u8g2_font_4x6_tf);
+        bool assigned = (s_fxModEditSlot >= 0 && gModSlots[s_fxModEditSlot].active);
+        ModSlot dummy; ModSlot &s = assigned ? gModSlots[s_fxModEditSlot] : dummy;
+        char l1[24]; snprintf(l1, sizeof(l1), "Shape: %s", kModShapeName[s.shape]);
+        oled.drawStr(2, 26, l1);
+        char l2[24];
+        if (s.bpmSync) snprintf(l2, sizeof(l2), "Rate: %s (BPM)", kDelaySubdivName[s.bpmDivIdx]);
+        else           snprintf(l2, sizeof(l2), "Rate: %.1fHz", s.rateHz);
+        oled.drawStr(2, 36, l2);
+        char l3[24]; snprintf(l3, sizeof(l3), "Depth: %d%%", (int)(s.depth*100.0f));
+        oled.drawStr(2, 46, l3);
+        oled.drawStr(2, 58, assigned ? "-- automating --" : "Raise depth (P4)");
+
+        // Live phase indicator: horizontal track + moving dot, only while assigned+active.
+        oled.drawFrame(4, 70, 120, 8);
+        if (assigned) {
+            float t = s.phase / (2.0f * (float)PI);
+            int x = 5 + (int)(t * 117.0f);
+            oled.drawBox(x, 71, 3, 6);
+        }
+        oled.drawStr(2, 92, "Joy X: change param");
+        oled.drawStr(2, 102, "Any key: back to FX");
+
         if (s_displayTaskHandle) xTaskNotifyGive(s_displayTaskHandle);
         return;
     }
@@ -5294,17 +5687,18 @@ void drawScreen(bool blockWait) {
                 }
                 break;
             }
-            // ---- MODULAR — 6-encoder analog modular synth ----
+            // ---- MODULAR — wavetable dual-osc synth (Serum-inspired MVP) ----
             case MODE_MODULAR: {
+                static const char* kModWtNames[] = {"111","BRAIDS01","PPGWA00","SIN2SAW","VIRAL"};
                 oled.drawStr(0,0,"MODULAR"); oled.drawHLine(0,9,128);
                 oled.setFont(u8g2_font_4x6_tf);
-                snprintf(buf,sizeof(buf),"P2 OSC  : %s  Oct:%+d",shapeNames[modShapeIdx],noteMap.getOctave());
+                snprintf(buf,sizeof(buf),"P2 Table: %s  Oct:%+d",kModWtNames[modOscTable%5],noteMap.getOctave());
                 oled.drawStr(0,18,buf);
-                snprintf(buf,sizeof(buf),"P3 FILT : %uHz  P4 Q:%.1f",(unsigned)modCutoff,modReso);
+                snprintf(buf,sizeof(buf),"P4 OscA pos: %.0f%%",modOscAPos*100.0f);
                 oled.drawStr(0,27,buf);
-                snprintf(buf,sizeof(buf),"P2 ENV  : %s",envNames[modEnvIdx]);
+                snprintf(buf,sizeof(buf),"P5 OscB pos: %.0f%%",modOscBPos*100.0f);
                 oled.drawStr(0,36,buf);
-                snprintf(buf,sizeof(buf),"P5 LFO  : %.1fHz  P6 vib:%.1fst",modLfoRate,modLfoDepth);
+                snprintf(buf,sizeof(buf),"P6 Filt:%uHz  P7 LFO:%.0f%%",(unsigned)modCutoff,modLfoDepth*100.0f);
                 oled.drawStr(0,45,buf);
                 oled.drawHLine(0,54,128);
                 oled.drawStr(0,62,"JY=bend  JX=velocity");
@@ -6021,6 +6415,57 @@ void drawScreen(bool blockWait) {
                 char bot[20];
                 snprintf(bot, sizeof(bot), "G:%dms J:spd/gate", (int)exp3GateMs);
                 oled.drawStr(0, 127, bot);
+                break;
+            }
+            case MODE_LIFE: {
+                oled.setFont(u8g2_font_4x6_tf);
+                static const char* kRuleNm[] = {"B3/S23","B36/S23"};
+                char hdr[32];
+                snprintf(hdr, sizeof(hdr), "BPM:%d %s", bpm, kRuleNm[lifeRule%2]);
+                oled.drawStr(0, 6, hdr);
+                // Grid: 8 cols x 4 rows, each cell a filled/outline box, big enough to be
+                // clearly legible (12px cells, centered-ish in the 128x128 screen).
+                const int cellW = 15, cellH = 15, ox = 2, oy = 10;
+                for (int r=0;r<KBD_NOTE_ROWS;r++) {
+                    for (int c=0;c<KBD_COLS;c++) {
+                        int x = ox + c*cellW, y = oy + (KBD_NOTE_ROWS-1-r)*cellH; // row0=bottom
+                        if (lifeGrid[r][c]) oled.drawBox(x, y, cellW-2, cellH-2);
+                        else                oled.drawFrame(x, y, cellW-2, cellH-2);
+                    }
+                }
+                char bot[28];
+                snprintf(bot, sizeof(bot), "Keys=seed  P6=reseed");
+                oled.drawStr(0, 127, bot);
+                break;
+            }
+            case MODE_SWARM: {
+                oled.setFont(u8g2_font_4x6_tf);
+                static const char* kScaleNmS[] = {"MAJ","MIN","PNT","CHR"};
+                const int CX = 64, CY = 70;
+                char hdr[32];
+                snprintf(hdr, sizeof(hdr), "Flock:%.0f%% Spd:%.1f %s",
+                         swarmFlockBal*100.0f, swarmSpeedCap, kScaleNmS[swarmScale%4]);
+                oled.drawStr(0, 6, hdr);
+                // Rotating arena outline (reused visual idiom from EXP2)
+                for (int s=0; s<swarmNumSides; s++) {
+                    float a0 = swarmHexAngle + s*2.0f*(float)PI/swarmNumSides;
+                    float a1 = swarmHexAngle + (s+1)*2.0f*(float)PI/swarmNumSides;
+                    oled.drawLine((int)(CX+cosf(a0)*50), (int)(CY+sinf(a0)*50),
+                                  (int)(CX+cosf(a1)*50), (int)(CY+sinf(a1)*50));
+                }
+                // Attractor zone (joystick-steered)
+                float jx = constrain(cachedJoyX/64.0f,-1.0f,1.0f), jy = constrain(cachedJoyY/64.0f,-1.0f,1.0f);
+                int azx = (int)(CX + jx*18.0f), azy = (int)(CY + jy*18.0f);
+                oled.drawCircle(azx, azy, (int)swarmZoneRadius);
+                // Boids
+                for (int i=0;i<SWARM_MAX_BOIDS;i++) {
+                    if (!swarmBoids[i].active) continue;
+                    int px = constrain((int)(CX+swarmBoids[i].x), 4, 124);
+                    int py = constrain((int)(CY+swarmBoids[i].y), 12, 124);
+                    if (swarmBoids[i].inZone) { oled.drawDisc(px, py, 3); }
+                    else oled.drawDisc(px, py, 2);
+                }
+                oled.drawStr(0, 127, "Joy=steer  Keys=on/off");
                 break;
             }
             case MODE_303S2: {
@@ -6790,6 +7235,31 @@ static void updateLedsAndShow()
                         bool thisOrbit = act && (exp3Balls[b].orbitRow == (uint8_t)r);
                         uint8_t bri = thisOrbit ? (uint8_t)(25+pulse*230.0f) : (act ? 10 : 4);
                         leds[li] = CHSV(kBallHue[b], act?220:60, bri);
+                    }
+                }
+                break;
+            }
+            case MODE_LIFE: {
+                // 1:1 cell->key LED mapping: alive=bright hue-by-column, dead=dim.
+                static const uint8_t kLifeColHue[] = {0,32,64,96,128,160,192,224};
+                for (int r=0;r<KBD_NOTE_ROWS;r++) for (int c=0;c<KBD_COLS;c++) {
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
+                    int li=(idx>=0&&idx<NUM_LEDS+4)?crdToIdx(idx,0):-1;
+                    if (li<0||li>=NUM_LEDS) continue;
+                    leds[li] = lifeGrid[r][c] ? CHSV(kLifeColHue[c], 220, 220) : CHSV(kLifeColHue[c], 150, 8);
+                }
+                break;
+            }
+            case MODE_SWARM: {
+                // Column = boid index. Active+in-zone = bright flash, active = mid, inactive = dim.
+                static const uint8_t kBoidHue[] = {0,32,64,96,128,160,192,224};
+                for (int b=0;b<SWARM_MAX_BOIDS;b++) {
+                    uint8_t bri = swarmBoids[b].inZone ? 240 : (swarmBoids[b].active ? 90 : 6);
+                    for (int r=0;r<KBD_NOTE_ROWS;r++) {
+                        int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-b, idx=gr*KBD_COLS+gc;
+                        int li=(idx>=0&&idx<NUM_LEDS+4)?crdToIdx(idx,0):-1;
+                        if (li<0||li>=NUM_LEDS) continue;
+                        leds[li] = CHSV(kBoidHue[b], 220, bri);
                     }
                 }
                 break;
@@ -7816,13 +8286,15 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             break;
         }
         case MODE_MODULAR: {
+            // Wavetable dual-osc synth (Section 5 rebuild) — plays on its own dedicated
+            // MOD3_OSCA_CH/MOD3_OSCB_CH channels, not the generic SYNTH_CH audioNoteOn().
             uint8_t note = noteMap.getMidiNote(row, col);
             activeNotes[row][col] = pressed ? note : 0;
             if (pressed) {
                 float jx = constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                audioNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f));
+                audioModularNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f), MOD_OSCB_DETUNE_SEMIS);
             } else {
-                audioNoteOff(note);
+                audioModularNoteOff(note);
             }
             break;
         }
@@ -7966,6 +8438,10 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     // FX column: multi-toggle (each row independent)
                     expFxMask ^= (uint8_t)(1 << row);
                     if (audioReady) expApplyFx();
+                } else if (col == 7) {
+                    // col7's LED row is a live arp-speed meter (driven by expPosX), not a
+                    // row-selector — deliberately not writing expColSel[7] here so it stays
+                    // a pure readout instead of a dead/confusing selection state.
                 } else {
                     expColSel[col] = row;
                     if (!audioReady) break;
@@ -7978,8 +8454,8 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     } else if (col == 2) {  // Arp: toggling off → stop note so next tick re-triggers cleanly
                         if (row == 0 && expNoteOn) { audioPostNote(expCurNote, 0.f); expNoteOn = false; }
                     }
-                    // col3=gate(unused), col5=scale, col6=oct — take effect in 10ms tick
-                    // col7: X axis = arp BPM now, no longer uses tex depth
+                    // col3=gate length (kExpGateMs[], used in the continuous-mode rate limit),
+                    // col5=scale, col6=oct — all take effect in the 10ms physics tick.
                 }
             }
             break;
@@ -8031,6 +8507,29 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     exp3Balls[b].orbitRow  = (uint8_t)row;
                     exp3Balls[b].active    = true;
                     exp3Balls[b].triggered = false;
+                }
+            }
+            break;
+        case MODE_LIFE:
+            // Manual seeding: toggle a cell alive/dead. Doesn't directly trigger a note —
+            // the next simulation tick's birth/death edge detection handles that, keeping
+            // note-triggering logic in one place (lifeStep()) regardless of whether a cell
+            // became alive by hand or by the automaton's own rules.
+            if (pressed) lifeGrid[row][col] = !lifeGrid[row][col];
+            break;
+        case MODE_SWARM:
+            // Toggle a boid active at a grid-column spawn point (row picks which of the
+            // 4 orbit-like starting angles within that column's spawn arc — kept simple:
+            // row is ignored for spawn geometry, swarmResetBoid() already spaces boids
+            // evenly; only the on/off toggle matters here).
+            if (pressed) {
+                uint8_t b = col;
+                if (swarmBoids[b].active) {
+                    if (swarmBoidNote[b]!=0xFF && audioReady) audioNoteOff(swarmBoidNote[b]);
+                    swarmBoids[b].active = false;
+                    swarmBoidNote[b] = 0xFF; swarmNoteOffMs[b] = 0;
+                } else {
+                    swarmResetBoid(b);
                 }
             }
             break;
@@ -9204,10 +9703,14 @@ void loop() {
             uint32_t arpInterval = (uint32_t)(60000.0f / (float)bpm / arpMult);
             arpInterval = constrain(arpInterval, 15u, 3000u);
             if (arpMode==0) {
-                // Continuous mode: rate-limit note changes to 25ms min to reduce AMY load
+                // Continuous mode: rate-limit note changes to reduce AMY load — the
+                // minimum gap is now user-controlled via col3 (kExpGateMs[]) instead of a
+                // fixed 25ms, doubling as a "gate length" feel control (short=skittery/
+                // arpeggio-like retriggering, long=smoother/more legato).
+                uint16_t gateMs = kExpGateMs[expColSel[3]];
                 if (!expNoteOn || baseNote!=expCurNote) {
                     uint32_t nowN = millis();
-                    if (!expNoteOn || (int32_t)(nowN - expLastNoteMs) >= 25) {
+                    if (!expNoteOn || (int32_t)(nowN - expLastNoteMs) >= gateMs) {
                         if (expNoteOn) audioPostNote(expCurNote, 0.f);
                         audioPostNote(baseNote, volume);
                         expNoteOn=true; expCurNote=baseNote;
@@ -9236,7 +9739,13 @@ void loop() {
             // Polygon auto-rotates at speed set by pot (no joystick coupling)
             exp2HexAngle += exp2RotVel;
 
-            // Joystick XY → direct gravity vector (instant response, no inertia)
+            // Joystick XY → direct gravity vector (instant response, no inertia). This is
+            // deliberate, not a bug: gravity itself should feel immediate so tilting the
+            // stick reads as an instant push on the balls. exp2GravAngle below is a
+            // display-only convenience (drawn as an arrow, main.cpp ~6056) that only
+            // updates while the stick is meaningfully deflected, so the arrow doesn't
+            // jitter toward (0,0) when the stick recenters — it is intentionally NOT fed
+            // back into gravX/gravY.
             float gravX = jx * exp2GravStr;
             float gravY = jy * exp2GravStr;
             // Update display angle only when stick is non-trivially deflected
@@ -9340,9 +9849,16 @@ void loop() {
             float jx = constrain(cachedJoyX/64.0f,-1.0f,1.0f);
             float jy = constrain(cachedJoyY/64.0f,-1.0f,1.0f);
 
-            // Joystick X = speed inertia: push right → accelerate, left → decelerate
+            // Joystick X = speed inertia: push right → accelerate, left → decelerate.
+            // Was a plain one-pole low-pass (no real inertia despite exp3SpeedVel's name
+            // and comment implying one) — exp3SpeedVel was declared but never actually
+            // read anywhere. Real spring/velocity integrator: exp3SpeedVel accumulates
+            // toward the target, damped each tick, so the orbit speed can overshoot and
+            // settle rather than just smoothly creeping — genuine momentum feel.
             float targetSpeed = 1.0f + jx * 2.5f;  // 0 = paused, 1 = normal, 3.5 = fast
-            exp3SpeedMul = exp3SpeedMul * 0.88f + targetSpeed * 0.12f;
+            exp3SpeedVel += (targetSpeed - exp3SpeedMul) * 0.05f;
+            exp3SpeedVel *= 0.90f; // damping
+            exp3SpeedMul += exp3SpeedVel;
             exp3SpeedMul = constrain(exp3SpeedMul, 0.0f, 5.0f);
 
             // Joystick Y: gate duration (short to long)
@@ -9382,6 +9898,88 @@ void loop() {
                 if (exp3NoteOffMs[b] && now3 >= exp3NoteOffMs[b] && audioReady) {
                     if (exp3BallNote[b] != 0xFF) audioNoteOff(exp3BallNote[b]);
                     exp3NoteOffMs[b] = 0;
+                }
+            }
+        }
+
+        // ==================== LIFE (10ms tick) ====================
+        if (currentMode==MODE_LIFE && !menuOpen) {
+            uint32_t stepMs = (uint32_t)(60000.0f / (float)bpm * kDelaySubdiv[lifeTickDivIdx]);
+            stepMs = constrain(stepMs, 40UL, 2000UL);
+            uint32_t nowL = millis();
+            if (nowL - lifeLastStepMs >= stepMs) {
+                lifeLastStepMs = nowL;
+                lifeStep();
+            }
+        }
+
+        // ==================== SWARM PHYSICS (10ms tick) ====================
+        // Explicitly reuses EXP2's ball-physics scaffolding: struct shape, polygon-arena
+        // rotation/containment math, and speed-cap clamp are the same idioms as EXP2's
+        // physics tick above (see main.cpp's EXP2 block) — only the per-boid force kernel
+        // (cohesion/separation/alignment replacing EXP2's elastic wall/ball collisions)
+        // and the joystick-steered attractor-zone note trigger are new.
+        if (currentMode==MODE_SWARM && !menuOpen) {
+            float jx = constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+            float jy = constrain(cachedJoyY/64.0f,-1.0f,1.0f);
+            swarmHexAngle += swarmRotVel;
+
+            float attrX = jx * 18.0f, attrY = jy * 18.0f;
+            float cohW = 0.006f * swarmFlockBal, sepW = 0.05f * (1.0f - swarmFlockBal), aliW = 0.03f * swarmFlockBal;
+
+            for (int i=0;i<SWARM_MAX_BOIDS;i++) {
+                if (!swarmBoids[i].active) continue;
+                SwarmBoid &s = swarmBoids[i];
+                float cx=0,cy=0,sx=0,sy=0,ax=0,ay=0; int neigh=0;
+                for (int j=0;j<SWARM_MAX_BOIDS;j++) {
+                    if (j==i || !swarmBoids[j].active) continue;
+                    float dx = swarmBoids[j].x - s.x, dy = swarmBoids[j].y - s.y;
+                    float d2 = dx*dx+dy*dy;
+                    if (d2 < 400.0f) { // neighbor radius 20
+                        cx += swarmBoids[j].x; cy += swarmBoids[j].y;
+                        ax += swarmBoids[j].vx; ay += swarmBoids[j].vy;
+                        neigh++;
+                        if (d2 < 25.0f && d2 > 0.001f) { sx -= dx/d2; sy -= dy/d2; } // separation, inverse-dist weighted
+                    }
+                }
+                if (neigh > 0) {
+                    cx = cx/neigh - s.x; cy = cy/neigh - s.y; // vector toward local flock center
+                    ax = ax/neigh; ay = ay/neigh;
+                    s.vx += cx*cohW + sx*sepW + ax*aliW;
+                    s.vy += cy*cohW + sy*sepW + ay*aliW;
+                }
+                // Joystick attractor: mild pull toward the steered point
+                s.vx += (attrX - s.x) * swarmAttractStr * 0.01f;
+                s.vy += (attrY - s.y) * swarmAttractStr * 0.01f;
+
+                float sp = sqrtf(s.vx*s.vx + s.vy*s.vy);
+                if (sp > swarmSpeedCap) { s.vx = s.vx/sp*swarmSpeedCap; s.vy = s.vy/sp*swarmSpeedCap; }
+                s.x += s.vx * 0.15f; s.y += s.vy * 0.15f;
+
+                // Soft containment: reflect back if drifting far outside the arena (reuses
+                // EXP2's spirit of keeping entities inside a bounded play area).
+                float r = sqrtf(s.x*s.x + s.y*s.y);
+                if (r > 55.0f) { s.vx -= s.x*0.01f; s.vy -= s.y*0.01f; }
+
+                // Attractor-zone note trigger: edge-detect entering the small trigger radius.
+                float dax = s.x - attrX, day = s.y - attrY;
+                bool inZ = (dax*dax + day*day) < (swarmZoneRadius*swarmZoneRadius);
+                if (inZ && !s.inZone && audioReady) {
+                    s.inZone = true;
+                    uint8_t note = swarmComputeNote((uint8_t)i);
+                    if (swarmBoidNote[i] != 0xFF) audioNoteOff(swarmBoidNote[i]);
+                    swarmBoidNote[i] = note;
+                    audioNoteOn(note, 0.6f * volume);
+                    swarmNoteOffMs[i] = millis() + 220;
+                } else if (!inZ) {
+                    s.inZone = false;
+                }
+            }
+            uint32_t nowS = millis();
+            for (int i=0;i<SWARM_MAX_BOIDS;i++) {
+                if (swarmNoteOffMs[i] && nowS >= swarmNoteOffMs[i] && audioReady) {
+                    if (swarmBoidNote[i] != 0xFF) audioNoteOff(swarmBoidNote[i]);
+                    swarmNoteOffMs[i] = 0;
                 }
             }
         }
@@ -9451,7 +10049,34 @@ void loop() {
             }
         }
 
-        if(audioReady&&!menuOpen){
+        // OVERLAY_FX_MOD pot dispatch: centralized here (not duplicated per-mode like the
+        // FX-active-param dispatch below) since its meaning never depends on currentMode —
+        // it's always "configure the automation for fxList[fxSelected]'s selected param."
+        if (audioReady && s_overlay == OVERLAY_FX_MOD) {
+            static float lpFm[4] = {-1,-1,-1,-1};
+            bool changed = false;
+            if (fabsf(pots[3].value - lpFm[0]) > 0.003f) { lpFm[0]=pots[3].value; changed=true; } // P4 depth
+            if (fabsf(pots[4].value - lpFm[1]) > 0.003f) { lpFm[1]=pots[4].value; changed=true; } // P5 rate
+            if (fabsf(pots[5].value - lpFm[2]) > 0.003f) { lpFm[2]=pots[5].value; changed=true; } // P6 shape
+            if (fabsf(pots[6].value - lpFm[3]) > 0.003f) { lpFm[3]=pots[6].value; changed=true; } // P7 bpm-sync/div
+            if (changed) {
+                float depth = pots[3].value;
+                if (s_fxModEditSlot < 0 && depth > 0.01f) {
+                    s_fxModEditSlot = modSlotAllocFxParam();
+                }
+                if (s_fxModEditSlot >= 0) {
+                    ModSlot &s = gModSlots[s_fxModEditSlot];
+                    s.destKind = MODDEST_FX_PARAM;
+                    s.destA = fxSelected; s.destB = s_fxModEditParam;
+                    s.depth = depth;
+                    s.rateHz = 0.1f + pots[4].value * 19.9f;
+                    s.shape = (ModWaveShape)constrain((int)(pots[5].value*3.99f), 0, MODSHAPE_COUNT-1);
+                    s.bpmSync = pots[6].value > 0.5f;
+                    if (s.bpmSync) s.bpmDivIdx = (uint8_t)constrain((int)((pots[6].value-0.5f)*2.0f*6.99f), 0, DELAY_SUBDIV_COUNT-1);
+                    s.active = depth > 0.005f;
+                }
+            }
+        } else if(audioReady&&!menuOpen){
             switch(currentMode){
                 case MODE_SYSEQ:  // SYSEQ uses same pot layout as SYNTH (shape/FX/env)
                 case MODE_SYNTH: {
@@ -10039,29 +10664,38 @@ void loop() {
                     break;
                 }
                 case MODE_MODULAR: {
-                    // P2=OSC shape  P3=Cutoff  P4=Reso  P5=LFO rate  P6=LFO depth
+                    // P2=wavetable (shared A+B)  P4=OscA morph pos  P5=OscB morph pos
+                    // P6=filter cutoff  P7=LFO depth (wobbles OscB's morph position —
+                    // fixed destination for this MVP; see the 10ms tick below for the
+                    // actual modulation, which reuses gModSlots[4], the slot reserved
+                    // for the modular synth's LFO source in the Section-1 mod engine).
                     static float lpm[5]={-1,-1,-1,-1,-1};
-                    if(fabsf(pots[1].value-lpm[0])>0.005f){
-                        uint8_t ns=(uint8_t)(pots[1].value*((float)SHAPE_COUNT-0.01f));
-                        if(ns!=modShapeIdx){ modShapeIdx=ns; audioSetShape((SynthShape)modShapeIdx); }
+                    if(fabsf(pots[1].value-lpm[0])>0.01f){
+                        uint8_t nt=(uint8_t)(pots[1].value*4.99f);
+                        if(nt!=modOscTable){
+                            modOscTable=nt;
+                            audioModularSetTable(MOD3_OSCA_CH, modOscTable);
+                            audioModularSetTable(MOD3_OSCB_CH, modOscTable);
+                        }
                         lpm[0]=pots[1].value;
                     }
                     if(fabsf(pots[3].value-lpm[1])>0.002f){
-                        modCutoff=80.0f*powf(100.0f, pots[3].value);
-                        audioSetFilter(modCutoff, modReso);
+                        modOscAPos=pots[3].value;
+                        audioModularSetWtPos(MOD3_OSCA_CH, modOscAPos);
                         lpm[1]=pots[3].value;
                     }
                     if(fabsf(pots[4].value-lpm[2])>0.002f){
-                        modReso=0.5f+pots[4].value*2.5f;
-                        audioSetFilter(modCutoff, modReso);
+                        modOscBPos=pots[4].value;
                         lpm[2]=pots[4].value;
                     }
                     if(fabsf(pots[5].value-lpm[3])>0.002f){
-                        modLfoRate=0.1f+pots[5].value*19.9f;
+                        modCutoff=200.0f*powf(90.0f, pots[5].value);
+                        audioModularSetFilter(modCutoff, modReso);
                         lpm[3]=pots[5].value;
                     }
                     if(fabsf(pots[6].value-lpm[4])>0.002f){
-                        modLfoDepth=pots[6].value*2.0f;
+                        modLfoDepth=pots[6].value;
+                        gModSlots[4].depth = modLfoDepth;
                         lpm[4]=pots[6].value;
                     }
                     break;
@@ -10134,7 +10768,7 @@ void loop() {
                         lp5e2=pots[5].value;
                         exp2GravStr = pots[5].value * 0.22f;
                     }
-                    // Pot 6: bounciness
+                    // Pot 7 (pots[6]): bounciness
                     if (fabsf(pots[6].value-lp6e2)>0.008f) {
                         lp6e2=pots[6].value;
                         exp2Bounce = 0.50f + pots[6].value * 0.50f;
@@ -10142,7 +10776,7 @@ void loop() {
                     break;
                 }
                 case MODE_EXP3: {
-                    static float lp1e3=-1, lp3e3=-1, lp4e3=-1;
+                    static float lp1e3=-1, lp3e3=-1, lp4e3=-1, lp5e3=-1, lp6e3=-1;
                     // Pot 1: shape (same as SYNTH)
                     if (fabsf(pots[1].value-lp1e3)>0.01f) {
                         lp1e3=pots[1].value;
@@ -10158,6 +10792,81 @@ void loop() {
                     if (fabsf(pots[4].value-lp4e3)>0.01f) {
                         lp4e3=pots[4].value;
                         if (audioReady) audioSetReverb(pots[4].value*0.85f, 0.78f, 0.45f, 2000.0f);
+                    }
+                    // Pot 6 (pots[5]): filter cutoff — was dead, EXP3 had no timbral shaping
+                    // at all beyond shape/scale/reverb until this fix.
+                    if (fabsf(pots[5].value-lp5e3)>0.005f) {
+                        lp5e3=pots[5].value;
+                        if (audioReady) audioSetFilter(200.0f*powf(40.0f,pots[5].value), 1.2f);
+                    }
+                    // Pot 7 (pots[6]): envelope select — also dead, EXP3 had no envelope
+                    // control at all (unlike EXP/EXP2, which both expose one via key grid).
+                    if (fabsf(pots[6].value-lp6e3)>0.01f) {
+                        lp6e3=pots[6].value;
+                        static const EnvPreset kExp3Envs[] = {ENV_FAST, ENV_NORMAL, ENV_PAD, ENV_PLUCK};
+                        uint8_t ei=(uint8_t)(pots[6].value*3.99f);
+                        if (audioReady) audioSetEnvelope(envTable[(uint8_t)kExp3Envs[ei]]);
+                    }
+                    break;
+                }
+                case MODE_LIFE: {
+                    static float lp1L=-1, lp4L=-1, lp5L=-1, lp6L=-1, lp7L=-1;
+                    // Pot 1: shape
+                    if (fabsf(pots[1].value-lp1L)>0.01f) {
+                        lp1L=pots[1].value;
+                        uint8_t si=(uint8_t)(pots[1].value*((uint8_t)SHAPE_COUNT-0.01f));
+                        if (audioReady) audioSetShape((SynthShape)si);
+                    }
+                    // Pot 4: rule variant (classic B3/S23 vs HighLife B36/S23)
+                    if (fabsf(pots[3].value-lp4L)>0.05f) {
+                        lp4L=pots[3].value;
+                        lifeRule = (pots[3].value > 0.5f) ? 1 : 0;
+                    }
+                    // Pot 5: tick rate (BPM subdivision)
+                    if (fabsf(pots[4].value-lp5L)>0.02f) {
+                        lp5L=pots[4].value;
+                        lifeTickDivIdx = (uint8_t)(pots[4].value * (DELAY_SUBDIV_COUNT-0.01f));
+                    }
+                    // Pot 6: density reseed — re-randomizes the grid at this density on a
+                    // meaningful pot move, not continuously (a live reseed every tick would
+                    // just be noise, not a usable "seed the automaton" gesture).
+                    if (fabsf(pots[5].value-lp6L)>0.08f) {
+                        lp6L=pots[5].value;
+                        lifeReseed(0.15f + pots[5].value*0.5f);
+                    }
+                    // Pot 7: envelope/decay style
+                    if (fabsf(pots[6].value-lp7L)>0.01f) {
+                        lp7L=pots[6].value;
+                        static const EnvPreset kLifeEnvs[] = {ENV_FAST, ENV_PLUCK, ENV_NORMAL, ENV_PAD};
+                        uint8_t ei=(uint8_t)(pots[6].value*3.99f);
+                        lifeEnv = kLifeEnvs[ei];
+                        if (audioReady) audioSetEnvelope(envTable[(uint8_t)lifeEnv]);
+                    }
+                    break;
+                }
+                case MODE_SWARM: {
+                    static float lp1S=-1, lp4S=-1, lp5S=-1, lp6S=-1, lp7S=-1;
+                    // Pot 1: shape
+                    if (fabsf(pots[1].value-lp1S)>0.01f) {
+                        lp1S=pots[1].value;
+                        uint8_t si=(uint8_t)(pots[1].value*((uint8_t)SHAPE_COUNT-0.01f));
+                        if (audioReady) audioSetShape((SynthShape)si);
+                    }
+                    // Pot 4: flock tightness (0=max separation/spread out, 1=max cohesion/tight)
+                    if (fabsf(pots[3].value-lp4S)>0.01f) {
+                        lp4S=pots[3].value; swarmFlockBal = pots[3].value;
+                    }
+                    // Pot 5: flock speed cap
+                    if (fabsf(pots[4].value-lp5S)>0.01f) {
+                        lp5S=pots[4].value; swarmSpeedCap = 1.0f + pots[4].value*8.0f;
+                    }
+                    // Pot 6: attractor pull strength
+                    if (fabsf(pots[5].value-lp6S)>0.01f) {
+                        lp6S=pots[5].value; swarmAttractStr = pots[5].value*0.4f;
+                    }
+                    // Pot 7: trigger-zone radius
+                    if (fabsf(pots[6].value-lp7S)>0.01f) {
+                        lp7S=pots[6].value; swarmZoneRadius = 4.0f + pots[6].value*16.0f;
                     }
                     break;
                 }
@@ -10235,6 +10944,9 @@ void loop() {
             }
         }
 
+        // Generic modulation-slot engine (FX-param automation, Section 2 double-click UI;
+        // also drives the modular synth's LFO source, Section 5) — see modSlotsTick10ms().
+        if (audioReady) modSlotsTick10ms();
 
         // Smooth FILT cutoff application — anti-zipper when turning the cutoff encoder.
         // Use audioSetFilterFreq (no filter_type field) to avoid AMY biquad state resets
@@ -10770,6 +11482,30 @@ void loop() {
                         audioSetShape(currentShape);
                     }
                     lastInstrNav = millis();
+                }
+            }
+        }
+
+        // FX automation editor (OVERLAY_FX_MOD): joystick X cycles which of the selected
+        // FX's non-empty params is being automated. Depth/rate/shape/BPM-sync are pots
+        // (P4-P7), handled in the OVERLAY_FX_MOD pot-dispatch block above.
+        if (s_overlay == OVERLAY_FX_MOD) {
+            static unsigned long lastFxModNav = 0;
+            if (millis() - lastFxModNav >= 200) {
+                float nx = cachedJoyX / 64.0f;
+                FxEffect &fx = fxList[fxSelected];
+                int8_t np = -1;
+                if (nx < -0.3f) {
+                    for (int8_t p = (int8_t)s_fxModEditParam - 1; p >= 0; p--)
+                        if (fx.paramNames[p][0] != '\0') { np = p; break; }
+                } else if (nx > 0.3f) {
+                    for (int8_t p = (int8_t)s_fxModEditParam + 1; p < 4; p++)
+                        if (fx.paramNames[p][0] != '\0') { np = p; break; }
+                }
+                if (np >= 0) {
+                    s_fxModEditParam = (uint8_t)np;
+                    s_fxModEditSlot = modSlotFindFxParam(fxSelected, s_fxModEditParam);
+                    lastFxModNav = millis();
                 }
             }
         }

@@ -444,6 +444,42 @@ void audioSetFilter(float cutoffHz, float resonance) {
 // Do NOT send per-osc events — PCM oscillators mishandle filter_freq_coefs and explode in volume.
 // When active (non-bypass), zero COEF_EG0/EG1 so shape-internal filter envelopes (HOOVER etc.)
 // cannot fight the FX cutoff. audioRestoreShapeFilter() reverts this when the FX turns off.
+// STONE plays on its own fixed round-robin oscillator range (STONE_OSC_BASE..+
+// STONE_VOICES-1, config.h) — like GRANULAR2, it is NOT part of SYNTH_CH, so neither
+// audioSetAllFilters() nor audioSetAllFiltersT() ever reached it: toggling FILT
+// (LPF/HPF/BPF) while playing a STONE sample did nothing audible, even though
+// MODE_STONE can open OVERLAY_FX and toggle it. Unlike GRANULAR2's large 32-osc pool
+// (which tracks an active-oscillator bitmask to avoid needlessly touching idle
+// oscillators), STONE_VOICES is a small fixed 6, so blanket-applying to the whole
+// range unconditionally is simpler and cheap enough not to need mask-tracking.
+static void audioApplyFilterToStone(bool bypass, float cutoffHz, float resonance, uint8_t filterType) {
+    amy_event se = amy_default_event();
+    se.filter_type = bypass ? FILTER_NONE : filterType;
+    se.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
+    if (!bypass) { se.filter_freq_coefs[COEF_EG0] = 0.0f; se.filter_freq_coefs[COEF_EG1] = 0.0f; }
+    se.resonance = bypass ? 1.0f : resonance;
+    for (uint8_t i = 0; i < STONE_VOICES; i++) {
+        se.osc = (uint16_t)(STONE_OSC_BASE + i);
+        amy_add_event(&se);
+    }
+}
+
+// Same gap as STONE above, for the modular synth's 2 dedicated dynamic channels
+// (MOD3_OSCA_CH/MOD3_OSCB_CH — not SYNTH_CH, so the shared FILT FX never reached them
+// either, even after OVERLAY_FX was wired into MODE_MODULAR). Channels use e.synth (not
+// e.osc) since they're whole AMY synth channels, not individually-addressed oscillators.
+static void audioApplyFilterToModular(bool bypass, float cutoffHz, float resonance, uint8_t filterType) {
+    amy_event me = amy_default_event();
+    me.filter_type = bypass ? FILTER_NONE : filterType;
+    me.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
+    if (!bypass) { me.filter_freq_coefs[COEF_EG0] = 0.0f; me.filter_freq_coefs[COEF_EG1] = 0.0f; }
+    me.resonance = bypass ? 1.0f : resonance;
+    for (uint8_t ch : {(uint8_t)MOD3_OSCA_CH, (uint8_t)MOD3_OSCB_CH}) {
+        me.synth = ch;
+        amy_add_event(&me);
+    }
+}
+
 void audioSetAllFilters(float cutoffHz, float resonance) {
     if (!audioReady) return;
     bool bypass = (cutoffHz <= 10.0f || cutoffHz >= 18000.0f);
@@ -496,6 +532,8 @@ void audioSetAllFilters(float cutoffHz, float resonance) {
             mask &= mask - 1;
         }
     }
+    audioApplyFilterToStone(bypass, cutoffHz, resonance, FILTER_LPF24);
+    audioApplyFilterToModular(bypass, cutoffHz, resonance, FILTER_LPF24);
 }
 
 // Same as audioSetAllFilters but with a configurable AMY filter type constant.
@@ -554,6 +592,8 @@ void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType) {
             mask &= mask - 1;
         }
     }
+    audioApplyFilterToStone(bypass, cutoffHz, resonance, filterType);
+    audioApplyFilterToModular(bypass, cutoffHz, resonance, filterType);
 }
 
 // Update only the cutoff/resonance of an already-active LPF — does NOT send filter_type.
@@ -3312,6 +3352,99 @@ void audioUnloadGranular2() {
         if (s_gran2FullRevBuf[s]) { free(s_gran2FullRevBuf[s]); s_gran2FullRevBuf[s] = nullptr; s_gran2FullRevLen[s] = 0; }
         pcm_unload_preset(GRAN2_SOURCE_BASE + s);
         s_gran2Loaded[s] = false;
+    }
+}
+
+// ==================== MODULAR SYNTH (MODE_MODULAR, wavetable dual-osc) ====================
+// See audio_engine.h — two dedicated dynamic channels, each wave=WAVETABLE. This is the
+// first user-facing use of AMY's WAVETABLE oscillator anywhere in this app: e.preset
+// selects which of the 5 built-in tables (pcm_wavetable_base..+pcm_wavetable_samples-1),
+// e.duty_coefs[COEF_CONST] is the continuous within-table morph position — both ordinary
+// per-event fields, no new AMY-level plumbing needed (render_wavetable() in oscillators.c
+// already does the crossfade natively).
+void audioModularOscInit(uint8_t ch, uint8_t tableIdx) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = ch;
+    e.wave = WAVETABLE;
+    e.preset = (int16_t)(pcm_wavetable_base + constrain((int)tableIdx, 0, (int)pcm_wavetable_samples - 1));
+    e.num_voices = NUM_SYNTH_VOICES;
+    e.oscs_per_voice = 1;
+    // Moderate pad-ish envelope so notes don't click — modular synth's whole point is
+    // slow evolving wavetable movement, not percussive hits.
+    e.eg0_times[0] = 15;  e.eg0_values[0] = 1.0f;
+    e.eg0_times[1] = 400; e.eg0_values[1] = 0.7f;
+    e.eg0_times[2] = 300; e.eg0_values[2] = 0.0f;
+    amy_add_event(&e);
+}
+
+// Lighter-weight than audioModularOscInit(): only changes which wavetable is selected,
+// without re-touching num_voices/oscs_per_voice/envelope. Use this for the pot-driven
+// "change table" gesture (P2) — sending the FULL config event on every table change was
+// silently killing whatever note was already sounding (a channel-reconfigure event acts
+// like AMY's own patches_load_patch()/reset_osc(), which resets voice state — same class
+// of bug already flagged for regular shape-switching elsewhere in this app), whereas a
+// bare preset change lets the currently-held note continue on the new table.
+void audioModularSetTable(uint8_t ch, uint8_t tableIdx) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = ch;
+    e.preset = (int16_t)(pcm_wavetable_base + constrain((int)tableIdx, 0, (int)pcm_wavetable_samples - 1));
+    amy_add_event(&e);
+}
+
+void audioModularSetWtPos(uint8_t ch, float pos01) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth = ch;
+    e.duty_coefs[COEF_CONST] = constrain(pos01, 0.0f, 1.0f);
+    amy_add_event(&e);
+}
+
+void audioModularNoteOn(uint8_t note, float vel, float detuneSemisB) {
+    if (!audioReady) return;
+    amy_event ea = amy_default_event();
+    ea.synth = MOD3_OSCA_CH; ea.midi_note = note; ea.velocity = vel;
+    amy_add_event(&ea);
+    amy_event eb = amy_default_event();
+    eb.synth = MOD3_OSCB_CH; eb.midi_note = note; eb.velocity = vel;
+    eb.pitch_bend = powf(2.0f, detuneSemisB / 12.0f);
+    amy_add_event(&eb);
+}
+
+// velocity=0 with midi_note unset is AMY's dedicated "all notes off for this synth"
+// event (see audioAllNotesOff()'s comment) — reused here for the modular synth's 2
+// channels instead of tracking individual held notes.
+void audioModularAllNotesOff() {
+    if (!audioReady) return;
+    for (uint8_t ch : {(uint8_t)MOD3_OSCA_CH, (uint8_t)MOD3_OSCB_CH}) {
+        amy_event e = amy_default_event();
+        e.synth = ch; e.velocity = 0;
+        amy_add_event(&e);
+    }
+}
+
+void audioModularNoteOff(uint8_t note) {
+    if (!audioReady) return;
+    amy_event ea = amy_default_event();
+    ea.synth = MOD3_OSCA_CH; ea.midi_note = note; ea.velocity = 0;
+    amy_add_event(&ea);
+    amy_event eb = amy_default_event();
+    eb.synth = MOD3_OSCB_CH; eb.midi_note = note; eb.velocity = 0;
+    amy_add_event(&eb);
+}
+
+// Per-channel filter setter — audioSetFilter()/audioSetAllFiltersT() are hardcoded to
+// SYNTH_CH, so the modular synth's own 2 channels need their own small setter.
+void audioModularSetFilter(float cutoffHz, float resonance) {
+    if (!audioReady) return;
+    for (uint8_t ch : {(uint8_t)MOD3_OSCA_CH, (uint8_t)MOD3_OSCB_CH}) {
+        amy_event e = amy_default_event();
+        e.synth = ch;
+        e.filter_type = FILTER_LPF24;
+        e.filter_freq_coefs[COEF_CONST] = cutoffHz;
+        e.resonance = resonance;
+        amy_add_event(&e);
     }
 }
 
