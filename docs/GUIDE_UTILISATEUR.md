@@ -44,7 +44,7 @@ le **synthé modulaire wavetable** et les **modes expérimentaux génératifs**.
 
 ```
    ┌───┬───┬───┬───┐
-   │B4 │B3 │B2 │B1 │        ┌────────────────────────┐
+   │B1 │B2 │B3 │B4 │        ┌────────────────────────┐
    └───┴───┴───┴───┘        │        Écran OLED       │
    ↑ boutons (haut-gauche)  │        128 × 128        │
                             └────────────────────────┘
