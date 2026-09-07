@@ -36,6 +36,7 @@ enum AppMode : uint8_t {
     MODE_IMPORT,    // Android-only: SAF folder picker, imports phone files onto the SD root
     MODE_LIFE,      // Conway's-Game-of-Life on the key grid: column=pitch, birth=note-on
     MODE_SWARM,     // boids flocking: joystick-steered attractor zone triggers notes
+    MODE_GEN,       // generative: joystick X=procedural texture, Y=sound-making method, independently tunable
     MODE_COUNT
 };
 
@@ -63,6 +64,7 @@ enum MenuItem : uint8_t {
     MENU_IMPORT,
     MENU_LIFE,
     MENU_SWARM,
+    MENU_GEN,
     MENU_ITEM_COUNT
 };
 static const char* menuLabels[] = {
@@ -74,9 +76,10 @@ static const char* menuLabels[] = {
     "SAMPS","ANIM","I303",
     "MEDIA","LANIM","EXP",
     "EXP2","EXP3","303S",
-    "PKMN","MODUL","GEST",
+    "PKMN","SERUM","GEST",
     "PURGPCM","STONE","GEST2",
-    "IMPORT","LIFE","SWRM"
+    "IMPORT","LIFE","SWRM",
+    "GEN"
 };
 #define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
 

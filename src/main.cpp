@@ -876,6 +876,8 @@ static uint8_t  lifeRule       = 0;          // 0=classic B3/S23, 1=HighLife B36
 static uint8_t  lifeTickDivIdx = 3;          // index into kDelaySubdiv[] — simulation tick rate
 static uint8_t  lifeScale      = 0;          // index into kExp2Scales[]
 static EnvPreset lifeEnv       = ENV_PLUCK;
+static bool     lifePaused     = false;      // B1 toggles — freezes the simulation tick
+static SynthShape lifeShape    = SHAPE_PLUCK; // P2-selected instrument/algorithm (display only, audioSetShape does the work)
 
 // ==================== SWARM STATE (MODE_SWARM) ====================
 // Boids flocking (cohesion/separation/alignment), explicitly reusing EXP2's ball struct
@@ -897,6 +899,50 @@ static uint8_t     swarmOctave     = 0;
 static uint8_t     swarmBoidNote[SWARM_MAX_BOIDS];
 static uint32_t    swarmNoteOffMs[SWARM_MAX_BOIDS];
 static uint8_t     swarmFxMask     = 0;      // bit0=REV bit1=DLY bit2=CHR
+
+// ==================== GEN STATE (MODE_GEN) ====================
+// Generalizes LIFE/SWARM's "a procedural process triggers notes" idea one level further:
+// instead of one fixed generator algorithm, GEN exposes a small BROWSABLE set of distinct
+// procedural textures (joystick X) crossed with a small BROWSABLE set of distinct
+// sound-making methods (joystick Y) — the two axes are fully independent, so any texture
+// can be hard with a pluck, soft with a pad, or grimy with the glitch voice. Each generator
+// has its own tunable params (P2/P4), each voice its own single tunable param (P5).
+static uint8_t  genGenerator   = 0;      // index into kGenNames[]/GEN_GENERATOR_COUNT
+static uint8_t  genVoice       = 0;      // index into kGenVoices[]/GEN_VOICE_COUNT
+static uint8_t  genTickDivIdx  = 3;      // index into kDelaySubdiv[] — generator tick rate
+static uint32_t genLastStepMs  = 0;
+static bool     genPaused      = false;  // B1 toggles, same convention as LIFE
+static uint8_t  genScale       = 0;      // index into kExp2Scales[]
+static uint8_t  genOctave      = 3;      // 0..6-ish, centered around a playable register
+static uint8_t  genLastNote    = 0xFF;   // currently-sounding generator note, 0xFF=none
+static uint8_t  genLastCol     = 0;      // last column the generator landed on (for LED/OLED)
+static float    genVoiceParam  = 0.5f;   // P5: voice-specific brightness/cutoff-ish knob, 0..1
+
+// WALK: a single walker steps across the 8 columns each tick.
+static uint8_t  genWalkPos     = 3;
+static float    genWalkWander  = 0.5f;   // P2: 0=mostly holds still, 1=jumps more/further
+
+// EUCL: classic Euclidean rhythm (Bjorklund), k pulses over 8 steps, rotating playhead.
+static uint8_t  genEuclPulses  = 3;      // P2: 1..8
+static uint8_t  genEuclStepIdx = 0;      // playhead 0..7
+static bool     genEuclPattern[8];
+static uint8_t  genEuclPulsesBuilt = 0xFF; // pattern is only rebuilt when pulses actually changes
+
+// DRIFT: logistic-map chaos (x' = r*x*(1-x)) quantized to a column — genuinely
+// unpredictable/non-repeating texture, deliberately embracing chaos here (unlike the LDR
+// filter fix) since "interesting and a little out of control" is the point of this one.
+static float    genDriftX      = 0.42f;
+static float    genDriftR      = 3.7f;   // P2: 3.5 (near-periodic) .. 3.99 (fully chaotic)
+
+struct GenVoiceDef { const char* name; SynthShape shape; EnvPreset env; };
+static const GenVoiceDef kGenVoices[] = {
+    { "Pluck",  SHAPE_PLUCK,        ENV_PLUCK },
+    { "Pad",    SHAPE_JUNO_STRINGS, ENV_PAD   },
+    { "Glitch", SHAPE_NOISE_WHITE,  ENV_FAST  },
+};
+#define GEN_VOICE_COUNT (sizeof(kGenVoices)/sizeof(kGenVoices[0]))
+static const char* kGenNames[] = { "Walk", "Eucl", "Drift" };
+#define GEN_GENERATOR_COUNT (sizeof(kGenNames)/sizeof(kGenNames[0]))
 
 // ==================== GRANULAR2 STATE ====================
 struct Gran2State {
@@ -1159,6 +1205,59 @@ static uint8_t swarmComputeNote(uint8_t boid) {
     return (uint8_t)constrain(note, 12, 108);
 }
 
+// ==================== GEN HELPERS ====================
+static uint8_t genComputeNote(uint8_t col, uint8_t octave) {
+    const uint8_t* sc = kExp2Scales[genScale % 4];
+    int note = 36 + (int)octave * 12 + (int)sc[col % 8];
+    return (uint8_t)constrain(note, 12, 108);
+}
+static void genApplyVoice() {
+    const GenVoiceDef &v = kGenVoices[genVoice % GEN_VOICE_COUNT];
+    audioSetShape(v.shape);
+    audioSetEnvelope(envTable[v.env]);
+    // P5 (genVoiceParam) doubles as brightness for pitched voices and cutoff for the
+    // noise-based glitch voice — one knob, meaning tailored per voice so it always does
+    // something audible rather than being blank for some voices.
+    float cutoff = 300.0f * powf(40.0f, genVoiceParam); // 300Hz..12kHz exp
+    audioSetFilter(cutoff, 1.4f);
+}
+// Bjorklund's algorithm: distributes `pulses` hits as evenly as possible over `steps` slots.
+static void genRebuildEuclid() {
+    uint8_t pulses = constrain(genEuclPulses, (uint8_t)1, (uint8_t)8);
+    for (uint8_t i = 0; i < 8; i++) genEuclPattern[i] = false;
+    // Simple accumulator form (equivalent result to full Bjorklund for a single 8-slot
+    // ring): step i is a hit when its running fraction crosses an integer boundary.
+    float acc = 0.0f;
+    for (uint8_t i = 0; i < 8; i++) {
+        acc += (float)pulses / 8.0f;
+        if (acc >= 1.0f) { acc -= 1.0f; genEuclPattern[i] = true; }
+    }
+    genEuclPulsesBuilt = pulses;
+}
+// One generator tick: advances whichever generator is selected and returns the column to
+// trigger, or -1 if this tick produces no note (EUCL's rests).
+static int8_t genStep() {
+    switch (genGenerator % GEN_GENERATOR_COUNT) {
+        case 0: { // WALK
+            float r = (float)random(0, 1000) / 1000.0f;
+            int step = (r < genWalkWander) ? ((random(0,2) ? 1 : -1) * (1 + (int)(genWalkWander*2.0f))) : 0;
+            genWalkPos = (uint8_t)(((int)genWalkPos + step + 8*4) % 8);
+            return (int8_t)genWalkPos;
+        }
+        case 1: { // EUCL
+            if (genEuclPulsesBuilt != genEuclPulses) genRebuildEuclid();
+            uint8_t step = genEuclStepIdx;
+            genEuclStepIdx = (uint8_t)((genEuclStepIdx + 1) % 8);
+            return genEuclPattern[step] ? (int8_t)step : (int8_t)-1;
+        }
+        case 2: default: { // DRIFT
+            genDriftX = genDriftR * genDriftX * (1.0f - genDriftX);
+            if (genDriftX <= 0.0f || genDriftX >= 1.0f) genDriftX = 0.42f; // guard against escaping [0,1]
+            return (int8_t)constrain((int)(genDriftX * 8.0f), 0, 7);
+        }
+    }
+}
+
 // Map (row, col) → (sampleIdx, sliceIdx, isReverse).
 // Physical layout (code row 0 = physical bottom; gc = 7-c so code col 7 = physical left):
 //   S0=physical TL (rows2-3, cols4-7), S1=physical TR (rows2-3, cols0-3)
@@ -1264,7 +1363,7 @@ static const MenuItem kMenuCatInstr[] = {
     MENU_MOD2, MENU_I303, MENU_MODULAR,
     MENU_GRANULAR2, MENU_EXP,
     MENU_EXP2, MENU_EXP3, MENU_POKEMON,
-    MENU_LIFE, MENU_SWARM
+    MENU_LIFE, MENU_SWARM, MENU_GEN
 };
 static const MenuItem kMenuCatSeq[] = {
     MENU_DRUM2, MENU_DR2, MENU_303S2, MENU_SYSEQ, MENU_SS2, MENU_GEST
@@ -1273,7 +1372,7 @@ static const MenuItem kMenuCatAut[] = {
     MENU_LIGHT, MENU_LIGHTPLAY, MENU_ABOUT, MENU_SD, MENU_ANIM, MENU_VID, MENU_LANIM, MENU_PCMCLEAN, MENU_IMPORT, MENU_MIDI
 };
 static const MenuItem* kMenuCatItems[] = { kMenuCatInstr, kMenuCatSeq, kMenuCatAut };
-static const uint8_t kMenuCatSizes[] = { 14, 6, 10 };
+static const uint8_t kMenuCatSizes[] = { 15, 6, 10 };
 
 // ==================== VID STATE ====================
 struct __attribute__((packed)) BvidHeader {
@@ -1509,6 +1608,23 @@ struct ModSlot {
 // Slot 5: spare headroom.
 ModSlot gModSlots[MOD_SLOT_COUNT];
 
+// Curated LFO starting points for OVERLAY_FX_MOD, browsed with joystick Y (JX still cycles
+// which FX param is being automated) — picking one sets shape/rate/sync together in one
+// gesture instead of hunting across 3 separate pots to reconstruct a "good" combination by
+// hand. P4 (depth) stays a separate, always-continuous pot since "how much" is the one
+// dimension that's genuinely intuitive to sweep directly.
+struct LfoProfile { const char* name; ModWaveShape shape; bool bpmSync; float rateHz; uint8_t bpmDivIdx; };
+static const LfoProfile kLfoProfiles[] = {
+    { "Slow Wave",    MODSHAPE_SINE, false, 0.4f, 4 },
+    { "Fast Wave",    MODSHAPE_SINE, false, 5.0f, 4 },
+    { "Tremolo",      MODSHAPE_SQR,  false, 6.0f, 4 },
+    { "Synced 1/4",   MODSHAPE_TRI,  true,  2.0f, 4 },
+    { "Synced 1/8 Chop", MODSHAPE_SQR, true, 2.0f, 2 },
+    { "Slow Sync Sweep", MODSHAPE_SINE, true, 2.0f, 6 },
+    { "Random Glitch", MODSHAPE_SH,  false, 9.0f, 4 },
+};
+#define LFO_PROFILE_COUNT (sizeof(kLfoProfiles)/sizeof(kLfoProfiles[0]))
+
 static float modWaveformSample(ModWaveShape shape, float phase, float shHold) {
     switch (shape) {
         case MODSHAPE_SINE: return sinf(phase);
@@ -1535,6 +1651,7 @@ int8_t modSlotFindFxParam(uint8_t fx, uint8_t param) {
 // OVERLAY_FX_MOD state (double-click an active FX slot in OVERLAY_FX to enter).
 static uint8_t s_fxModEditParam = 0;   // which of fxList[fxSelected]'s params is being automated
 static int8_t  s_fxModEditSlot  = -1;  // gModSlots[] index owning this (fx,param); -1 = unassigned
+static int8_t  s_fxModProfileIdx = -1; // joystick-Y cursor into kLfoProfiles[]; -1 = none picked yet (custom/pot-tuned)
 static uint32_t s_fxDblLastMs = 0;
 static uint8_t  s_fxDblLastOpt = 255;
 
@@ -2129,6 +2246,12 @@ static CtrlLabels ctrlLabelsFor(AppMode m) {
         }
         case MODE_LIGHT:
             return {"-", "N", "SPEED", "HUE", "INTENSITY", "-", "-", "-", "-"};
+        case MODE_LIFE:
+            return {"INSTR", "RULE", "TICKRATE", "RESEED", "ENV", "PAUSE", "-", "-", "-"};
+        case MODE_SWARM:
+            return {"SHAPE", "FLOCK", "SPEED", "ATTRACT", "ZONE", "-", "-", "-", "-"};
+        case MODE_GEN:
+            return {"TEXTURE PARAM", "TICKRATE", "SCALE", "OCTAVE", "VOICE PARAM", "PAUSE", "-", "-", "-"};
         default:
             return {"-", "-", "-", "-", "-", "-", "-", "-", "-"};
     }
@@ -2305,6 +2428,12 @@ void switchMode(AppMode newMode) {
             swarmApplyFx(); audioSetFilter(0.0f,1.5f); audioSetWavefold(1.0f);
         } else { swarmFxMask=0; }
     }
+    if (currentMode==MODE_GEN) {
+        if (audioReady) {
+            if (genLastNote!=0xFF) { audioNoteOff(genLastNote); genLastNote=0xFF; }
+            audioSetFilter(0.0f,1.5f);
+        }
+    }
     if (currentMode==MODE_MODULAR) {
         gModSlots[4].active = false;
         gModSlots[4].destKind = MODDEST_NONE;
@@ -2333,7 +2462,8 @@ void switchMode(AppMode newMode) {
                 false,false,true, false,false, // EXP2,EXP3,303S2,POKEMON,MODULAR
                 true,                          // GEST
                 false,false,true, false,       // PCMCLEAN,STONE,DR2,IMPORT
-                false,false                    // LIFE,SWARM
+                false,false,                   // LIFE,SWARM
+                false                          // GEN
             };
             if (!kIsSeq[currentMode]) {
                 audioSetFilter(0.0f, 1.5f);
@@ -2350,8 +2480,8 @@ void switchMode(AppMode newMode) {
           "SYNTH","OMNI","SAMPL","LIGHT","LPLY",
           "BATT","DIAG","MOD2","GRANU",
           "MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303","MEDIA","LANIM",
-          "EXP","EXP2","EXP3","303S","PKMN","MODUL","GEST",
-          "PURGPCM","STONE","GEST2","IMPORT","LIFE","SWARM"};
+          "EXP","EXP2","EXP3","303S","PKMN","SERUM","GEST",
+          "PURGPCM","STONE","GEST2","IMPORT","LIFE","SWARM","GEN"};
       // This array must have exactly MODE_COUNT entries in AppMode order — the
       // compiler silently pads any missing trailing ones with nullptr (no size
       // mismatch warning), and printf("%s", nullptr) crashes (LoadProhibited).
@@ -2582,10 +2712,11 @@ void switchMode(AppMode newMode) {
     }
     if (newMode==MODE_LIFE && audioReady) {
         lifeRule = 0; lifeTickDivIdx = 3; lifeScale = 0; lifeEnv = ENV_PLUCK;
+        lifePaused = false; lifeShape = SHAPE_PLUCK;
         lifeLastStepMs = millis();
         for (int c=0;c<KBD_COLS;c++) lifeColNote[c] = 0xFF;
         lifeReseed(0.3f);
-        audioSetShape(SHAPE_PLUCK);
+        audioSetShape(lifeShape);
         audioSetEnvelope(envTable[lifeEnv]);
         audioSetReverb(0.3f, 0.78f, 0.45f, 2000.0f);
         audioSetFilter(0.0f, 1.5f);
@@ -2602,6 +2733,17 @@ void switchMode(AppMode newMode) {
         audioSetEnvelope(envTable[ENV_FAST]);
         swarmApplyFx();
         audioSetFilter(0.0f, 1.5f);
+    }
+    if (newMode==MODE_GEN && audioReady) {
+        genGenerator = 0; genVoice = 0; genTickDivIdx = 3; genPaused = false;
+        genScale = 0; genOctave = 3; genVoiceParam = 0.5f;
+        genWalkPos = 3; genWalkWander = 0.5f;
+        genEuclPulses = 3; genEuclStepIdx = 0; genEuclPulsesBuilt = 0xFF;
+        genDriftX = 0.42f; genDriftR = 3.7f;
+        genLastNote = 0xFF; genLastCol = 0;
+        genLastStepMs = millis();
+        genApplyVoice();
+        audioSetReverb(0.2f, 0.78f, 0.45f, 2000.0f);
     }
     if (newMode==MODE_GEST) {
         // Pickup: don't apply pot values immediately — wait for the pot to actually move
@@ -2684,6 +2826,7 @@ static void dispatchMenuItem(MenuItem item) {
         case MENU_DR2:       switchMode(MODE_DR2);       break;
         case MENU_LIFE:      switchMode(MODE_LIFE);      break;
         case MENU_SWARM:     switchMode(MODE_SWARM);     break;
+        case MENU_GEN:       switchMode(MODE_GEN);       break;
         default: break;
     }
 }
@@ -2800,9 +2943,14 @@ static const int8_t kOctOpts[] = {-2, -1, 0, 1};
 void overlayKeyPress(uint8_t row, uint8_t col) {
     if (s_overlayCloseAt) return;
 
-    // FX automation editor: any key press closes back to OVERLAY_FX (param selection is
-    // via joystick X, not the key grid — see the joystick-nav block in loop()).
+    // FX automation editor: cols 0-3 (note-grid keys) are left alone here so the user can
+    // play/preview notes and hear the effect of the modulation while dialing it in — audio
+    // for them is handled separately by handleNoteKeyAudio (gated by
+    // notePreviewSafeDuringFxOverlay(), same exemption OVERLAY_FX itself uses). Any other
+    // key (cols 4-7) closes back to OVERLAY_FX — param selection is via joystick X, not
+    // the key grid.
     if (s_overlay == OVERLAY_FX_MOD) {
+        if (col < 4) return;
         s_overlay = OVERLAY_FX; s_overlayCloseAt = 0;
         return;
     }
@@ -2859,6 +3007,7 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
                         fxSelected = opt;
                         s_fxModEditParam = 0;
                         s_fxModEditSlot = modSlotFindFxParam(opt, 0);
+                        s_fxModProfileIdx = -1;
                         s_overlay = OVERLAY_FX_MOD;
                         Serial.printf("OVL FX_MOD enter fx=%d\n", opt);
                         return;
@@ -3272,6 +3421,16 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                             if (s303CurNote) { audioT303NoteOff(s303CurNote); s303CurNote=0; }
                             t303SlideActive=false; audioT303PitchBend(1.0f); ss2CurSlot=0xFF;
                         }
+                        break;
+                    case MODE_LIFE:
+                        // Pause/resume the automaton tick — held notes and the current grid
+                        // state are left exactly as they are (lifeStep() itself decides
+                        // note-on/off on birth/death edges, so simply not calling it freezes
+                        // both the pattern and whatever's currently sounding).
+                        lifePaused = !lifePaused;
+                        break;
+                    case MODE_GEN:
+                        genPaused = !genPaused;
                         break;
                     default: break;
                 }
@@ -3967,7 +4126,10 @@ void drawScreen(bool blockWait) {
         oled.drawStr(2, 36, l2);
         char l3[24]; snprintf(l3, sizeof(l3), "Depth: %d%%", (int)(s.depth*100.0f));
         oled.drawStr(2, 46, l3);
-        oled.drawStr(2, 58, assigned ? "-- automating --" : "Raise depth (P4)");
+        char l4[24];
+        if (s_fxModProfileIdx >= 0) snprintf(l4, sizeof(l4), "Profile: %s", kLfoProfiles[s_fxModProfileIdx].name);
+        else                        snprintf(l4, sizeof(l4), assigned ? "Profile: custom" : "Profile: --");
+        oled.drawStr(2, 56, l4);
 
         // Live phase indicator: horizontal track + moving dot, only while assigned+active.
         oled.drawFrame(4, 70, 120, 8);
@@ -3976,8 +4138,9 @@ void drawScreen(bool blockWait) {
             int x = 5 + (int)(t * 117.0f);
             oled.drawBox(x, 71, 3, 6);
         }
-        oled.drawStr(2, 92, "Joy X: change param");
-        oled.drawStr(2, 102, "Any key: back to FX");
+        oled.drawStr(2, 88, "Joy X: param  Joy Y: profile");
+        oled.drawStr(2, 98, assigned ? "Keys: play notes" : "P4: raise depth");
+        oled.drawStr(2, 108, "B1: back to FX");
 
         if (s_displayTaskHandle) xTaskNotifyGive(s_displayTaskHandle);
         return;
@@ -5690,7 +5853,7 @@ void drawScreen(bool blockWait) {
             // ---- MODULAR — wavetable dual-osc synth (Serum-inspired MVP) ----
             case MODE_MODULAR: {
                 static const char* kModWtNames[] = {"111","BRAIDS01","PPGWA00","SIN2SAW","VIRAL"};
-                oled.drawStr(0,0,"MODULAR"); oled.drawHLine(0,9,128);
+                oled.drawStr(0,0,"SERUM"); oled.drawHLine(0,9,128);
                 oled.setFont(u8g2_font_4x6_tf);
                 snprintf(buf,sizeof(buf),"P2 Table: %s  Oct:%+d",kModWtNames[modOscTable%5],noteMap.getOctave());
                 oled.drawStr(0,18,buf);
@@ -6421,11 +6584,14 @@ void drawScreen(bool blockWait) {
                 oled.setFont(u8g2_font_4x6_tf);
                 static const char* kRuleNm[] = {"B3/S23","B36/S23"};
                 char hdr[32];
-                snprintf(hdr, sizeof(hdr), "BPM:%d %s", bpm, kRuleNm[lifeRule%2]);
+                snprintf(hdr, sizeof(hdr), "%sBPM:%d %s", lifePaused?"[||] ":"", bpm, kRuleNm[lifeRule%2]);
                 oled.drawStr(0, 6, hdr);
+                char hdr2[32];
+                snprintf(hdr2, sizeof(hdr2), "Instr:%s", shapeNames[lifeShape]);
+                oled.drawStr(0, 13, hdr2);
                 // Grid: 8 cols x 4 rows, each cell a filled/outline box, big enough to be
                 // clearly legible (12px cells, centered-ish in the 128x128 screen).
-                const int cellW = 15, cellH = 15, ox = 2, oy = 10;
+                const int cellW = 15, cellH = 15, ox = 2, oy = 18;
                 for (int r=0;r<KBD_NOTE_ROWS;r++) {
                     for (int c=0;c<KBD_COLS;c++) {
                         int x = ox + c*cellW, y = oy + (KBD_NOTE_ROWS-1-r)*cellH; // row0=bottom
@@ -6433,8 +6599,8 @@ void drawScreen(bool blockWait) {
                         else                oled.drawFrame(x, y, cellW-2, cellH-2);
                     }
                 }
-                char bot[28];
-                snprintf(bot, sizeof(bot), "Keys=seed  P6=reseed");
+                char bot[32];
+                snprintf(bot, sizeof(bot), "Keys=seed P2=instr B1=%s", lifePaused?"play":"pause");
                 oled.drawStr(0, 127, bot);
                 break;
             }
@@ -6466,6 +6632,39 @@ void drawScreen(bool blockWait) {
                     else oled.drawDisc(px, py, 2);
                 }
                 oled.drawStr(0, 127, "Joy=steer  Keys=on/off");
+                break;
+            }
+            case MODE_GEN: {
+                oled.setFont(u8g2_font_4x6_tf);
+                static const char* kScaleNmG[] = {"MAJ","MIN","PNT","CHR"};
+                char hdr[32];
+                snprintf(hdr, sizeof(hdr), "%s%s > %s", genPaused?"[||] ":"",
+                         kGenNames[genGenerator%GEN_GENERATOR_COUNT], kGenVoices[genVoice%GEN_VOICE_COUNT].name);
+                oled.drawStr(0, 6, hdr);
+                char hdr2[32];
+                snprintf(hdr2, sizeof(hdr2), "BPM:%d Oct:%d %s", bpm, genOctave, kScaleNmG[genScale%4]);
+                oled.drawStr(0, 13, hdr2);
+
+                // Generator-specific detail line
+                char gd[32];
+                switch (genGenerator % GEN_GENERATOR_COUNT) {
+                    case 0: snprintf(gd, sizeof(gd), "Wander:%d%%", (int)(genWalkWander*100.0f)); break;
+                    case 1: snprintf(gd, sizeof(gd), "Pulses:%d/8", genEuclPulses); break;
+                    default: snprintf(gd, sizeof(gd), "Chaos R:%.2f", genDriftR); break;
+                }
+                oled.drawStr(0, 20, gd);
+
+                // 8-column strip: highlight the column the generator most recently landed on
+                const int cellW = 14, cellH = 24, ox = 4, oy = 30;
+                for (int c=0;c<KBD_COLS;c++) {
+                    int x = ox + c*cellW;
+                    if (c == genLastCol) oled.drawBox(x, oy, cellW-3, cellH);
+                    else                 oled.drawFrame(x, oy, cellW-3, cellH);
+                }
+                oled.drawStr(2, 92, "Joy X:texture  Y:voice");
+                oled.drawStr(2, 102, "Keys: play  P2:tune P7:tone");
+                char bot[24]; snprintf(bot, sizeof(bot), "B1:%s", genPaused?"play":"pause");
+                oled.drawStr(2, 112, bot);
                 break;
             }
             case MODE_303S2: {
@@ -7264,6 +7463,23 @@ static void updateLedsAndShow()
                 }
                 break;
             }
+            case MODE_GEN: {
+                // Hue = which voice is selected (so the sound-making choice is visible at a
+                // glance); the generator's current column lights up bright, the rest dim.
+                // Manually-held keys light independently so hand-played notes are visible too.
+                static const uint8_t kVoiceHue[] = {32, 160, 0}; // Pluck=amber Pad=blue Glitch=red
+                uint8_t hue = kVoiceHue[genVoice % GEN_VOICE_COUNT];
+                for (int r=0;r<KBD_NOTE_ROWS;r++) for (int c=0;c<KBD_COLS;c++) {
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
+                    int li=(idx>=0&&idx<NUM_LEDS+4)?crdToIdx(idx,0):-1;
+                    if (li<0||li>=NUM_LEDS) continue;
+                    bool held = activeNotes[r][c] != 0;
+                    bool genCol = ((uint8_t)c == genLastCol);
+                    uint8_t bri = held ? 255 : (genCol ? 200 : 10);
+                    leds[li] = CHSV(hue, 220, bri);
+                }
+                break;
+            }
             case MODE_DR2: {
                 // Left half (cols 4-7) = sequencer: row0=beat, row1=step (bright=touched
                 // last, mid=in multi-select batch, dim=has hits for the focused instrument,
@@ -7620,11 +7836,12 @@ static bool notePreviewSafeDuringFxOverlay() {
 
 static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
 {
-    // OVERLAY_FX is deliberately exempted (for modes where it's safe — see
-    // notePreviewSafeDuringFxOverlay() above): it's designed to "stay open for
-    // multi-toggle" (see overlayKeyPress's OVERLAY_FX case) so pots can keep adjusting
-    // an FX's params while it's open — but with every overlay silently blocking note
-    // playback here, a user could never actually HEAR the effect while dialing it in,
+    // OVERLAY_FX and OVERLAY_FX_MOD are deliberately exempted (for modes where it's safe
+    // — see notePreviewSafeDuringFxOverlay() above): both are designed to "stay open for
+    // multi-toggle / live tweak" (see overlayKeyPress's OVERLAY_FX and OVERLAY_FX_MOD
+    // cases) so pots/joystick can keep adjusting an FX's (or its automation's) params
+    // while it's open — but with every overlay silently blocking note playback here, a
+    // user could never actually HEAR the effect while dialing it in,
     // since pressing a note key produced no sound at all (and, via overlayKeyPress's
     // colMin check below, silently closed the overlay too — so by the time a pot got
     // touched, the overlay was already gone and pots fell back to whatever the mode's
@@ -7636,7 +7853,7 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
     // the overlay.
     if (menuOpen || !audioReady ||
         (s_overlay != OVERLAY_NONE &&
-         !(s_overlay == OVERLAY_FX && col < 4 && notePreviewSafeDuringFxOverlay())))
+         !((s_overlay == OVERLAY_FX || s_overlay == OVERLAY_FX_MOD) && col < 4 && notePreviewSafeDuringFxOverlay())))
         return;
     switch(currentMode){
         case MODE_SYNTH:{
@@ -8531,6 +8748,15 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                 } else {
                     swarmResetBoid(b);
                 }
+            }
+            break;
+        case MODE_GEN:
+            // Manual play, independent of whatever the generator is doing on its own tick —
+            // lets any texture/voice combo be auditioned by hand, not just watched run.
+            {
+                uint8_t note = genComputeNote(col, (uint8_t)(genOctave + row));
+                activeNotes[row][col] = pressed ? note : 0;
+                if (audioReady) { if (pressed) audioNoteOn(note, 0.8f*volume); else audioNoteOff(note); }
             }
             break;
         case MODE_MIDI: {
@@ -9903,7 +10129,7 @@ void loop() {
         }
 
         // ==================== LIFE (10ms tick) ====================
-        if (currentMode==MODE_LIFE && !menuOpen) {
+        if (currentMode==MODE_LIFE && !menuOpen && !lifePaused) {
             uint32_t stepMs = (uint32_t)(60000.0f / (float)bpm * kDelaySubdiv[lifeTickDivIdx]);
             stepMs = constrain(stepMs, 40UL, 2000UL);
             uint32_t nowL = millis();
@@ -9926,6 +10152,19 @@ void loop() {
 
             float attrX = jx * 18.0f, attrY = jy * 18.0f;
             float cohW = 0.006f * swarmFlockBal, sepW = 0.05f * (1.0f - swarmFlockBal), aliW = 0.03f * swarmFlockBal;
+
+            // Arena polygon vertices — same origin/radius (50) as the rotating hexagon
+            // drawn in the OLED renderer (main.cpp, MODE_SWARM case), so boid coords
+            // (relative to that same origin) can be edge-tested against it directly.
+            const float SWARM_ARENA_R = 50.0f, SWARM_BALL_R = 2.5f, SWARM_BOUNCE = 0.85f;
+            struct { float x, y; } spv[EXP2_MAX_SIDES];
+            uint8_t sN = swarmNumSides;
+            float sAngleStep = 2.0f*(float)M_PI / (float)sN;
+            for (int i=0;i<sN;i++) {
+                float a = swarmHexAngle + i*sAngleStep;
+                spv[i].x = SWARM_ARENA_R*cosf(a);
+                spv[i].y = SWARM_ARENA_R*sinf(a);
+            }
 
             for (int i=0;i<SWARM_MAX_BOIDS;i++) {
                 if (!swarmBoids[i].active) continue;
@@ -9956,10 +10195,30 @@ void loop() {
                 if (sp > swarmSpeedCap) { s.vx = s.vx/sp*swarmSpeedCap; s.vy = s.vy/sp*swarmSpeedCap; }
                 s.x += s.vx * 0.15f; s.y += s.vy * 0.15f;
 
-                // Soft containment: reflect back if drifting far outside the arena (reuses
-                // EXP2's spirit of keeping entities inside a bounded play area).
-                float r = sqrtf(s.x*s.x + s.y*s.y);
-                if (r > 55.0f) { s.vx -= s.x*0.01f; s.vy -= s.y*0.01f; }
+                // Hexagon-wall collision: real per-edge reflection against the rotating
+                // arena (same math as EXP2's polygon-wall bounce) — replaces a previous
+                // purely-circular soft pullback that never actually interacted with the
+                // hexagon drawn on screen (the bug report this fixes).
+                for (int w=0;w<(int)sN;w++) {
+                    float ax=spv[w].x, ay=spv[w].y;
+                    float bx_=spv[(w+1)%sN].x, by_=spv[(w+1)%sN].y;
+                    float edx=bx_-ax, edy=by_-ay;
+                    float len=sqrtf(edx*edx+edy*edy);
+                    if (len<0.001f) continue;
+                    float nx=-edy/len, ny=edx/len;  // inward normal
+                    float d=(s.x-ax)*nx+(s.y-ay)*ny;
+                    if (d < SWARM_BALL_R) {
+                        float vn=s.vx*nx+s.vy*ny;
+                        if (vn < 0.0f) {
+                            float vtx = s.vx - vn*nx;
+                            float vty = s.vy - vn*ny;
+                            s.vx = vtx + (-SWARM_BOUNCE * vn) * nx;
+                            s.vy = vty + (-SWARM_BOUNCE * vn) * ny;
+                            s.x  += (SWARM_BALL_R - d) * nx;
+                            s.y  += (SWARM_BALL_R - d) * ny;
+                        }
+                    }
+                }
 
                 // Attractor-zone note trigger: edge-detect entering the small trigger radius.
                 float dax = s.x - attrX, day = s.y - attrY;
@@ -9980,6 +10239,27 @@ void loop() {
                 if (swarmNoteOffMs[i] && nowS >= swarmNoteOffMs[i] && audioReady) {
                     if (swarmBoidNote[i] != 0xFF) audioNoteOff(swarmBoidNote[i]);
                     swarmNoteOffMs[i] = 0;
+                }
+            }
+        }
+
+        // ==================== GEN (10ms tick) ====================
+        // Advances whichever generator is selected; a returned column of -1 (EUCL rests)
+        // produces no note this tick. Monophonic on purpose — the point is auditioning one
+        // texture/voice combination clearly, not building a dense pattern.
+        if (currentMode==MODE_GEN && !menuOpen && !genPaused) {
+            uint32_t stepMs = (uint32_t)(60000.0f / (float)bpm * kDelaySubdiv[genTickDivIdx]);
+            stepMs = constrain(stepMs, 40UL, 2000UL);
+            uint32_t nowG = millis();
+            if (nowG - genLastStepMs >= stepMs) {
+                genLastStepMs = nowG;
+                int8_t col = genStep();
+                if (col >= 0 && audioReady) {
+                    genLastCol = (uint8_t)col;
+                    if (genLastNote != 0xFF) audioNoteOff(genLastNote);
+                    uint8_t note = genComputeNote((uint8_t)col, genOctave);
+                    genLastNote = note;
+                    audioNoteOn(note, 0.75f * volume);
                 }
             }
         }
@@ -10811,11 +11091,13 @@ void loop() {
                 }
                 case MODE_LIFE: {
                     static float lp1L=-1, lp4L=-1, lp5L=-1, lp6L=-1, lp7L=-1;
-                    // Pot 1: shape
+                    // Pot 2 (P2): instrument/algorithm — cycles through the same shape set
+                    // SYNTH's OVERLAY_INSTR offers, shown by name in the OLED header.
                     if (fabsf(pots[1].value-lp1L)>0.01f) {
                         lp1L=pots[1].value;
                         uint8_t si=(uint8_t)(pots[1].value*((uint8_t)SHAPE_COUNT-0.01f));
-                        if (audioReady) audioSetShape((SynthShape)si);
+                        lifeShape = (SynthShape)si;
+                        if (audioReady) audioSetShape(lifeShape);
                     }
                     // Pot 4: rule variant (classic B3/S23 vs HighLife B36/S23)
                     if (fabsf(pots[3].value-lp4L)>0.05f) {
@@ -10867,6 +11149,45 @@ void loop() {
                     // Pot 7: trigger-zone radius
                     if (fabsf(pots[6].value-lp7S)>0.01f) {
                         lp7S=pots[6].value; swarmZoneRadius = 4.0f + pots[6].value*16.0f;
+                    }
+                    break;
+                }
+                case MODE_GEN: {
+                    static float lp1G=-1, lp4G=-1, lp5G=-1, lp6G=-1, lp7G=-1;
+                    // Pot 2: primary tuning knob for whichever generator (texture) is
+                    // currently selected — WALK=wander amount, EUCL=pulse count, DRIFT=chaos.
+                    if (fabsf(pots[1].value-lp1G)>0.01f) {
+                        lp1G=pots[1].value;
+                        switch (genGenerator % GEN_GENERATOR_COUNT) {
+                            case 0: genWalkWander = pots[1].value; break;
+                            case 1: genEuclPulses = (uint8_t)constrain((int)(pots[1].value*7.99f)+1, 1, 8); break;
+                            case 2: genDriftR = 3.5f + pots[1].value*0.49f; break;
+                        }
+                    }
+                    // Pot 4: generator tick rate (BPM subdivision)
+                    if (fabsf(pots[3].value-lp4G)>0.02f) {
+                        lp4G=pots[3].value;
+                        genTickDivIdx = (uint8_t)(pots[3].value * (DELAY_SUBDIV_COUNT-0.01f));
+                    }
+                    // Pot 5: scale
+                    if (fabsf(pots[4].value-lp5G)>0.05f) {
+                        lp5G=pots[4].value;
+                        genScale = (uint8_t)(pots[4].value * 3.99f);
+                    }
+                    // Pot 6: octave (register the generator plays in)
+                    if (fabsf(pots[5].value-lp6G)>0.05f) {
+                        lp6G=pots[5].value;
+                        genOctave = (uint8_t)(1.0f + pots[5].value*5.99f); // 1..6
+                    }
+                    // Pot 7: voice brightness/cutoff — the one tunable knob for whichever
+                    // sound-making method (voice) is currently selected.
+                    if (fabsf(pots[6].value-lp7G)>0.01f) {
+                        lp7G=pots[6].value;
+                        genVoiceParam = pots[6].value;
+                        if (audioReady) {
+                            float cutoff = 300.0f * powf(40.0f, genVoiceParam);
+                            audioSetFilter(cutoff, 1.4f);
+                        }
                     }
                     break;
                 }
@@ -11487,12 +11808,17 @@ void loop() {
         }
 
         // FX automation editor (OVERLAY_FX_MOD): joystick X cycles which of the selected
-        // FX's non-empty params is being automated. Depth/rate/shape/BPM-sync are pots
-        // (P4-P7), handled in the OVERLAY_FX_MOD pot-dispatch block above.
+        // FX's non-empty params is being automated; joystick Y browses curated LFO
+        // starting points (kLfoProfiles[]) and applies the picked one immediately —
+        // shape/rate/sync set together in one gesture instead of hunting across 3 pots
+        // to reconstruct a good combination by hand. Depth stays a separate pot (P4):
+        // picking a profile only touches shape/rate/sync, and gives the slot a sensible
+        // default depth if it doesn't have one yet so the effect is audible right away.
         if (s_overlay == OVERLAY_FX_MOD) {
             static unsigned long lastFxModNav = 0;
             if (millis() - lastFxModNav >= 200) {
                 float nx = cachedJoyX / 64.0f;
+                float ny = cachedJoyY / 64.0f;
                 FxEffect &fx = fxList[fxSelected];
                 int8_t np = -1;
                 if (nx < -0.3f) {
@@ -11505,8 +11831,54 @@ void loop() {
                 if (np >= 0) {
                     s_fxModEditParam = (uint8_t)np;
                     s_fxModEditSlot = modSlotFindFxParam(fxSelected, s_fxModEditParam);
+                    s_fxModProfileIdx = -1;
                     lastFxModNav = millis();
                 }
+
+                int8_t nprof = -1;
+                if (ny < -0.3f || ny > 0.3f) {
+                    if (s_fxModProfileIdx < 0) nprof = 0;
+                    else if (ny < -0.3f && s_fxModProfileIdx > 0) nprof = s_fxModProfileIdx - 1;
+                    else if (ny > 0.3f && s_fxModProfileIdx < (int8_t)LFO_PROFILE_COUNT - 1) nprof = s_fxModProfileIdx + 1;
+                }
+                if (nprof >= 0) {
+                    s_fxModProfileIdx = nprof;
+                    if (s_fxModEditSlot < 0) s_fxModEditSlot = modSlotAllocFxParam();
+                    if (s_fxModEditSlot >= 0) {
+                        ModSlot &s = gModSlots[s_fxModEditSlot];
+                        const LfoProfile &p = kLfoProfiles[nprof];
+                        s.destKind = MODDEST_FX_PARAM;
+                        s.destA = fxSelected; s.destB = s_fxModEditParam;
+                        s.shape = p.shape; s.bpmSync = p.bpmSync; s.rateHz = p.rateHz; s.bpmDivIdx = p.bpmDivIdx;
+                        if (s.depth < 0.01f) s.depth = 0.5f;
+                        s.active = true;
+                    }
+                    lastFxModNav = millis();
+                }
+            }
+        }
+
+        // GEN (MODE_GEN): JX browses the procedural texture (generator), JY browses the
+        // sound-making method (voice) — two fully independent axes, mirroring how
+        // OVERLAY_PKMN below already splits JX/JY across two unrelated lists. Selecting a
+        // generator resets its own tick position so switching textures feels immediate
+        // rather than picking up mid-pattern from whatever the old generator left behind.
+        if (currentMode == MODE_GEN && !menuOpen) {
+            static unsigned long lastGenNav = 0;
+            if (millis() - lastGenNav >= 220) {
+                float nx = constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                float ny = constrain(cachedJoyY/64.0f,-1.0f,1.0f);
+                bool changed = false;
+                if (nx < -0.4f && genGenerator > 0) { genGenerator--; changed = true; }
+                else if (nx > 0.4f && genGenerator < GEN_GENERATOR_COUNT-1) { genGenerator++; changed = true; }
+                if (changed) {
+                    genWalkPos = 3; genEuclStepIdx = 0; genEuclPulsesBuilt = 0xFF; genDriftX = 0.42f;
+                }
+                bool vChanged = false;
+                if (ny < -0.4f && genVoice > 0) { genVoice--; vChanged = true; }
+                else if (ny > 0.4f && genVoice < GEN_VOICE_COUNT-1) { genVoice++; vChanged = true; }
+                if (vChanged && audioReady) genApplyVoice();
+                if (changed || vChanged) lastGenNav = millis();
             }
         }
 
