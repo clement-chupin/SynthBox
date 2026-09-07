@@ -43,10 +43,11 @@ le **synthé modulaire wavetable** et les **modes expérimentaux génératifs**.
 # Les contrôles physiques
 
 ```
-                         ┌────────────────────────┐
-                         │        Écran OLED       │
-                         │        128 × 128        │
-                         └────────────────────────┘
+   ┌───┬───┬───┬───┐
+   │B4 │B3 │B2 │B1 │        ┌────────────────────────┐
+   └───┴───┴───┴───┘        │        Écran OLED       │
+   ↑ boutons (haut-gauche)  │        128 × 128        │
+                            └────────────────────────┘
 
    ┌───┬───┬───┬───┬───┬───┬───┬───┐
    │   │   │   │   │   │   │   │   │  ← rangée 3 (aiguës)
@@ -56,8 +57,6 @@ le **synthé modulaire wavetable** et les **modes expérimentaux génératifs**.
    │   │   │   │   │   │   │   │   │  ← rangée 1        (clavier / séquenceur /
    ├───┼───┼───┼───┼───┼───┼───┼───┤         sélecteur selon le mode)
    │   │   │   │   │   │   │   │   │  ← rangée 0 (graves)
-   ├───┼───┼───┼───┼───┴───┴───┴───┤
-   │ ~ │ ~ │ ~ │ ~ │ B4│ B3│ B2│ B1 │  ← rangée menu (B1-B4 = 4 boutons)
    └───┴───┴───┴───┴───┴───┴───┴───┘
 
      (P1)              (●)              (P3)   (P4)(P5)(P6)(P7)
@@ -67,7 +66,7 @@ le **synthé modulaire wavetable** et les **modes expérimentaux génératifs**.
 | Contrôle | Rôle |
 |---|---|
 | **Grille 4×8** | 32 touches jouables. Selon le mode : clavier musical, grille de séquenceur, sélecteur de motifs (LIFE), points de spawn (SWARM)… |
-| **4 boutons (B1-B4)** | Rangée 4, colonnes 4-7 du clavier physique. Rôle contextuel selon le mode — le plus souvent B1 = ouvrir/fermer le menu FX. |
+| **4 boutons (B1-B4)** | Placés physiquement en haut à gauche, à côté de l'écran OLED (électriquement câblés sur la même matrice de touches, rangée 4 / colonnes 4-7 — transparent pour l'utilisateur). Rôle contextuel selon le mode — le plus souvent B1 = ouvrir/fermer le menu FX. |
 | **Joystick + clic** | Contrôle continu (X/Y) contextuel — hauteur/vitesse/direction selon le mode — plus un appui (clic) pour valider/sélectionner. |
 | **P1 (Volume)** | Toujours le volume général, quel que soit le mode. |
 | **P3 (BPM)** | Toujours le tempo, quel que soit le mode. |
