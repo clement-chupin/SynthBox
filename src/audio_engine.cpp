@@ -3448,3 +3448,31 @@ void audioModularSetFilter(float cutoffHz, float resonance) {
     }
 }
 
+// audioSetEnvelope() hardcodes e.synth=SYNTH_CH, so it never reaches MOD3_OSCA_CH/
+// MOD3_OSCB_CH — same class of gap as the filter functions above. Bare eg0-only event
+// (not a full reconfigure) so it's safe to call while a note is held, same reasoning as
+// audioModularSetTable()/SetWtPos().
+void audioModularSetEnvelope(const EnvParams &env) {
+    if (!audioReady) return;
+    for (uint8_t ch : {(uint8_t)MOD3_OSCA_CH, (uint8_t)MOD3_OSCB_CH}) {
+        amy_event e = amy_default_event();
+        e.synth = ch;
+        e.eg0_times[0] = env.atk;  e.eg0_values[0] = 1.0f;
+        e.eg0_times[1] = env.dec;  e.eg0_values[1] = env.sus;
+        e.eg0_times[2] = env.rel;  e.eg0_values[2] = 0.0f;
+        amy_add_event(&e);
+    }
+}
+
+// audioSetPitchBend() also hardcodes e.synth=SYNTH_CH — MODE_MODULAR's joystick-Y "bend"
+// feature was silently a no-op ever since it was added, since it called that function
+// instead of targeting MOD3_OSCA_CH/MOD3_OSCB_CH. Same recurring gap as the two above.
+void audioModularSetPitchBend(float ratio) {
+    if (!audioReady) return;
+    for (uint8_t ch : {(uint8_t)MOD3_OSCA_CH, (uint8_t)MOD3_OSCB_CH}) {
+        amy_event e = amy_default_event();
+        e.synth = ch; e.pitch_bend = ratio;
+        amy_add_event(&e);
+    }
+}
+

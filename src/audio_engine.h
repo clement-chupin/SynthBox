@@ -216,3 +216,5 @@ void audioModularNoteOn(uint8_t note, float vel, float detuneSemisB);
 void audioModularNoteOff(uint8_t note);
 void audioModularAllNotesOff();
 void audioModularSetFilter(float cutoffHz, float resonance);
+void audioModularSetEnvelope(const EnvParams &env);
+void audioModularSetPitchBend(float ratio);

@@ -137,7 +137,11 @@ static float s_battVSmooth = 8.0f;
 // (AMY's WAVETABLE wave, independent morph position each, shared table + a small fixed
 // detune on B for thickness) -> shared filter -> LFO wobbling osc B's morph position for
 // that classic "evolving wavetable" motion. See audioModularOscInit() etc, audio_engine.cpp.
-static uint8_t  modOscTable  = 0;      // shared wavetable index for osc A+B (0-4)
+static uint8_t  modOscTable  = 0;      // osc A wavetable index (0-4) — P2
+static uint8_t  modOscBTable = 0;      // osc B wavetable index (0-4) — B3 cycles it independently
+static int8_t   modFocusIdx  = 0;      // 0=OscA 1=OscB 2=Filter 3=Env 4=LFO — which live curve is drawn large
+static bool     modNavMode   = false;  // joystick click toggles: false=play (JX=vel,JY=bend), true=nav (JX=focus)
+static float    modLfoPhase  = 0.0f;   // file-scope (was a local static in loop()) so drawScreen() can plot a live moving dot
 static float    modOscAPos   = 0.0f;   // osc A morph position (0-1)
 static float    modOscBPos   = 0.3f;   // osc B morph position, BASE value before LFO wobble
 static float    modCutoff    = 4000.0f;
@@ -2246,6 +2250,8 @@ static CtrlLabels ctrlLabelsFor(AppMode m) {
         }
         case MODE_LIGHT:
             return {"-", "N", "SPEED", "HUE", "INTENSITY", "-", "-", "-", "-"};
+        case MODE_MODULAR:
+            return {"OSCA WAVE", "OSCA POS", "OSCB POS", "FILT CUT", "LFO DEPTH", "FX", "ENV", "OSCB WAVE", "OCTAVE"};
         case MODE_LIFE:
             return {"INSTR", "RULE", "TICKRATE", "RESEED", "ENV", "PAUSE", "-", "-", "-"};
         case MODE_SWARM:
@@ -2521,10 +2527,11 @@ void switchMode(AppMode newMode) {
         mod2AlgoApply();
     }
     if (newMode==MODE_MODULAR && audioReady) {
-        modOscTable = 0; modOscAPos = 0.0f; modOscBPos = 0.3f;
+        modOscTable = 0; modOscBTable = 0; modOscAPos = 0.0f; modOscBPos = 0.3f;
+        modFocusIdx = 0; modNavMode = false; modLfoPhase = 0.0f;
         modCutoff = 4000.0f; modReso = 1.5f; modLfoRate = 0.3f; modLfoDepth = 0.0f;
         audioModularOscInit(MOD3_OSCA_CH, modOscTable);
-        audioModularOscInit(MOD3_OSCB_CH, modOscTable);
+        audioModularOscInit(MOD3_OSCB_CH, modOscBTable);
         audioModularSetWtPos(MOD3_OSCA_CH, modOscAPos);
         audioModularSetWtPos(MOD3_OSCB_CH, modOscBPos);
         audioModularSetFilter(modCutoff, modReso);
@@ -3048,6 +3055,8 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
                                        envTable[currentEnv].sus,
                                        (float)envTable[currentEnv].dec,
                                        (float)envTable[currentEnv].rel);
+                if (currentMode == MODE_MODULAR && audioReady)
+                    audioModularSetEnvelope(envTable[currentEnv]);
             } else if (opt >= 12 && opt < 16) {
                 noteMap.setOctave(kOctOpts[opt-12]);
             }
@@ -3754,6 +3763,16 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             // already fixed once for MOD2/STONE elsewhere in this file); fixed to
             // `btn==3`, matching the working STONE precedent.
             if (btn==3) noteMap.nextOctave();
+            // B2: envelope overlay — was entirely unwired (B2/B3 did nothing, matching
+            // template SYNTH's usual B2=ENV binding used by SYNTH/POKEMON/MOD2).
+            if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_ENV) s_overlay=OVERLAY_ENV; }
+            // B3: cycle Osc B's wavetable independently of Osc A's (P2) — a real second
+            // control rather than a redundant echo of P2, and true to the Serum-style
+            // "two independently-selected wavetable oscillators" idea this mode is based on.
+            if (btn==2) {
+                modOscBTable = (uint8_t)((modOscBTable+1)%5);
+                if (audioReady) audioModularSetTable(MOD3_OSCB_CH, modOscBTable);
+            }
             break;
         case MODE_GRANULAR2:
             // Btn2: cycle play mode NRM→LOP→FUL→SEQ→SQL→NRM
@@ -5850,31 +5869,140 @@ void drawScreen(bool blockWait) {
                 }
                 break;
             }
-            // ---- MODULAR — wavetable dual-osc synth (Serum-inspired MVP) ----
+            // ---- MODULAR/SERUM — wavetable dual-osc synth, visual editor ----
+            // Shows a live curve for whichever element (OscA/OscB/Filter/Env/LFO) is
+            // focused, so turning a pot has an immediate, legible on-screen consequence
+            // instead of just a number changing. The oscillator curves are a STYLIZED
+            // representative shape per wavetable+morph-position (not a literal readout of
+            // AMY's internal PCM wavetable bytes, which this UI layer has no cheap access
+            // to) — enough to see how the morph pot visibly deforms the wave, which is the
+            // actual goal (understanding the *shape* of the interaction, not exact samples).
             case MODE_MODULAR: {
                 static const char* kModWtNames[] = {"111","BRAIDS01","PPGWA00","SIN2SAW","VIRAL"};
-                oled.drawStr(0,0,"SERUM"); oled.drawHLine(0,9,128);
+                static const char* kFocusNames[] = {"OscA","OscB","Filt","Env","LFO"};
                 oled.setFont(u8g2_font_4x6_tf);
-                snprintf(buf,sizeof(buf),"P2 Table: %s  Oct:%+d",kModWtNames[modOscTable%5],noteMap.getOctave());
-                oled.drawStr(0,18,buf);
-                snprintf(buf,sizeof(buf),"P4 OscA pos: %.0f%%",modOscAPos*100.0f);
-                oled.drawStr(0,27,buf);
-                snprintf(buf,sizeof(buf),"P5 OscB pos: %.0f%%",modOscBPos*100.0f);
-                oled.drawStr(0,36,buf);
-                snprintf(buf,sizeof(buf),"P6 Filt:%uHz  P7 LFO:%.0f%%",(unsigned)modCutoff,modLfoDepth*100.0f);
-                oled.drawStr(0,45,buf);
-                oled.drawHLine(0,54,128);
-                oled.drawStr(0,62,"JY=bend  JX=velocity");
-                oled.setFont(u8g2_font_5x7_tf);
-                oled.drawHLine(0,68,128);
-                {
-                    float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                    int barW=(int)((jx+1.0f)*0.5f*128.0f);
-                    oled.drawFrame(0,70,128,6);
-                    if(barW>2) oled.drawBox(0,70,barW,6);
-                    snprintf(buf,sizeof(buf),"vel %.0f%%  Vol:%.0f%%",(0.8f+jx*0.6f)*100.0f,pots[0].value*100);
-                    oled.drawStr(0,84,buf);
+                snprintf(buf,sizeof(buf),"SERUM%s",modNavMode?" [NAV]":"");
+                oled.drawStr(0,6,buf);
+                snprintf(buf,sizeof(buf),"Oct:%+d",noteMap.getOctave());
+                oled.drawStr(90,6,buf);
+                oled.drawHLine(0,9,128);
+
+                // Tab strip: 5 elements, focused one filled.
+                const int tabW = 128/5;
+                for (int i=0;i<5;i++) {
+                    int tx = i*tabW;
+                    if (i==modFocusIdx) { oled.drawBox(tx,11,tabW-1,9); }
+                    else                { oled.drawFrame(tx,11,tabW-1,9); }
+                    oled.drawStr(tx+2,18,kFocusNames[i]);
                 }
+
+                // Curve area: x in [2,125], y in [24,74] (mid=49, half-height=25).
+                const int CX0=2, CX1=125, CY_MID=49, CY_HALF=24;
+                oled.drawHLine(CX0,CY_MID,CX1-CX0);
+                const int N=40;
+                int prevX=0, prevY=0; bool havePrev=false;
+                switch (modFocusIdx) {
+                    case 0: case 1: { // OscA / OscB waveform
+                        uint8_t table = (modFocusIdx==0) ? modOscTable : modOscBTable;
+                        float pos     = (modFocusIdx==0) ? modOscAPos  : modOscBPos;
+                        for (int i=0;i<=N;i++) {
+                            float t = (float)i/N, ph = t*2.0f*(float)PI;
+                            float base = sinf(ph), character;
+                            switch (table%5) {
+                                case 0: character = 2.0f*(t-floorf(t+0.5f)); break;                       // 111: saw-ish
+                                case 1: character = sinf(ph)+0.4f*sinf(ph*3.0f)-0.2f*sinf(ph*5.0f); break; // BRAIDS01: harmonic-rich
+                                case 2: character = (fmodf(t,1.0f)<0.5f)?1.0f:-1.0f; break;                // PPGWA00: pulse-ish
+                                case 3: character = base*(1.0f-t)+(2.0f*(t-floorf(t+0.5f)))*t; break;      // SIN2SAW: sine->saw
+                                default: character = sinf(ph)*sinf(ph*7.0f)*0.6f+sinf(ph*2.3f)*0.4f; break;// VIRAL: gritty
+                            }
+                            float y = constrain(base*(1.0f-pos)+character*pos, -1.0f, 1.0f);
+                            int px = CX0 + (int)(t*(CX1-CX0));
+                            int py = CY_MID - (int)(y*CY_HALF);
+                            if (havePrev) oled.drawLine(prevX,prevY,px,py);
+                            prevX=px; prevY=py; havePrev=true;
+                        }
+                        break;
+                    }
+                    case 2: { // Filter magnitude response, log-frequency x-axis
+                        for (int i=0;i<=N;i++) {
+                            float t = (float)i/N;
+                            float f = 20.0f*powf(1000.0f,t); // 20Hz..20kHz
+                            float ratio = f/fmaxf(modCutoff,20.0f);
+                            float mag = 1.0f/sqrtf(1.0f+powf(ratio,4.0f));
+                            if (modReso>1.0f) {
+                                float d = logf(fmaxf(ratio,0.001f));
+                                mag += expf(-d*d*8.0f)*(modReso-1.0f)*0.5f;
+                            }
+                            mag = constrain(mag, 0.0f, 1.3f);
+                            int px = CX0 + (int)(t*(CX1-CX0));
+                            int py = CY_MID+CY_HALF - (int)(mag/1.3f*(2*CY_HALF));
+                            if (havePrev) oled.drawLine(prevX,prevY,px,py);
+                            prevX=px; prevY=py; havePrev=true;
+                        }
+                        break;
+                    }
+                    case 3: { // ADSR envelope shape
+                        const EnvParams &env = envTable[currentEnv];
+                        float wA = constrain(env.atk/8.0f, 6.0f, 26.0f);
+                        float wD = constrain(env.dec/20.0f, 6.0f, 26.0f);
+                        float wS = 20.0f;
+                        float wR = constrain(env.rel/20.0f, 6.0f, 30.0f);
+                        float total = wA+wD+wS+wR;
+                        float scale = (CX1-CX0)/total;
+                        int x0=CX0, yBot=CY_MID+CY_HALF, yTop=CY_MID-CY_HALF;
+                        int x1=x0+(int)(wA*scale);
+                        int ySus=yBot-(int)(env.sus*(yBot-yTop));
+                        int x2=x1+(int)(wD*scale);
+                        int x3=x2+(int)(wS*scale);
+                        int x4=x3+(int)(wR*scale);
+                        oled.drawLine(x0,yBot,x1,yTop);
+                        oled.drawLine(x1,yTop,x2,ySus);
+                        oled.drawLine(x2,ySus,x3,ySus);
+                        oled.drawLine(x3,ySus,x4,yBot);
+                        break;
+                    }
+                    default: { // LFO: sine shaped by depth, with a live phase dot
+                        for (int i=0;i<=N;i++) {
+                            float t = (float)i/N;
+                            float y = sinf(t*2.5f*2.0f*(float)PI) * modLfoDepth;
+                            int px = CX0 + (int)(t*(CX1-CX0));
+                            int py = CY_MID - (int)(y*CY_HALF);
+                            if (havePrev) oled.drawLine(prevX,prevY,px,py);
+                            prevX=px; prevY=py; havePrev=true;
+                        }
+                        float tp = modLfoPhase/(2.0f*(float)PI);
+                        tp = tp - floorf(tp);
+                        int dpx = CX0 + (int)(fmodf(tp*2.5f,1.0f)*(CX1-CX0));
+                        int dpy = CY_MID - (int)(sinf(modLfoPhase)*modLfoDepth*CY_HALF);
+                        oled.drawDisc(dpx,dpy,3);
+                        break;
+                    }
+                }
+
+                // Live readout + which pot/button controls the focused element.
+                oled.setFont(u8g2_font_4x6_tf);
+                switch (modFocusIdx) {
+                    case 0: snprintf(buf,sizeof(buf),"P2 %s pos:%.0f%%",kModWtNames[modOscTable%5],modOscAPos*100.0f); break;
+                    case 1: snprintf(buf,sizeof(buf),"B3 %s pos:P5=%.0f%%",kModWtNames[modOscBTable%5],modOscBPos*100.0f); break;
+                    case 2: snprintf(buf,sizeof(buf),"P6 Cut:%uHz Res:%.1f",(unsigned)modCutoff,modReso); break;
+                    case 3: snprintf(buf,sizeof(buf),"B2 A:%d D:%d S:%.0f%% R:%d",envTable[currentEnv].atk,envTable[currentEnv].dec,envTable[currentEnv].sus*100.0f,envTable[currentEnv].rel); break;
+                    default: snprintf(buf,sizeof(buf),"P7 Depth:%.0f%% Rate:%.1fHz",modLfoDepth*100.0f,modLfoRate); break;
+                }
+                oled.drawStr(0,84,buf);
+                oled.drawHLine(0,88,128);
+                if (modNavMode) {
+                    oled.drawStr(0,98,"JX: change element");
+                    oled.drawStr(0,107,"Click: back to play");
+                } else {
+                    float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                    int barW=(int)((jx+1.0f)*0.5f*100.0f);
+                    oled.drawFrame(0,92,100,6);
+                    if(barW>2) oled.drawBox(0,92,barW,6);
+                    snprintf(buf,sizeof(buf),"vel%.0f%%",(0.8f+jx*0.6f)*100.0f);
+                    oled.drawStr(102,97,buf);
+                    oled.drawStr(0,107,"JY:bend  Click:nav");
+                }
+                oled.drawStr(0,116,"B1:FX  B2:Env  B3:OscB  B4:Oct");
                 break;
             }
             // ---- I303 — polyphonic TB-303 ----
@@ -8508,7 +8636,10 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             uint8_t note = noteMap.getMidiNote(row, col);
             activeNotes[row][col] = pressed ? note : 0;
             if (pressed) {
-                float jx = constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                // In nav mode JX is busy browsing elements, not expressive velocity —
+                // fall back to a fixed, still-musical velocity rather than reading a
+                // joystick position that means something else right now.
+                float jx = modNavMode ? 0.0f : constrain(cachedJoyX/64.0f,-1.0f,1.0f);
                 audioModularNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f), MOD_OSCB_DETUNE_SEMIS);
             } else {
                 audioModularNoteOff(note);
@@ -9368,6 +9499,13 @@ void loop() {
                 }
                 joyLongFired = true;
             }
+        } else if (currentMode==MODE_MODULAR) {
+            // Toggle between PLAY (JX=velocity, JY=pitch-bend — the performance role the
+            // joystick has everywhere else) and NAV (JX browses which element's live curve
+            // is shown large on screen: OscA/OscB/Filter/Env/LFO) — clicking again returns
+            // to play. Without this split, JX/JY couldn't do both jobs at once.
+            modNavMode = !modNavMode;
+            joyLongFired = true;
         } else {
             audioAllNotesOff(); omniRoot=0xFF; omniStrumPos=-1;
             menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true;
@@ -10944,18 +11082,17 @@ void loop() {
                     break;
                 }
                 case MODE_MODULAR: {
-                    // P2=wavetable (shared A+B)  P4=OscA morph pos  P5=OscB morph pos
-                    // P6=filter cutoff  P7=LFO depth (wobbles OscB's morph position —
-                    // fixed destination for this MVP; see the 10ms tick below for the
-                    // actual modulation, which reuses gModSlots[4], the slot reserved
-                    // for the modular synth's LFO source in the Section-1 mod engine).
+                    // P2=OscA wavetable (B3 cycles OscB's independently)  P4=OscA morph pos
+                    // P5=OscB morph pos  P6=filter cutoff  P7=LFO depth (wobbles OscB's morph
+                    // position — fixed destination for this MVP; see the 10ms tick below for
+                    // the actual modulation, which reuses gModSlots[4], the slot reserved for
+                    // the modular synth's LFO source in the Section-1 mod engine).
                     static float lpm[5]={-1,-1,-1,-1,-1};
                     if(fabsf(pots[1].value-lpm[0])>0.01f){
                         uint8_t nt=(uint8_t)(pots[1].value*4.99f);
                         if(nt!=modOscTable){
                             modOscTable=nt;
                             audioModularSetTable(MOD3_OSCA_CH, modOscTable);
-                            audioModularSetTable(MOD3_OSCB_CH, modOscTable);
                         }
                         lpm[0]=pots[1].value;
                     }
@@ -11381,15 +11518,18 @@ void loop() {
             }
         }
 
-        // MODULAR: joystick Y pitch bend + LFO vibrato
+        // MODULAR: joystick Y pitch bend (play mode only — in nav mode JY is free/unused
+        // while browsing elements) + LFO vibrato (always runs, it's an internal modulation
+        // source, not joystick-driven). Was silently inert before: audioSetPitchBend()
+        // only ever reaches SYNTH_CH, never this mode's MOD3_OSCA_CH/MOD3_OSCB_CH — fixed
+        // by routing through the new audioModularSetPitchBend() instead.
         if(currentMode==MODE_MODULAR && !menuOpen && audioReady){
-            static float modLfoPhase=0.0f;
             modLfoPhase += modLfoRate * 2.0f * (float)M_PI * 0.01f;
             if(modLfoPhase > 2.0f*(float)M_PI) modLfoPhase -= 2.0f*(float)M_PI;
-            float jy = cachedJoyY / 64.0f;
+            float jy = modNavMode ? 0.0f : cachedJoyY / 64.0f;
             float baseBend = (fabsf(jy) < 0.15f) ? 0.0f : -jy * 2.0f;
             float vibrato = (modLfoDepth > 0.01f) ? sinf(modLfoPhase) * modLfoDepth : 0.0f;
-            audioSetPitchBend(powf(2.0f, (baseBend + vibrato) / 12.0f));
+            audioModularSetPitchBend(powf(2.0f, (baseBend + vibrato) / 12.0f));
         }
 
         // 303 portamento slide: interpolate pitch_bend from t303SlideFrom to t303SlideTo
@@ -11879,6 +12019,19 @@ void loop() {
                 else if (ny > 0.4f && genVoice < GEN_VOICE_COUNT-1) { genVoice++; vChanged = true; }
                 if (vChanged && audioReady) genApplyVoice();
                 if (changed || vChanged) lastGenNav = millis();
+            }
+        }
+
+        // SERUM (MODE_MODULAR) nav mode: JX browses which element's live curve is shown
+        // large (OscA/OscB/Filter/Env/LFO) — joystick click (handled in the click block
+        // above) toggles into this mode; JY is intentionally unused here (freed up rather
+        // than repurposed, so there's exactly one thing to learn: nav mode moves JX only).
+        if (currentMode == MODE_MODULAR && modNavMode && !menuOpen) {
+            static unsigned long lastModNav = 0;
+            if (millis() - lastModNav >= 220) {
+                float nx = constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                if (nx < -0.4f && modFocusIdx > 0) { modFocusIdx--; lastModNav = millis(); }
+                else if (nx > 0.4f && modFocusIdx < 4) { modFocusIdx++; lastModNav = millis(); }
             }
         }
 

@@ -2079,24 +2079,39 @@ int16_t * amy_fill_buffer() {
         float g = amy_ladder_cutoff / (AMY_SAMPLE_RATE * 0.5f);
         if (g < 0.001f) g = 0.001f;
         if (g > 0.999f) g = 0.999f;
-        float drive = 1.0f + amy_ladder_resonance * 0.35f;
-        // The acid-tuning pass above pushes resonance/drive far enough that the
-        // feedback loop can become a genuine self-oscillator ("resonates infinitely").
-        // A first attempt bled a tiny bit of energy out of the feedback tap each
-        // sample (a loss factor <1), reasoning that would eventually force convergence
-        // — measured (via a standalone harness matching this exact recursion) that it
-        // does NOT: once excited past a fairly low amplitude, tanh(s[3]*resonance)
-        // saturates close enough to ±1 that shrinking s[3] a little barely shrinks the
-        // feedback term at all, so the loop keeps re-exciting itself indefinitely
-        // regardless of how strong a constant loss is applied (tested down to 0.98/
-        // sample — 2% loss *every sample* — with no change in sustained amplitude).
-        // The fix that actually works: once the actual INPUT has been silent for a
-        // sustained stretch (LADDER_SILENCE_GATE samples), cut the feedback tap to
-        // exactly 0 — this isn't a loss, it's removing the loop's only energy source,
-        // so what remains is an ordinary non-resonant 4-pole lowpass with zero input,
-        // which decays to true silence within a handful of samples (time constant
-        // ~1/g). Re-engages instantly the moment new input arrives, so it never dulls
-        // legitimate playing — only the "forgot to turn FILT off" infinite tail.
+        float drive = 1.0f + amy_ladder_resonance * 0.15f;
+        // ---- History of this block (read before changing the tuning again) ----
+        // 1) First cut: tanh() on every one of the 4 stages, inside the feedback loop.
+        //    Stacking that many nonlinearities in one feedback loop is a textbook
+        //    recipe for chaos (non-periodic, sensitive-to-initial-conditions output)
+        //    rather than a musical self-oscillator — fixed by reducing to ONE
+        //    nonlinearity in the loop.
+        // 2) That one nonlinearity was tanh(s[3]*amy_ladder_resonance) on the feedback
+        //    tap. Measured via a headless RMS sweep (resonance 0.5..12, white-noise
+        //    input, real compiled path) that s[3]'s typical amplitude here (~0.1-0.3)
+        //    meant ANY resonance above ~1.0 already saturated that tanh to near ±1 —
+        //    so raising resonance further barely changed the feedback term, and the
+        //    resonance control was nearly inert across ~95% of its range (measured:
+        //    RMS only crept from ~1150 to ~1900 across the WHOLE 0.5-12 sweep).
+        // 3) Moving the multiply outside the tanh (`tanh(s[3])*resonance`-style, or
+        //    scaling elsewhere) doesn't fix it either if the ceiling stays ±1: ANY
+        //    single saturator with a fixed ±1 output range caps the whole loop's
+        //    steady-state amplitude regardless of how much gain is fed into it, which
+        //    is what actually starved the resonant buildup — not which exact node
+        //    the multiply happened at. The fix that actually works: give the loop's
+        //    one saturator real HEADROOM (LADDER_HEADROOM, well above the ±1 a typical
+        //    filtered signal sits at) so a genuinely growing resonant sinusoid has
+        //    room to build up across many round-trips through the 4 stages before
+        //    the limiter engages — only THEN does resonance produce an audibly
+        //    dominant, self-oscillating peak instead of a barely-there wiggle.
+        #define LADDER_HEADROOM 2.2f
+        // Silence gate: once the actual INPUT has been silent for a sustained stretch
+        // (LADDER_SILENCE_GATE samples), cut the feedback tap to exactly 0 — removing
+        // the loop's only energy source so a self-oscillating filter left on with no
+        // input decays to true silence (time constant ~1/g) instead of ringing forever.
+        // A constant per-sample loss factor was tried first and does NOT work once the
+        // loop is saturating (measured: no change in sustained amplitude down to 2%
+        // loss/sample) — only removing the energy source outright does.
         #define LADDER_SILENCE_THRESH  0.0008f
         #define LADDER_SILENCE_GATE    3500   // ~79ms at 44100Hz
         int n = AMY_BLOCK_SIZE * AMY_NCHANS;
@@ -2108,19 +2123,9 @@ int16_t * amy_fill_buffer() {
                 float rawin = S2F(buf[i]);
                 if (fabsf(rawin) > LADDER_SILENCE_THRESH) silence = 0;
                 else if (silence < LADDER_SILENCE_GATE + 1) silence++;
-                float fb = (silence > LADDER_SILENCE_GATE) ? 0.0f : tanhf(s[3] * amy_ladder_resonance);
-                float in = rawin * drive - fb;
-                // Only ONE nonlinearity inside the feedback loop (the input-drive
-                // saturation below) plus the feedback tap's own tanh() above — stages
-                // 1-3 are plain linear one-pole lowpass. An earlier tuning pass put a
-                // tanh() on every one of the 4 stages, stacking 4 nonlinearities inside
-                // a single feedback loop; that is the textbook recipe for a chaotic
-                // (non-periodic, sensitive-to-initial-conditions) ladder filter rather
-                // than a musical self-oscillator, and is what made high-resonance LDR
-                // sound "random"/drifting instead of settling into a stable pitched
-                // squeal like a real acid filter. A real analog ladder's grit comes from
-                // the drive and feedback stages, not from re-saturating every pole.
-                s[0] += g * (tanhf(in * 1.3f) - s[0]);
+                float fbRaw = (silence > LADDER_SILENCE_GATE) ? 0.0f : (s[3] * amy_ladder_resonance);
+                float in = rawin * drive - fbRaw;
+                s[0] += g * (tanhf(in / LADDER_HEADROOM) * LADDER_HEADROOM - s[0]);
                 s[1] += g * (s[0] - s[1]);
                 s[2] += g * (s[1] - s[2]);
                 s[3] += g * (s[2] - s[3]);
