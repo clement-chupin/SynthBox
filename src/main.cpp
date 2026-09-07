@@ -140,7 +140,10 @@ static float s_battVSmooth = 8.0f;
 static uint8_t  modOscTable  = 0;      // osc A wavetable index (0-4) — P2
 static uint8_t  modOscBTable = 0;      // osc B wavetable index (0-4) — B3 cycles it independently
 static int8_t   modFocusIdx  = 0;      // 0=OscA 1=OscB 2=Filter 3=Env 4=LFO — which live curve is drawn large
-static bool     modNavMode   = false;  // joystick click toggles: false=play (JX=vel,JY=bend), true=nav (JX=focus)
+                                        // and which element JY modifies. JX always cycles
+                                        // this; the joystick has no performance role in this
+                                        // mode (no velocity/bend) — it's purely a live
+                                        // parameter-shaping control paired with the curve.
 static float    modLfoPhase  = 0.0f;   // file-scope (was a local static in loop()) so drawScreen() can plot a live moving dot
 static float    modOscAPos   = 0.0f;   // osc A morph position (0-1)
 static float    modOscBPos   = 0.3f;   // osc B morph position, BASE value before LFO wobble
@@ -1682,7 +1685,7 @@ void applyFxEffect(uint8_t fx) {
             // amy.c's bus-0 processing block for the actual "exotic" nonlinear rolloff.
             audioSetAllFiltersT(on && !ladder ? cut : 0.0f, on && !ladder ? res : 1.5f,
                                 (on && !ladder) ? kFiltAMY[ti] : FILTER_LPF24);
-            audioSetLadderFilter(cut, res * 3.5f, on && ladder);  // *3.5: wider effective resonance range than the shared 0-3 param slot (more headroom for acid-style self-oscillation), safe since the ladder's tanh feedback can't blow up regardless of gain
+            audioSetLadderFilter(cut, res * 4.5f, on && ladder);  // *4.5: maps the shared 0.5-3.0 param range onto ~2.25-13.5, the smooth/dramatic part of the measured resonance-vs-RMS curve for this filter's feedforward design (RMS climbs ~7x smoothly across that span before the safety soft-clip starts compressing further gains past ~15)
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
             // audioSetAllFiltersT() above reaches every channel including T303_CH, so
             // turning the FX LPF off leaves the 303 stuck on the FX's last cutoff/type
@@ -2528,7 +2531,7 @@ void switchMode(AppMode newMode) {
     }
     if (newMode==MODE_MODULAR && audioReady) {
         modOscTable = 0; modOscBTable = 0; modOscAPos = 0.0f; modOscBPos = 0.3f;
-        modFocusIdx = 0; modNavMode = false; modLfoPhase = 0.0f;
+        modFocusIdx = 0; modLfoPhase = 0.0f;
         modCutoff = 4000.0f; modReso = 1.5f; modLfoRate = 0.3f; modLfoDepth = 0.0f;
         audioModularOscInit(MOD3_OSCA_CH, modOscTable);
         audioModularOscInit(MOD3_OSCB_CH, modOscBTable);
@@ -5881,8 +5884,7 @@ void drawScreen(bool blockWait) {
                 static const char* kModWtNames[] = {"111","BRAIDS01","PPGWA00","SIN2SAW","VIRAL"};
                 static const char* kFocusNames[] = {"OscA","OscB","Filt","Env","LFO"};
                 oled.setFont(u8g2_font_4x6_tf);
-                snprintf(buf,sizeof(buf),"SERUM%s",modNavMode?" [NAV]":"");
-                oled.drawStr(0,6,buf);
+                oled.drawStr(0,6,"SERUM");
                 snprintf(buf,sizeof(buf),"Oct:%+d",noteMap.getOctave());
                 oled.drawStr(90,6,buf);
                 oled.drawHLine(0,9,128);
@@ -5979,29 +5981,19 @@ void drawScreen(bool blockWait) {
                     }
                 }
 
-                // Live readout + which pot/button controls the focused element.
+                // Live readout for the focused element, naming what JY does to it.
                 oled.setFont(u8g2_font_4x6_tf);
                 switch (modFocusIdx) {
-                    case 0: snprintf(buf,sizeof(buf),"P2 %s pos:%.0f%%",kModWtNames[modOscTable%5],modOscAPos*100.0f); break;
-                    case 1: snprintf(buf,sizeof(buf),"B3 %s pos:P5=%.0f%%",kModWtNames[modOscBTable%5],modOscBPos*100.0f); break;
-                    case 2: snprintf(buf,sizeof(buf),"P6 Cut:%uHz Res:%.1f",(unsigned)modCutoff,modReso); break;
-                    case 3: snprintf(buf,sizeof(buf),"B2 A:%d D:%d S:%.0f%% R:%d",envTable[currentEnv].atk,envTable[currentEnv].dec,envTable[currentEnv].sus*100.0f,envTable[currentEnv].rel); break;
-                    default: snprintf(buf,sizeof(buf),"P7 Depth:%.0f%% Rate:%.1fHz",modLfoDepth*100.0f,modLfoRate); break;
+                    case 0: snprintf(buf,sizeof(buf),"P2 %s  JY pos:%.0f%%",kModWtNames[modOscTable%5],modOscAPos*100.0f); break;
+                    case 1: snprintf(buf,sizeof(buf),"B3 %s  JY pos:%.0f%%",kModWtNames[modOscBTable%5],modOscBPos*100.0f); break;
+                    case 2: snprintf(buf,sizeof(buf),"P6 Cut:%uHz  JY Res:%.1f",(unsigned)modCutoff,modReso); break;
+                    case 3: snprintf(buf,sizeof(buf),"JY:presetA:%d D:%d S:%.0f%% R:%d",envTable[currentEnv].atk,envTable[currentEnv].dec,envTable[currentEnv].sus*100.0f,envTable[currentEnv].rel); break;
+                    default: snprintf(buf,sizeof(buf),"P7 Depth:%.0f%%  JY Rate:%.1fHz",modLfoDepth*100.0f,modLfoRate); break;
                 }
                 oled.drawStr(0,84,buf);
                 oled.drawHLine(0,88,128);
-                if (modNavMode) {
-                    oled.drawStr(0,98,"JX: change element");
-                    oled.drawStr(0,107,"Click: back to play");
-                } else {
-                    float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                    int barW=(int)((jx+1.0f)*0.5f*100.0f);
-                    oled.drawFrame(0,92,100,6);
-                    if(barW>2) oled.drawBox(0,92,barW,6);
-                    snprintf(buf,sizeof(buf),"vel%.0f%%",(0.8f+jx*0.6f)*100.0f);
-                    oled.drawStr(102,97,buf);
-                    oled.drawStr(0,107,"JY:bend  Click:nav");
-                }
+                oled.drawStr(0,98,"JX: change element");
+                oled.drawStr(0,107,"JY: modify it");
                 oled.drawStr(0,116,"B1:FX  B2:Env  B3:OscB  B4:Oct");
                 break;
             }
@@ -6722,7 +6714,12 @@ void drawScreen(bool blockWait) {
                 const int cellW = 15, cellH = 15, ox = 2, oy = 18;
                 for (int r=0;r<KBD_NOTE_ROWS;r++) {
                     for (int c=0;c<KBD_COLS;c++) {
-                        int x = ox + c*cellW, y = oy + (KBD_NOTE_ROWS-1-r)*cellH; // row0=bottom
+                        // Column flipped (KBD_COLS-1-c) to match the physical key layout —
+                        // same convention every other grid renderer in this file uses (LED
+                        // render, DRUM2's OLED grid, etc.); this one was the odd one out,
+                        // drawing column c straight through and mirroring the grid left-right
+                        // relative to which physical key actually toggled a cell.
+                        int x = ox + (KBD_COLS-1-c)*cellW, y = oy + (KBD_NOTE_ROWS-1-r)*cellH; // row0=bottom
                         if (lifeGrid[r][c]) oled.drawBox(x, y, cellW-2, cellH-2);
                         else                oled.drawFrame(x, y, cellW-2, cellH-2);
                     }
@@ -6782,10 +6779,12 @@ void drawScreen(bool blockWait) {
                 }
                 oled.drawStr(0, 20, gd);
 
-                // 8-column strip: highlight the column the generator most recently landed on
+                // 8-column strip: highlight the column the generator most recently landed
+                // on. Column flipped (KBD_COLS-1-c) to match the physical key layout, same
+                // convention the LED renderer for this mode already uses below.
                 const int cellW = 14, cellH = 24, ox = 4, oy = 30;
                 for (int c=0;c<KBD_COLS;c++) {
-                    int x = ox + c*cellW;
+                    int x = ox + (KBD_COLS-1-c)*cellW;
                     if (c == genLastCol) oled.drawBox(x, oy, cellW-3, cellH);
                     else                 oled.drawFrame(x, oy, cellW-3, cellH);
                 }
@@ -8636,11 +8635,10 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             uint8_t note = noteMap.getMidiNote(row, col);
             activeNotes[row][col] = pressed ? note : 0;
             if (pressed) {
-                // In nav mode JX is busy browsing elements, not expressive velocity —
-                // fall back to a fixed, still-musical velocity rather than reading a
-                // joystick position that means something else right now.
-                float jx = modNavMode ? 0.0f : constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                audioModularNoteOn(note, constrain(0.8f+jx*0.6f, 0.05f, 1.5f), MOD_OSCB_DETUNE_SEMIS);
+                // Fixed velocity — the joystick has no performance role in this mode
+                // (JX/JY modify the focused element's parameters instead, see the
+                // MODE_MODULAR joystick-nav block in loop()).
+                audioModularNoteOn(note, 0.85f, MOD_OSCB_DETUNE_SEMIS);
             } else {
                 audioModularNoteOff(note);
             }
@@ -9499,13 +9497,6 @@ void loop() {
                 }
                 joyLongFired = true;
             }
-        } else if (currentMode==MODE_MODULAR) {
-            // Toggle between PLAY (JX=velocity, JY=pitch-bend — the performance role the
-            // joystick has everywhere else) and NAV (JX browses which element's live curve
-            // is shown large on screen: OscA/OscB/Filter/Env/LFO) — clicking again returns
-            // to play. Without this split, JX/JY couldn't do both jobs at once.
-            modNavMode = !modNavMode;
-            joyLongFired = true;
         } else {
             audioAllNotesOff(); omniRoot=0xFF; omniStrumPos=-1;
             menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true;
@@ -11518,18 +11509,17 @@ void loop() {
             }
         }
 
-        // MODULAR: joystick Y pitch bend (play mode only — in nav mode JY is free/unused
-        // while browsing elements) + LFO vibrato (always runs, it's an internal modulation
-        // source, not joystick-driven). Was silently inert before: audioSetPitchBend()
-        // only ever reaches SYNTH_CH, never this mode's MOD3_OSCA_CH/MOD3_OSCB_CH — fixed
-        // by routing through the new audioModularSetPitchBend() instead.
+        // MODULAR: LFO vibrato only — an internal modulation source, not joystick-driven
+        // (the joystick has no performance role in this mode; see the MODE_MODULAR
+        // joystick-nav block below for what JX/JY actually do: modify the focused
+        // element's parameters). audioModularSetPitchBend() itself was fixed separately:
+        // the generic audioSetPitchBend() only ever reaches SYNTH_CH, never this mode's
+        // MOD3_OSCA_CH/MOD3_OSCB_CH.
         if(currentMode==MODE_MODULAR && !menuOpen && audioReady){
             modLfoPhase += modLfoRate * 2.0f * (float)M_PI * 0.01f;
             if(modLfoPhase > 2.0f*(float)M_PI) modLfoPhase -= 2.0f*(float)M_PI;
-            float jy = modNavMode ? 0.0f : cachedJoyY / 64.0f;
-            float baseBend = (fabsf(jy) < 0.15f) ? 0.0f : -jy * 2.0f;
             float vibrato = (modLfoDepth > 0.01f) ? sinf(modLfoPhase) * modLfoDepth : 0.0f;
-            audioModularSetPitchBend(powf(2.0f, (baseBend + vibrato) / 12.0f));
+            audioModularSetPitchBend(powf(2.0f, vibrato / 12.0f));
         }
 
         // 303 portamento slide: interpolate pitch_bend from t303SlideFrom to t303SlideTo
@@ -12022,16 +12012,44 @@ void loop() {
             }
         }
 
-        // SERUM (MODE_MODULAR) nav mode: JX browses which element's live curve is shown
-        // large (OscA/OscB/Filter/Env/LFO) — joystick click (handled in the click block
-        // above) toggles into this mode; JY is intentionally unused here (freed up rather
-        // than repurposed, so there's exactly one thing to learn: nav mode moves JX only).
-        if (currentMode == MODE_MODULAR && modNavMode && !menuOpen) {
-            static unsigned long lastModNav = 0;
-            if (millis() - lastModNav >= 220) {
-                float nx = constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                if (nx < -0.4f && modFocusIdx > 0) { modFocusIdx--; lastModNav = millis(); }
-                else if (nx > 0.4f && modFocusIdx < 4) { modFocusIdx++; lastModNav = millis(); }
+        // SERUM (MODE_MODULAR): the joystick has no performance role here (no velocity,
+        // no pitch-bend) — JX browses which element's live curve is focused (OscA/OscB/
+        // Filter/Env/LFO), JY modifies THAT element's parameter directly. Two of these
+        // (filter resonance, LFO rate) had no live control at all before this — pots
+        // were already full (P2/P4-P7), so the joystick is what makes them reachable.
+        if (currentMode == MODE_MODULAR && !menuOpen) {
+            static unsigned long lastModFocusNav = 0, lastModParamNav = 0;
+            float nx = constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+            float ny = constrain(cachedJoyY/64.0f,-1.0f,1.0f);
+            if (millis() - lastModFocusNav >= 220) {
+                if (nx < -0.4f && modFocusIdx > 0) { modFocusIdx--; lastModFocusNav = millis(); }
+                else if (nx > 0.4f && modFocusIdx < 4) { modFocusIdx++; lastModFocusNav = millis(); }
+            }
+            if (audioReady && fabsf(ny) > 0.15f) {
+                switch (modFocusIdx) {
+                    case 0: // OscA morph position — continuous
+                        modOscAPos = constrain(modOscAPos + ny*0.02f, 0.0f, 1.0f);
+                        audioModularSetWtPos(MOD3_OSCA_CH, modOscAPos);
+                        break;
+                    case 1: // OscB morph position — continuous
+                        modOscBPos = constrain(modOscBPos + ny*0.02f, 0.0f, 1.0f);
+                        audioModularSetWtPos(MOD3_OSCB_CH, modOscBPos);
+                        break;
+                    case 2: // Filter resonance — continuous, was pot-less until now
+                        modReso = constrain(modReso + ny*0.08f, 0.5f, 6.0f);
+                        audioModularSetFilter(modCutoff, modReso);
+                        break;
+                    case 3: // Envelope preset — discrete, same debounce as focus-nav
+                        if (millis() - lastModParamNav >= 250) {
+                            currentEnv = (EnvPreset)((currentEnv + (ny>0?1:ENV_PRESET_COUNT-1)) % ENV_PRESET_COUNT);
+                            audioModularSetEnvelope(envTable[currentEnv]);
+                            lastModParamNav = millis();
+                        }
+                        break;
+                    default: // LFO rate — continuous, was pot-less until now
+                        modLfoRate = constrain(modLfoRate + ny*0.05f, 0.05f, 10.0f);
+                        break;
+                }
             }
         }
 

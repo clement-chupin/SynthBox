@@ -169,21 +169,18 @@ float amy_wavefold_pos_only = 0.0f;
 // Global wavefolder on bus 0 (REP FX): 1.0=dry. gain = 1/threshold. Applied after bus merge.
 float amy_wavefold_gain_bus0 = 1.0f;
 
-// Global ladder-style resonant LPF on bus 0 (FILT FX, Typ=LADDER). Set from
-// audio_engine.cpp via audioSetLadderFilter(); applied after the bus-0 wavefolder,
-// before per-bus FX (EQ/chorus/reverb/delay). AMY's own filter types (FILTER_LPF/HPF/
-// BPF/LPF24) are plain linear biquads (LPF24 is just the LPF biquad run twice) with
-// no resonant self-oscillation or saturation modeling — this is a separate, custom
-// 4-pole one-pole cascade with tanh-saturated feedback for that "exotic" nonlinear
-// rolloff character instead. Stable at any resonance (tanh bounds the loop), so there
-// is no hard ceiling on amy_ladder_resonance.
+// Global resonant LPF on bus 0 (FILT FX, Typ=LADDER). Set from audio_engine.cpp via
+// audioSetLadderFilter(); applied after the bus-0 wavefolder, before per-bus FX
+// (EQ/chorus/reverb/delay). AMY's own filter types (FILTER_LPF/HPF/BPF/LPF24) are
+// plain linear biquads (LPF24 is just the LPF biquad run twice) with no resonant
+// peak or saturation modeling — this is a separate, custom two-cascade design (see
+// the bus-0 ladder block below, amy_ladder_on > 0.5f) with a feedforward-only
+// resonance bump instead, chosen specifically because it has no feedback loop and
+// so cannot self-oscillate or get stuck ringing regardless of amy_ladder_resonance.
 float amy_ladder_on        = 0.0f;
 float amy_ladder_cutoff    = 20000.0f;
 float amy_ladder_resonance = 0.0f;
 static float amy_ladder_stage[AMY_NCHANS][4];
-// Consecutive near-silent samples per channel — see the silence gate at the bus-0
-// ladder block below (amy_ladder_on > 0.5f) for why this is needed.
-static int amy_ladder_silence[AMY_NCHANS];
 
 // Global bus-0 ring modulator (RINGMOD FX): multiplies the signal by a sine carrier.
 // Set from audio_engine.cpp via audioSetRingmod(); applied right after the bus-0
@@ -2042,96 +2039,62 @@ int16_t * amy_fill_buffer() {
         }
     }
 
-    // Global ladder-style resonant LPF on bus 0 (FILT FX, Typ=LADDER) — see the
-    // amy_ladder_* declarations above for why this exists as custom DSP rather than
-    // an AMY filter_type. Four one-pole lowpass stages in series (unconditionally
-    // stable for g in [0,1]: each stage is a convex blend of its previous state and a
-    // tanh()-bounded target), with the last stage's output fed back to the input
-    // through its own tanh() — that saturated feedback is what gives high resonance a
-    // musically-compressing self-oscillation instead of a linear blow-up, and the
-    // per-stage tanh() (driven above unity gain so the saturation actually engages)
-    // is what makes the rolloff itself "exotic" rather than a textbook straight
-    // -24dB/octave line. Persistent per-channel state (amy_ladder_stage) is required
-    // because this runs on the already-interleaved stereo buffer — mixing L/R through
-    // one shared state would cross-contaminate the two channels' filter memory.
+    // Global resonant LPF on bus 0 (FILT FX, Typ=LADDER) — see the amy_ladder_*
+    // declarations above for why this exists as custom DSP rather than an AMY
+    // filter_type (no ladder topology exists there).
     //
-    // "Acid" tuning: a real TB-303-style ladder gets grittier as resonance rises, not
-    // just narrower — the resonance knob and input drive are coupled here so higher
-    // settings sound distinctly distorted/deformed instead of just a peakier LPF (this
-    // is what previously made LDR feel "too similar to LPF"). The per-stage gain (1.4
-    // -> 2.0) pushes the internal tanh()s further into saturation for more audible
-    // harmonic grit, and amy_ladder_resonance's own caller-side range was widened to
-    // give the self-oscillation more headroom (see audioSetLadderFilter()/main.cpp).
+    // ---- History (read before changing this again) ----
+    // Three earlier designs all put the resonance inside a FEEDBACK loop (classic
+    // Moog-ladder style: last stage's output subtracted back from the input) and
+    // fought the same family of problems every time: stacking a saturator on every
+    // stage made it chaotic; a single saturator on the feedback tap saturated so
+    // early that resonance did almost nothing across ~95% of its range; giving that
+    // saturator more headroom fixed the range but then let genuine self-oscillation
+    // build up — which is exactly what a real acid filter does, but here it turned
+    // out harsh/shriek-y at high cutoffs and could occasionally get stuck ringing
+    // (a feedback loop's state can only be forced to zero by an explicit gate,
+    // which is fragile against anything that keeps "input" technically non-silent,
+    // e.g. a reverb/delay tail sharing the same bus).
     //
-    // SAMPLE is a fixed-point s8.23 value (AMY_USE_FIXEDPOINT is unconditionally on —
-    // see amy.h), not a plain float in -1..1: this block was reading/writing buf[i]
-    // directly into the tanh() math with no S2F()/F2S() conversion, so a real signal
-    // (whose raw s8.23 value is on the order of millions) drove every tanh() straight
-    // into ±1 saturation regardless of actual level, and writing that small float
-    // result (~±0.1-0.9) back into an s8.23 slot truncated to 0 almost every sample —
-    // audibly, this made the whole filter collapse to near-total silence once resonance
-    // pushed the tanh()s deep enough into saturation to matter (exactly the range this
-    // acid-tuning pass needed). Converting through S2F()/F2S() at the boundary is what
-    // the wavefold/ringmod/compressor blocks around this one already do (by a different,
-    // self-normalizing means); this filter has cross-block state so a fixed-scale
-    // conversion is the simpler correct fit here.
+    // This design has NO feedback loop at all, so none of that class of bug can
+    // happen, structurally: two independent 2-pole lowpass cascades run at the
+    // SAME cutoff but different "voicing" (stageB is tuned slightly brighter), and
+    // their difference — a bandpass-shaped bump centered near the cutoff — is
+    // mixed back on top of the main (stageA) lowpass output, scaled by resonance.
+    // Since that mix is feedforward (added once, not fed back into next sample's
+    // input), it cannot compound or run away regardless of how high resonance is
+    // set: raising it only makes the bump louder, never unstable. With zero input,
+    // every stage is a plain leaky integrator decaying toward 0 — no separate
+    // "silence gate" hack is needed, it's just how a lowpass behaves.
     if (amy_ladder_on > 0.5f && fbl[0][0] != NULL) {
         float g = amy_ladder_cutoff / (AMY_SAMPLE_RATE * 0.5f);
         if (g < 0.001f) g = 0.001f;
         if (g > 0.999f) g = 0.999f;
-        float drive = 1.0f + amy_ladder_resonance * 0.15f;
-        // ---- History of this block (read before changing the tuning again) ----
-        // 1) First cut: tanh() on every one of the 4 stages, inside the feedback loop.
-        //    Stacking that many nonlinearities in one feedback loop is a textbook
-        //    recipe for chaos (non-periodic, sensitive-to-initial-conditions output)
-        //    rather than a musical self-oscillator — fixed by reducing to ONE
-        //    nonlinearity in the loop.
-        // 2) That one nonlinearity was tanh(s[3]*amy_ladder_resonance) on the feedback
-        //    tap. Measured via a headless RMS sweep (resonance 0.5..12, white-noise
-        //    input, real compiled path) that s[3]'s typical amplitude here (~0.1-0.3)
-        //    meant ANY resonance above ~1.0 already saturated that tanh to near ±1 —
-        //    so raising resonance further barely changed the feedback term, and the
-        //    resonance control was nearly inert across ~95% of its range (measured:
-        //    RMS only crept from ~1150 to ~1900 across the WHOLE 0.5-12 sweep).
-        // 3) Moving the multiply outside the tanh (`tanh(s[3])*resonance`-style, or
-        //    scaling elsewhere) doesn't fix it either if the ceiling stays ±1: ANY
-        //    single saturator with a fixed ±1 output range caps the whole loop's
-        //    steady-state amplitude regardless of how much gain is fed into it, which
-        //    is what actually starved the resonant buildup — not which exact node
-        //    the multiply happened at. The fix that actually works: give the loop's
-        //    one saturator real HEADROOM (LADDER_HEADROOM, well above the ±1 a typical
-        //    filtered signal sits at) so a genuinely growing resonant sinusoid has
-        //    room to build up across many round-trips through the 4 stages before
-        //    the limiter engages — only THEN does resonance produce an audibly
-        //    dominant, self-oscillating peak instead of a barely-there wiggle.
-        #define LADDER_HEADROOM 2.2f
-        // Silence gate: once the actual INPUT has been silent for a sustained stretch
-        // (LADDER_SILENCE_GATE samples), cut the feedback tap to exactly 0 — removing
-        // the loop's only energy source so a self-oscillating filter left on with no
-        // input decays to true silence (time constant ~1/g) instead of ringing forever.
-        // A constant per-sample loss factor was tried first and does NOT work once the
-        // loop is saturating (measured: no change in sustained amplitude down to 2%
-        // loss/sample) — only removing the energy source outright does.
-        #define LADDER_SILENCE_THRESH  0.0008f
-        #define LADDER_SILENCE_GATE    3500   // ~79ms at 44100Hz
+        // Second cascade's cutoff is a fixed multiple brighter than the first —
+        // the gap between the two is what shapes the resonant bump's width.
+        float g2 = g * 1.6f;
+        if (g2 > 0.999f) g2 = 0.999f;
         int n = AMY_BLOCK_SIZE * AMY_NCHANS;
         SAMPLE* buf = fbl[0][0];
         for (int ch = 0; ch < AMY_NCHANS; ch++) {
+            // Repurposed from the old feedback design: s[0]/s[1] = cascade A (the
+            // main 2-pole lowpass that's actually output), s[2]/s[3] = cascade B
+            // (the brighter reference cascade used only to derive the peak).
             float* s = amy_ladder_stage[ch];
-            int silence = amy_ladder_silence[ch];
             for (int i = ch; i < n; i += AMY_NCHANS) {
                 float rawin = S2F(buf[i]);
-                if (fabsf(rawin) > LADDER_SILENCE_THRESH) silence = 0;
-                else if (silence < LADDER_SILENCE_GATE + 1) silence++;
-                float fbRaw = (silence > LADDER_SILENCE_GATE) ? 0.0f : (s[3] * amy_ladder_resonance);
-                float in = rawin * drive - fbRaw;
-                s[0] += g * (tanhf(in / LADDER_HEADROOM) * LADDER_HEADROOM - s[0]);
+                s[0] += g * (rawin - s[0]);
                 s[1] += g * (s[0] - s[1]);
-                s[2] += g * (s[1] - s[2]);
-                s[3] += g * (s[2] - s[3]);
-                buf[i] = F2S(s[3]);
+                s[2] += g2 * (rawin - s[2]);
+                s[3] += g2 * (s[2] - s[3]);
+                float peak = (s[3] - s[1]) * amy_ladder_resonance;
+                float outv = s[1] + peak;
+                // Gentle safety soft-clip — engages only if a user dials resonance
+                // very high on loud material; does not define the resonance
+                // character itself (that's entirely the feedforward peak above).
+                outv = tanhf(outv * 0.6f) * 1.6667f;
+                buf[i] = F2S(outv);
             }
-            amy_ladder_silence[ch] = silence;
         }
     }
 
