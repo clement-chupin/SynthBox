@@ -492,7 +492,16 @@ void audioSetAllFilters(float cutoffHz, float resonance) {
         // For patches: don't change filter_type — only modulate freq/resonance so the preset's
         // internal filter character (e.g. Juno BPF stack) is preserved under LFO/FX modulation.
         if (!s_synthChIsPatch) e.filter_type = bypass ? FILTER_NONE : FILTER_LPF24;
-        e.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
+        // Cap at the patch's own native cutoff — see the matching comment in
+        // audioSetAllFiltersT() for why (an FX cutoff above native brightens the patch
+        // instead of ever being able to just darken it, since there's one shared filter).
+        float effCutoff = cutoffHz;
+        if (!bypass && s_synthChIsPatch) {
+            float nativeCC, nativeRes;
+            getPatchNativeFilter(s_currentPatchNumber, nativeCC, nativeRes);
+            effCutoff = fminf(cutoffHz, nativeCC);
+        }
+        e.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : effCutoff;
         if (!bypass && !s_synthChIsPatch) { e.filter_freq_coefs[COEF_EG0] = 0.0f; e.filter_freq_coefs[COEF_EG1] = 0.0f; }
         e.resonance = bypass ? 1.0f : resonance;
         amy_add_event(&e);
@@ -551,7 +560,22 @@ void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType) {
         e.synth = SYNTH_CH;
         // For patches: preserve filter_type so the preset's internal filter is not overridden.
         if (!s_synthChIsPatch) e.filter_type = bypass ? FILTER_NONE : filterType;
-        e.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
+        // For patches, never let the FX's cutoff open the filter BEYOND the patch's own
+        // native cutoff — the FX overwrites the same single filter_freq_coefs the patch's
+        // own native character depends on (there's no separate cascaded stage), so an FX
+        // cutoff above the native value doesn't add filtering, it REPLACES the patch's own
+        // (often much lower/darker) native cutoff with a brighter one — audibly "the LPF
+        // boosts the highs" instead of ever being able to just cut them, and is exactly
+        // backwards from what turning on a low-pass filter should be able to do. Capping
+        // at the native cutoff means the FX can only ever darken a patch further, matching
+        // normal LPF expectations, while a lower FX cutoff still works exactly as before.
+        float effCutoff = cutoffHz;
+        if (!bypass && s_synthChIsPatch) {
+            float nativeCC, nativeRes;
+            getPatchNativeFilter(s_currentPatchNumber, nativeCC, nativeRes);
+            effCutoff = fminf(cutoffHz, nativeCC);
+        }
+        e.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : effCutoff;
         if (!bypass && !s_synthChIsPatch) {
             e.filter_freq_coefs[COEF_EG0] = 0.0f;
             e.filter_freq_coefs[COEF_EG1] = 0.0f;
@@ -706,17 +730,6 @@ static const ShapeFilterSave kShapeFilter[] = {
 };
 static_assert(sizeof(kShapeFilter)/sizeof(kShapeFilter[0]) == SHAPE_COUNT,
               "kShapeFilter must have one entry per SynthShape");
-
-void audioGetNativeCutoff(SynthShape shape, float& cc, float& res) {
-    if ((uint8_t)shape >= SHAPE_COUNT) { cc = 18000.0f; res = 1.0f; return; }
-    int16_t patch = shapePatch[(uint8_t)shape];
-    if (patch >= 0) {
-        getPatchNativeFilter(patch, cc, res);
-    } else {
-        cc  = kShapeFilter[(uint8_t)shape].cc;
-        res = kShapeFilter[(uint8_t)shape].res;
-    }
-}
 
 // Restore the shape's native filter+EG coefficients after FX LPF/Overdrive is turned off.
 // For preset shapes (Juno/DX7), re-sends patch_number to restore internal filter EG state that

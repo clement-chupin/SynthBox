@@ -2067,12 +2067,28 @@ int16_t * amy_fill_buffer() {
     // every stage is a plain leaky integrator decaying toward 0 — no separate
     // "silence gate" hack is needed, it's just how a lowpass behaves.
     if (amy_ladder_on > 0.5f && fbl[0][0] != NULL) {
-        float g = amy_ladder_cutoff / (AMY_SAMPLE_RATE * 0.5f);
+        // g = 1 - exp(-2*pi*fc/fs) is the correct one-pole coefficient for a target
+        // cutoff fc (leaky integrator y += g*(x-y) has -3dB point at fc only with
+        // this formula). The previous g = fc/(fs/2) linear approximation was way off
+        // except at very low fc — e.g. a nominal 4000Hz setting was actually acting
+        // like ~1400Hz, 16000Hz like ~9000Hz (verified numerically). That mismatch
+        // is very likely why the cutoff pot felt "off," and also why bass notes
+        // (whose dense harmonic spacing means many harmonics sit right around
+        // wherever the ACTUAL cutoff ends up) sounded so much more resonant/different
+        // than treble notes: the real cutoff was sitting much lower than the label
+        // suggested, so bass content was interacting with the resonant peak far more
+        // than a correctly-calibrated "4000Hz" filter would.
+        float g = 1.0f - expf(-2.0f * (float)M_PI * amy_ladder_cutoff / (float)AMY_SAMPLE_RATE);
         if (g < 0.001f) g = 0.001f;
         if (g > 0.999f) g = 0.999f;
-        // Second cascade's cutoff is a fixed multiple brighter than the first —
-        // the gap between the two is what shapes the resonant bump's width.
-        float g2 = g * 1.6f;
+        // Second cascade's cutoff is a fixed multiple brighter than the first, computed
+        // the same correct way (not by scaling the coefficient directly, which doesn't
+        // correspond to a clean frequency ratio) — the gap between the two is what
+        // shapes the resonant bump's width, clamped so it stays sane near Nyquist.
+        float fc2 = amy_ladder_cutoff * 1.6f;
+        if (fc2 > AMY_SAMPLE_RATE * 0.45f) fc2 = AMY_SAMPLE_RATE * 0.45f;
+        float g2 = 1.0f - expf(-2.0f * (float)M_PI * fc2 / (float)AMY_SAMPLE_RATE);
+        if (g2 < 0.001f) g2 = 0.001f;
         if (g2 > 0.999f) g2 = 0.999f;
         int n = AMY_BLOCK_SIZE * AMY_NCHANS;
         SAMPLE* buf = fbl[0][0];

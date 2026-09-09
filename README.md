@@ -1,5 +1,8 @@
 # GrvEP
 
+- **Exécutable Windows prêt à l'emploi** : [releases/GrvEP-windows.exe](releases/GrvEP-windows.exe) — aucune installation, double-clic pour lancer.
+- **Vidéo de présentation** : [Instagram](https://www.instagram.com/p/DdB59hfBGcy/)
+
 ![GrvEP](./images/image.png)
 
 GrvEP est une boîte à rythmes / synthétiseur portable basée sur un ESP32-S3 : plus de 30
@@ -14,11 +17,17 @@ guide d'utilisation complet (contrôles, navigation, panorama des modes), conver
 PDF (`pandoc docs/GUIDE_UTILISATEUR.md -o guide.pdf --toc --pdf-engine=wkhtmltopdf`, ou
 avec un moteur LaTeX comme `xelatex` si installé).
 
-Le même code applicatif (`src/`) tourne sur trois cibles :
+**Développeur, ou envie de contribuer via Claude Code ?** Voir [CLAUDE.md](CLAUDE.md) —
+contexte projet condensé (les 4 cibles de build, le piège des deux copies d'AMY à
+synchroniser à la main, la méthodologie de test) et [structure/](structure/) pour la
+documentation d'architecture détaillée.
+
+Le même code applicatif (`src/`) tourne sur quatre cibles :
 
 - **ESP32-S3** — le matériel réel, via [PlatformIO](https://platformio.org/).
-- **Simulateur desktop Linux** — une reconstruction de la carte (écran, clavier, joystick, LEDs) en SDL2, pour développer/tester sans le matériel.
+- **Simulateur desktop Linux/Windows** — une reconstruction de la carte (écran, clavier, joystick, LEDs) en SDL2, pour développer/tester sans le matériel.
 - **APK Android** — le même simulateur SDL2, compilé nativement en C++ pour Android (pas de wrapper web).
+- **Web (WebAssembly)** — le même simulateur compilé via Emscripten (voir [structure/WEB_SIMULATOR.md](structure/WEB_SIMULATOR.md)).
 
 ## Nouveautés récentes
 
@@ -70,6 +79,10 @@ cd simulator
 
 # Lancer
 DISPLAY=:1 ./build/grvep_sim
+
+# or in one line
+./simulator/build.sh; DISPLAY=:1 ./simulator/build/grvep_sim
+
 ```
 
 Le binaire est produit dans `simulator/build/grvep_sim`.

@@ -23,6 +23,8 @@ extern SAMPLE ** fbl;
 #include "miniaudio.h"
 
 #include <stdio.h>
+#include <math.h>
+#define GRVEP_BRIGHT_TAP
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -138,6 +140,26 @@ static void data_callback(ma_device* pDevice, void* pOutput, const void* pInput,
         if(in_ptr == (AMY_BLOCK_SIZE*AMY_NCHANS)) { // we have a block of input ready
             // render and copy into output ring buffer
             int16_t * buf = amy_simple_fill_buffer();
+#ifdef GRVEP_BRIGHT_TAP
+            {
+                static double sumsq = 0.0, sumsqDiff = 0.0; static int16_t prevSample = 0;
+                static int nblocks = 0;
+                int n = AMY_BLOCK_SIZE * AMY_NCHANS;
+                for (int i = 0; i < n; i++) {
+                    sumsq += (double)buf[i] * (double)buf[i];
+                    double d = (double)buf[i] - (double)prevSample;
+                    sumsqDiff += d * d;
+                    prevSample = buf[i];
+                }
+                nblocks++;
+                if (nblocks >= 20) {
+                    double rms = sqrt(sumsq / (double)(nblocks * n));
+                    double brightness = sqrt(sumsqDiff / (double)(nblocks * n));
+                    fprintf(stderr, "BRIGHTTAP rms=%.1f bright=%.1f\n", rms, brightness);
+                    sumsq = 0.0; sumsqDiff = 0.0; nblocks = 0;
+                }
+            }
+#endif
             // Maybe pass to amy_update.
             last_audio_buffer = buf;
             // reset the input pointer for future input data

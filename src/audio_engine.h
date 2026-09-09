@@ -18,7 +18,6 @@ void audioTrackerInit();           // initialize one AMY synth channel per track
 void audioTrackerNoteOn(uint8_t trackIdx, uint8_t midiNote, float vel);
 void audioTrackerNoteOff(uint8_t trackIdx, uint8_t midiNote);
 void audioRestoreShapeFilter(SynthShape shape); // restore native filter after FX filter off
-void audioGetNativeCutoff(SynthShape shape, float& cc, float& res); // native cutoff/res for a shape (patch-aware)
 void audioSetVolume(float vol);
 void audioSetFilter(float cutoffHz, float resonance);
 void audioSetAllFilters(float cutoffHz, float resonance); // LPF on synth + all sample/seq oscs (0=open)

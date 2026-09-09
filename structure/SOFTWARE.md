@@ -223,8 +223,9 @@ LEDs : rainbow wave synchro avec la vitesse animation.
 
 ## Effets (grille FX, overlay `OVERLAY_FX`)
 
-16 effets configurables, stockés dans `fxList[]` (`main.cpp`), accessibles via une grille
-4×4 dans l'overlay FX (B1 court sur SYNTH/POKEMON/I303/STONE/OMNI/MODULAR/GRANULAR2/DR2/GEST) :
+15 effets configurables, stockés dans `fxList[]` (`main.cpp`), accessibles via une grille
+4×4 dans l'overlay FX (B1 court sur SYNTH/POKEMON/I303/STONE/OMNI/MODULAR/GRANULAR2/DR2/GEST)
+— la grille a 16 cellules mais `FX_COUNT=15`, donc la dernière case reste vide :
 
 | Index | Nom | Implémentation |
 |-------|-----|-----------------|
@@ -234,16 +235,20 @@ LEDs : rainbow wave synchro avec la vitesse animation.
 | 3 | CHORUS | `audioSetChorus` (bus 0) |
 | 4 | FLANGER | `config_chorus` (délai court = comb filter) |
 | 5 | DELAY | `audioSetDelay`, synchronisé au BPM |
-| 6 | LFO | Modulation du cutoff FILT, tick 10ms dans `loop()` |
-| 7 | EQ | `audioSetEq` (3 bandes) |
-| 8 | RESECHO | Écho synchronisé BPM avec filtre tonal dans la boucle de feedback |
-| 9 | REP | Wavefold global (`audioSetWavefold`) |
-| 10 | BITCRS | Wavefold à gain extrême (simule une réduction de bit-depth) + LPF optionnel |
-| 11 | TREMOLO | Modulation du volume, tick 10ms |
-| 12 | AUTOPAN | Modulation du pan, tick 10ms |
-| 13 | OVERDRIVE | `audioSetOverdrive` |
-| 14 | RINGMOD | Modulation en anneau (porteuse sinus, bus 0) |
-| 15 | COMPRESSOR | Compresseur feedforward à enveloppe de crête (bus 0) |
+| 6 | EQ | `audioSetEq` (3 bandes) |
+| 7 | RESECHO | Écho synchronisé BPM avec filtre tonal dans la boucle de feedback |
+| 8 | REP | Wavefold global (`audioSetWavefold`) |
+| 9 | BITCRS | Wavefold à gain extrême (simule une réduction de bit-depth) + LPF optionnel |
+| 10 | TREMOLO | Modulation du volume, tick 10ms |
+| 11 | AUTOPAN | Modulation du pan, tick 10ms |
+| 12 | OVERDRIVE | `audioSetOverdrive` |
+| 13 | RINGMOD | Modulation en anneau (porteuse sinus, bus 0) |
+| 14 | COMPRESSOR | Compresseur feedforward à enveloppe de crête (bus 0) |
+
+L'ancien FX dédié **LFO** (qui modulait uniquement le cutoff de FILT) a été retiré : son
+« réglage spécial » ne produisait pas d'effet audible fiable, et il faisait doublon avec le
+moteur d'automatisation générique ci-dessous, qui peut moduler le cutoff de FILT (ou
+n'importe quel autre paramètre de n'importe quel FX) de la même façon mais en mieux.
 
 Les FX bus-0 (REVERB/CHORUS/DELAY/EQ/RESECHO/REP/BITCRS/RINGMOD/COMPRESSOR/FILT-LADDER)
 s'appliquent après le mix, donc à **toute** source sonore (synthé, sample, granulaire…).
@@ -261,7 +266,7 @@ Double-cliquer un slot FX **déjà actif** dans la grille FX ouvre un éditeur d
 FX est automatisé, les pots P4-P7 règlent profondeur/vitesse/forme d'onde/synchro BPM.
 Repose sur un moteur de modulation générique (`gModSlots[]`, struct `ModSlot`, `main.cpp`)
 — sine/tri/carré/sample&hold, Hz libre ou synchronisé au BPM (table `kDelaySubdiv[]`) —
-qui généralise le pattern déjà utilisé par les FX LFO/TREMOLO/AUTOPAN (accumulateur de
+qui généralise le pattern déjà utilisé par les FX TREMOLO/AUTOPAN (accumulateur de
 phase + porte de profondeur + restauration propre à la désactivation), sans les modifier :
 `gModSlots[0..3]` sont un pool général alloué dynamiquement par cette UI,
 `gModSlots[4]` est réservé au LFO du synthé modulaire (voir plus bas).

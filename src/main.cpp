@@ -452,6 +452,20 @@ static uint8_t  dr2T303Vel [DR2_NOTES][DR2H_BEATS][DR2H_STEPS][DR2H_MICROS] = {}
 static uint8_t  dr2SynthPats[DR2_PATS][DR2_NOTES][DR2H_BEATS][DR2H_STEPS][DR2H_MICROS] = {};
 static uint8_t  dr2T303Pats [DR2_PATS][DR2_NOTES][DR2H_BEATS][DR2H_STEPS][DR2H_MICROS] = {};
 static uint8_t  dr2T303CurNote = 0;      // currently-sounding 303 note (0 = none), for monophonic retrigger
+// The T303 track is a single monophonic voice (like the real hardware) but
+// dr2T303Vel[] is indexed by note, so nothing previously stopped two different
+// notes from both being marked "on" at the same beat/step/micro — the data would
+// silently hold both, and only the lowest note index ever actually played back
+// (see dr2T303CurNote / the playback loop that does "if (...vel...) { t303Note=n;
+// break; }"), so placing a second note on a step you'd already placed one on
+// looked like nothing happened rather than replacing it. Call this whenever a
+// T303 note is turned ON at a given slot to enforce one-note-per-step for real,
+// the same way editing already assumes.
+static void dr2T303ClearOtherNotes(uint8_t beat, uint8_t step, uint8_t micro, uint8_t exceptNote) {
+    for (uint8_t n = 0; n < DR2_NOTES; n++) {
+        if (n != exceptNote) dr2T303Vel[n][beat][step][micro] = 0;
+    }
+}
 static bool     dr2T303Inited  = false;  // audioT303Init() called once on first selecting the 303 slot
 static unsigned long dr2NoteFlashMs[DR2_NOTES] = {};  // LED "just hit" flash, mirrors dr2PadFlashMs for the melodic grid
 // Unlike drums (one-shot PCM samples that end on their own) the generic synth
@@ -1475,11 +1489,6 @@ FxEffect fxList[] = {
      {"Lvl","","",""},
      {0.0f,  0.0f, 0.0f, -1.0f},
      {1.0f,  6.0f, 0.8f,  1.0f}},
-    // LFO: software filter LFO — modulates active LPF cutoff
-    {"LFO",      false, {3.0f, 0.7f, 0.0f, 0.0f},
-     {"Rate","Dep","",""},
-     {0.1f, 0.0f, 0.0f, 0.0f},
-     {20.0f, 1.0f, 0.0f, 0.0f}},
     // EQ: 3-band EQ via AMY config_eq (1.0=flat, >1 boost, <1 cut)
     {"EQ",       false, {1.5f, 1.0f, 0.8f, 0.0f},
      {"Low","Mid","Hi",""},
@@ -1540,7 +1549,7 @@ FxEffect fxList[] = {
      {0.05f, 1.0f, 0.0f, 0.0f},
      {1.0f, 20.0f, 0.0f, 0.0f}},
 };
-static const uint8_t FX_COUNT = 16;
+static const uint8_t FX_COUNT = 15;
 
 // Noms des types de filtre FILT — LPF, HPF, BPF
 static const char* kFiltTypN[] = {"LPF","HPF","BPF","LDR"};
@@ -1576,13 +1585,15 @@ void fxOrderRemove(uint8_t fx) {
 }
 
 // ==================== MODULATION-SLOT ENGINE ====================
-// Generic LFO-style modulation, separate from and additive to the existing fxList[6]
-// (LFO), [11] (TREMOLO), [12] (AUTOPAN) slots — those stay exactly as they are (simple,
-// single-toggle, fixed-destination FX everyone already relies on). This engine exists for
-// what those can't do: automate an ARBITRARY fxList[] param via the FX-overlay double-click
-// UI, and drive the modular synth's small mod matrix. Modeled directly on the existing LFO
-// tick's shape (phase accumulator + depth gate + restore-on-deactivate), see the loop()
-// 10ms block below for the LFO/TREMOLO/AUTOPAN precedent this generalizes.
+// Generic LFO-style modulation, separate from and additive to the existing fxList[10]
+// (TREMOLO), [11] (AUTOPAN) slots — those stay exactly as they are (simple, single-toggle,
+// fixed-destination FX everyone already relies on). This engine exists for what those
+// can't do: automate an ARBITRARY fxList[] param via the FX-overlay double-click UI, and
+// drive the modular synth's small mod matrix. Modeled directly on TREMOLO/AUTOPAN's own
+// tick shape (phase accumulator + depth gate + restore-on-deactivate) — see the loop()
+// 10ms block below for that precedent. (The old dedicated "LFO" FX slot that used to sit
+// at fxList[6] and modulate filter cutoff the same way was removed once this generic
+// engine could automate FILT's cutoff directly — see the FX list definition.)
 enum ModWaveShape : uint8_t { MODSHAPE_SINE=0, MODSHAPE_TRI, MODSHAPE_SQR, MODSHAPE_SH, MODSHAPE_COUNT };
 static const char* kModShapeName[] = { "Sine","Tri","Sqr","S&H" };
 enum ModDestKind : uint8_t {
@@ -1655,12 +1666,19 @@ int8_t modSlotFindFxParam(uint8_t fx, uint8_t param) {
     return -1;
 }
 
-// OVERLAY_FX_MOD state (double-click an active FX slot in OVERLAY_FX to enter).
+// OVERLAY_FX_MOD state (long-press an active FX slot in OVERLAY_FX to enter — see
+// s_fxPressOpt below and the poll near btn1PressTime in loop()).
 static uint8_t s_fxModEditParam = 0;   // which of fxList[fxSelected]'s params is being automated
 static int8_t  s_fxModEditSlot  = -1;  // gModSlots[] index owning this (fx,param); -1 = unassigned
 static int8_t  s_fxModProfileIdx = -1; // joystick-Y cursor into kLfoProfiles[]; -1 = none picked yet (custom/pot-tuned)
-static uint32_t s_fxDblLastMs = 0;
-static uint8_t  s_fxDblLastOpt = 255;
+// Long-press tracking for the FX grid: press arms this without acting yet; released
+// before the threshold performs the normal toggle (overlayFxKeyRelease()), held past it
+// opens the automation editor instead (polled in loop(), same idiom as btn1PressTime's
+// long-press-to-menu) for an already-active FX (automating an inactive one makes no sense).
+#define FX_LONGPRESS_MS 500
+static uint8_t  s_fxPressOpt       = 255; // opt currently held down in the FX grid, 255=none
+static uint32_t s_fxPressStartMs   = 0;
+static bool     s_fxLongPressFired = false;
 
 void applyFxEffect(uint8_t fx) {
     FxEffect &e = fxList[fx];
@@ -1668,8 +1686,8 @@ void applyFxEffect(uint8_t fx) {
     // Helper: no FX filter active → safe to restore shape's native filter coefficients
     // BITCRS counts as filter-user when its Cut param is set (params[1] > 200Hz)
     auto noFilterFx = [&]() {
-        return !fxList[0].active && !fxList[1].active && !fxList[6].active && !fxList[13].active
-               && !(fxList[10].active && fxList[10].params[1] > 200.0f);
+        return !fxList[0].active && !fxList[1].active && !fxList[12].active
+               && !(fxList[9].active && fxList[9].params[1] > 200.0f);
     };
     switch (fx) {
         case 0: {  // FILT — filtre général (params[3]=Typ: 0=LPF,1=HPF,2=BPF,3=LADDER)
@@ -1721,39 +1739,37 @@ void applyFxEffect(uint8_t fx) {
             audioSetDelay(on ? e.params[0] : 0.0f, dms, e.params[2], e.params[3]);
             break;
         }
-        case 6:  // LFO — handled in the 10ms loop
-            break;
-        case 7:  // EQ
-            Serial.printf("FX7 EQ  %s L=%.2f M=%.2f H=%.2f\n", on?"ON":"off",
+        case 6:  // EQ
+            Serial.printf("FX6 EQ  %s L=%.2f M=%.2f H=%.2f\n", on?"ON":"off",
                           on?e.params[0]:1.0f, on?e.params[1]:1.0f, on?e.params[2]:1.0f);
             audioSetEq(on ? e.params[0] : 1.0f,
                        on ? e.params[1] : 1.0f,
                        on ? e.params[2] : 1.0f);
             break;
-        case 8: {  // ResEcho — BPM-synced echo with tonal filter_coef
+        case 7: {  // ResEcho — BPM-synced echo with tonal filter_coef
             uint8_t si = (uint8_t)constrain((int)roundf(e.params[3]), 0, DELAY_SUBDIV_COUNT-1);
             float dms  = 60000.0f / (float)bpm * kDelaySubdiv[si];
             dms = constrain(dms, 30.0f, 700.0f);
-            Serial.printf("FX8 RES %s lvl=%.2f fb=%.2f tone=%.2f %s=%.0fms\n",
+            Serial.printf("FX7 RES %s lvl=%.2f fb=%.2f tone=%.2f %s=%.0fms\n",
                           on?"ON":"off", on?e.params[0]:0.0f, e.params[1], e.params[2],
                           kDelaySubdivName[si], dms);
             audioSetDelay(on ? e.params[0] : 0.0f, dms, e.params[1], e.params[2]);
             break;
         }
-        case 9: {  // REP — global wavefold; threshold=e.params[0], gain=1/threshold
+        case 8: {  // REP — global wavefold; threshold=e.params[0], gain=1/threshold
             float thr = constrain(e.params[0], 0.05f, 1.0f);
             float baseWf = (currentMode == MODE_POKEMON) ? kPokemon[pkmnSelected].wavefold : 1.0f;
             float gain = on ? (baseWf / thr) : baseWf;
-            Serial.printf("FX9 REP %s seuil=%.2f gain=%.1f\n", on?"ON":"off", thr, gain);
+            Serial.printf("FX8 REP %s seuil=%.2f gain=%.1f\n", on?"ON":"off", thr, gain);
             audioSetWavefold(gain);
             break;
         }
-        case 10: {  // BITCRS — wavefold at extreme gain to simulate bit-depth reduction
+        case 9: {  // BITCRS — wavefold at extreme gain to simulate bit-depth reduction
             float bits = constrain(e.params[0], 2.0f, 8.0f);
             float baseWf = (currentMode == MODE_POKEMON) ? kPokemon[pkmnSelected].wavefold : 1.0f;
             float gain = on ? powf(2.0f, 9.0f - bits) : baseWf;  // 8bit→2x, 4bit→32x, 2bit→128x; off→restore
             float cut  = e.params[1];
-            Serial.printf("FX10 BITCRS %s bits=%.0f gain=%.1f cut=%.0f\n",
+            Serial.printf("FX9 BITCRS %s bits=%.0f gain=%.1f cut=%.0f\n",
                           on?"ON":"off", bits, gain, cut);
             audioSetWavefold(gain);
             // LPF: use audioSetAllFiltersT so the filter type is properly set (LPF24)
@@ -1764,21 +1780,21 @@ void applyFxEffect(uint8_t fx) {
             }
             break;
         }
-        case 11:  // TREMOLO — handled in the 10ms loop (volume LFO), same as LFO/case 6
+        case 10:  // TREMOLO — handled in the 10ms loop (volume LFO)
             break;
-        case 12:  // AUTOPAN — handled in the 10ms loop (pan LFO), same as LFO/case 6
+        case 11:  // AUTOPAN — handled in the 10ms loop (pan LFO)
             break;
-        case 13:  // OVERDRIVE — single-knob filter drive
-            Serial.printf("FX13 OVERDRV %s drv=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
+        case 12:  // OVERDRIVE — single-knob filter drive
+            Serial.printf("FX12 OVERDRV %s drv=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
             audioSetOverdrive(on ? e.params[0] : 0.0f);
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
             break;
-        case 14:  // RINGMOD — bus-0 sine-carrier amplitude modulation
-            Serial.printf("FX14 RINGMOD %s freq=%.0f mix=%.2f\n", on?"ON":"off", e.params[0], e.params[1]);
+        case 13:  // RINGMOD — bus-0 sine-carrier amplitude modulation
+            Serial.printf("FX13 RINGMOD %s freq=%.0f mix=%.2f\n", on?"ON":"off", e.params[0], e.params[1]);
             audioSetRingmod(e.params[0], e.params[1], on);
             break;
-        case 15:  // COMPRESSOR — bus-0 feedforward peak compressor
-            Serial.printf("FX15 COMPRESS %s thr=%.2f ratio=%.1f\n", on?"ON":"off", e.params[0], e.params[1]);
+        case 14:  // COMPRESSOR — bus-0 feedforward peak compressor
+            Serial.printf("FX14 COMPRESS %s thr=%.2f ratio=%.1f\n", on?"ON":"off", e.params[0], e.params[1]);
             audioSetCompressor(e.params[0], e.params[1], on);
             break;
     }
@@ -2950,6 +2966,54 @@ static const int8_t kOctOpts[] = {-2, -1, 0, 1};
 //     opt = (3-row)*8 + (7-col) → row 3 col7=opt0 … row 0 col0=opt31
 // LED positions resolved at runtime via crdToIdx (respects OOPSIE_LED_FLAG routing).
 
+// The FX grid's "short click" action: toggle an FX on/off. Pulled out of
+// overlayKeyPress() so both the release handler (short press) and the long-press poll
+// can share it without duplicating the logic.
+static void overlayFxToggle(uint8_t opt) {
+    fxSelected = opt;
+    fxList[opt].active = !fxList[opt].active;
+    if (fxList[opt].active) {
+        fxOrderAdd(opt); fxPotNeedSync = true;
+        if (opt == 9) fxList[9].params[0] = 8.0f;  // BITCRS: reset to 8 bits (mild) on activation
+        // FILT: don't let the LADDER "special mode" silently persist across a
+        // deactivate/reactivate cycle — always come back up as plain LPF, so re-enabling
+        // FILT never surprises you with the exotic resonant filter unless you
+        // deliberately dial Typ back to LADDER again.
+        if (opt == 0) fxList[0].params[3] = 0.0f;
+    } else fxOrderRemove(opt);
+    // Always use applyAllFx() on toggle so that filter-sharing FX (FILT/DISTORT) don't
+    // corrupt each other: applyAllFx resets all inactive then re-applies all active in
+    // order, guaranteeing consistent AMY filter state.
+    applyAllFx();
+    if (opt == 0 && fxList[0].active) lpfSmoothCut = fxList[0].params[0];
+    Serial.printf("OVL FX[%d] %s\n", opt, fxList[opt].active?"ON":"OFF");
+}
+
+// The FX grid's "long press" action: open the automation editor for an ALREADY-active
+// slot — automating an inactive FX makes no sense, so this is a no-op on an inactive one
+// (the short-press toggle already fired on press... no: press only arms the timer, so an
+// inactive FX held past the threshold just does nothing until release, which then performs
+// the normal toggle since s_fxLongPressFired stays false here).
+static void overlayFxEnterAutomation(uint8_t opt) {
+    if (!fxList[opt].active) return;
+    fxSelected = opt;
+    s_fxModEditParam = 0;
+    s_fxModEditSlot = modSlotFindFxParam(opt, 0);
+    s_fxModProfileIdx = -1;
+    s_overlay = OVERLAY_FX_MOD;
+    Serial.printf("OVL FX_MOD enter fx=%d\n", opt);
+}
+
+// Called on key RELEASE (not press) while OVERLAY_FX is open, from the key-event loop —
+// performs the deferred short-click toggle if the long-press threshold was never reached.
+void overlayFxKeyRelease(uint8_t row, uint8_t col) {
+    if (col < 4) return; // not a slot cell in the FX grid
+    uint8_t opt = (uint8_t)((3 - row) + (uint8_t)(7 - col) * 4);
+    if (opt != s_fxPressOpt) return; // release doesn't match the currently-armed press
+    if (!s_fxLongPressFired) overlayFxToggle(opt);
+    s_fxPressOpt = 255;
+}
+
 void overlayKeyPress(uint8_t row, uint8_t col) {
     if (s_overlayCloseAt) return;
 
@@ -2988,7 +3052,8 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
     }
 
     bool is4col = (s_overlay == OVERLAY_SCALE_ARP || s_overlay == OVERLAY_303 || s_overlay == OVERLAY_303_PRESET || s_overlay == OVERLAY_SYSEQ || s_overlay == OVERLAY_SEQB2 || s_overlay == OVERLAY_FX);
-    // FX is now a full 4x4 grid (FX_COUNT=16) like the other is4col overlays; others use 2 (col6-7)
+    // FX is a full 4x4 grid (16 cells, FX_COUNT=15 so the last cell is unused) like the
+    // other is4col overlays; others use 2 (col6-7)
     uint8_t colMin = is4col ? 4u : 6u;
     if (col < colMin) {
         // OVERLAY_FX: a key outside its selection columns is someone playing a note to
@@ -3003,38 +3068,15 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
 
     switch (s_overlay) {
         case OVERLAY_FX:
+            // Deferred: pressing just arms the long-press timer, it doesn't act yet.
+            // Releasing before FX_LONGPRESS_MS performs the normal toggle
+            // (overlayFxKeyRelease(), called from the key-event loop on release); holding
+            // past it opens the automation editor instead (polled in loop(), see
+            // s_fxPressOpt) — see overlayFxToggle()/overlayFxEnterAutomation() below.
             if (opt < FX_COUNT) {
-                // Double-clicking an ALREADY-active slot opens the automation editor
-                // instead of toggling it off — automating an inactive FX makes no sense,
-                // so this only intercepts the case where a toggle would be a no-op anyway
-                // from the user's perspective (they're not trying to turn it off).
-                {
-                    uint32_t now = millis();
-                    bool isDbl = fxList[opt].active && (opt == s_fxDblLastOpt) && ((now - s_fxDblLastMs) < 350);
-                    s_fxDblLastOpt = opt;
-                    s_fxDblLastMs = isDbl ? 0 : now;
-                    if (isDbl) {
-                        fxSelected = opt;
-                        s_fxModEditParam = 0;
-                        s_fxModEditSlot = modSlotFindFxParam(opt, 0);
-                        s_fxModProfileIdx = -1;
-                        s_overlay = OVERLAY_FX_MOD;
-                        Serial.printf("OVL FX_MOD enter fx=%d\n", opt);
-                        return;
-                    }
-                }
-                fxSelected = opt;
-                fxList[opt].active = !fxList[opt].active;
-                if (fxList[opt].active) {
-                    fxOrderAdd(opt); fxPotNeedSync = true;
-                    if (opt == 10) fxList[10].params[0] = 8.0f;  // BITCRS: reset to 8 bits (mild) on activation
-                } else fxOrderRemove(opt);
-                // Always use applyAllFx() on toggle so that filter-sharing FX (FILT/DISTORT)
-                // don't corrupt each other: applyAllFx resets all inactive then re-applies all
-                // active in order, guaranteeing consistent AMY filter state.
-                applyAllFx();
-                if (opt == 0 && fxList[0].active) lpfSmoothCut = fxList[0].params[0];
-                Serial.printf("OVL FX[%d] %s\n", opt, fxList[opt].active?"ON":"OFF");
+                s_fxPressOpt = opt;
+                s_fxPressStartMs = millis();
+                s_fxLongPressFired = false;
             }
             return;  // FX overlay stays open for multi-toggle (no close timer)
         case OVERLAY_SCALE_ARP:
@@ -3138,7 +3180,10 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
                 fxList[opt].active = !fxList[opt].active;
                 if (fxList[opt].active) {
                     fxOrderAdd(opt); fxPotNeedSync = true;
-                    if (opt == 10) fxList[10].params[0] = 8.0f;  // BITCRS: reset to 8 bits on activation
+                    if (opt == 9) fxList[9].params[0] = 8.0f;  // BITCRS: reset to 8 bits on activation
+                    // FILT: don't let the LADDER "special mode" silently persist across a
+                    // deactivate/reactivate cycle — see the OVERLAY_FX toggle path above.
+                    if (opt == 0) fxList[0].params[3] = 0.0f;
                 } else fxOrderRemove(opt);
                 applyAllFx();
                 if (opt == 0 && fxList[0].active) lpfSmoothCut = fxList[0].params[0];
@@ -8036,6 +8081,14 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                 float polyScale = 1.0f / sqrtf(fmaxf(1.0f, (float)held));
                 float vnote = constrain((0.8f+jx*0.6f) * polyScale, 0.05f, 1.0f);
                 audioStoneNoteOn(note, vnote);
+                // audioStoneNoteOn() round-robin-steals one of STONE's 6 fixed oscillators
+                // and sends it a note-on event — same bug class as MOD3's table-change fix
+                // earlier this session: re-triggering a PCM voice can leave that oscillator's
+                // filter state not matching what FILT last set (a stale/reused voice can end
+                // up unfiltered even while FILT shows active), since audioApplyFilterToStone()
+                // is only ever called when the FX itself changes, not on every new note. Cheap
+                // to re-assert unconditionally here since it's just re-sending the same state.
+                if (fxList[0].active) applyFxEffect(0);
             } else {
                 audioStoneNoteOff(note);
             }
@@ -8329,6 +8382,10 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                             if (!(dr2BeatSelMask & (1 << b))) continue;
                             for (uint8_t s = 0; s < DR2H_STEPS; s++) {
                                 if (!(dr2StepSelMask & (1 << s))) continue;
+                                // T303 is one monophonic voice — placing a note on a step
+                                // must replace whatever note was already there, not just
+                                // add alongside it (see dr2T303ClearOtherNotes()).
+                                if (turnOn) dr2T303ClearOtherNotes(b, s, idx, dr2SelNote);
                                 dr2T303Vel[dr2SelNote][b][s][idx] = newVal;
                             }
                         }
@@ -8403,7 +8460,7 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     if (dr2RecArmed && dr2Playing) {
                         uint8_t rb,rs,rm; dr2RecordNearestSlot(&rb,&rs,&rm);
                         if (dr2Instrument == DR2_INSTR_SYNTH) dr2SynthVel[noteIdx][rb][rs][rm] = 100;
-                        else                                  dr2T303Vel[noteIdx][rb][rs][rm] = 100;
+                        else { dr2T303ClearOtherNotes(rb, rs, rm, noteIdx); dr2T303Vel[noteIdx][rb][rs][rm] = 100; }
                         dr2RecomputeActivePatFilled();
                     }
                 }
@@ -9219,6 +9276,32 @@ void setup() {
     // same state handleButton()'s long-press-B1 path sets when opening the menu.
     menuOpen = true; menuRow = 0; menuCol = 0; menuOnTabBar = true;
 
+    // TEMP DBG: J:PNO brightness with FILT off / near-max-but-not-bypassed / genuinely low.
+    // Retrigger a FRESH note per phase (J:PNO has its own decay envelope even while held,
+    // so measuring across one continuous hold would conflate envelope decay with the
+    // filter's effect) — each phase measures the same early post-attack window instead.
+    menuOpen = false;
+    switchMode(MODE_SYNTH);
+    audioSetVolume(0.8f);
+    audioSetShape(SHAPE_JUNO_PIANO); // J:PNO
+    fxList[0].active = false; applyAllFx();
+    audioNoteOff(48); delay(200);
+    audioNoteOn(48, 0.8f);
+    Serial.println("TEMP DBG --- baseline, FILT off (native ~994Hz) ---"); delay(400);
+    audioNoteOff(48); delay(200);
+
+    fxList[0].active = true; fxList[0].params[0]=17000.0f; fxList[0].params[1]=1.5f; fxList[0].params[3]=0.0f;
+    applyAllFx();
+    audioNoteOn(48, 0.8f);
+    Serial.println("TEMP DBG --- FILT on, cutoff=17000 (near max, should be capped to native) ---"); delay(400);
+    audioNoteOff(48); delay(200);
+
+    fxList[0].params[0]=500.0f; applyAllFx();
+    audioNoteOn(48, 0.8f);
+    Serial.println("TEMP DBG --- FILT on, cutoff=500 (genuinely darker than native) ---"); delay(400);
+    audioNoteOff(48); delay(200);
+    Serial.println("TEMP DBG: J:PNO brightness check done");
+
     Serial.println("Ready");
 }
 
@@ -9282,6 +9365,9 @@ void loop() {
         // Overlay intercept: bottom-row keys select options; other rows close overlay
         if(s_overlay != OVERLAY_NONE){
             if(pressed) overlayKeyPress(row,col);
+            // OVERLAY_FX defers its action to release/long-press (see s_fxPressOpt) —
+            // every other overlay still acts entirely on press, so release is a no-op there.
+            else if(s_overlay == OVERLAY_FX) overlayFxKeyRelease(row,col);
             continue;
         }
         // Note audio handled immediately by handleNoteKeyAudio() via kbdPollTask callback.
@@ -9307,6 +9393,20 @@ void loop() {
 #if CONFIG_TINYUSB_MIDI_ENABLED
         }
 #endif
+    }
+
+    // FX grid long-press poll (same idiom as btn1PressTime above): fires once the armed
+    // key has been held past FX_LONGPRESS_MS, opening the automation editor instead of
+    // waiting for release. If the key is released first, overlayFxKeyRelease() (called
+    // from the key-event loop above) performs the normal toggle instead.
+    if (s_fxPressOpt != 255 && !s_fxLongPressFired && s_overlay == OVERLAY_FX
+        && (millis() - s_fxPressStartMs >= FX_LONGPRESS_MS)) {
+        s_fxLongPressFired = true;
+        uint8_t firedOpt = s_fxPressOpt;
+        s_fxPressOpt = 255; // done with this press regardless of outcome — s_overlay may
+                             // change inside overlayFxEnterAutomation(), after which the key
+                             // loop's release handler won't see OVERLAY_FX anymore to clear it
+        overlayFxEnterAutomation(firedOpt);
     }
 
     // ---- JOYSTICK CLICK ----
@@ -10444,7 +10544,7 @@ void loop() {
                 lpBpm=pots[2].value;
                 Serial.printf("B:%d\n", bpm);
                 if(fxList[5].active && audioReady) applyFxEffect(5); // re-sync delay to new BPM
-                if(fxList[8].active && audioReady) applyFxEffect(8); // re-sync resecho to new BPM
+                if(fxList[7].active && audioReady) applyFxEffect(7); // re-sync resecho to new BPM
             }
         }
 
@@ -11323,46 +11423,13 @@ void loop() {
             }
         }
 
-        // LFO filter modulation (10ms tick) — FX chain LFO slot
-        if(fxList[6].active&&audioReady){
-            static float lfoPhase=0.0f;
-            static uint8_t lfoLogTick=0;
-            static bool lfoWasActive=false;
-            float rate  = fxList[6].params[0];
-            float depth = fxList[6].params[1];
-            lfoPhase += rate * 2.0f * (float)M_PI * 0.01f;
-            if(lfoPhase > 2.0f*(float)M_PI) lfoPhase -= 2.0f*(float)M_PI;
-            if(depth > 0.005f){
-                lfoWasActive = true;
-                float lfoMod = (1.0f + sinf(lfoPhase)) * 0.5f;
-                float baseCut, baseRes;
-                if (fxList[0].active) {
-                    baseCut = fxList[0].params[0];
-                    baseRes = fxList[0].params[1];
-                } else {
-                    audioGetNativeCutoff(currentShape, baseCut, baseRes);
-                }
-                float cut = baseCut * (1.0f - depth * lfoMod * 0.8f);
-                if(++lfoLogTick >= 50){
-                    Serial.printf("LFO tick cut=%.0f res=%.2f mod=%.2f\n", cut, baseRes, lfoMod);
-                    lfoLogTick=0;
-                }
-                audioSetAllFilters(cut, baseRes);
-            } else if(lfoWasActive) {
-                // Depth just dropped to 0 — restore SYNTH_CH to its clean shape state so the
-                // last LFO filter position doesn't remain stuck (especially critical for patches).
-                lfoWasActive = false;
-                audioRestoreShapeFilter(currentShape);
-            }
-        }
-
-        // TREMOLO (10ms tick) — volume LFO, same shape as the filter-LFO tick above,
-        // just modulating the volume pot's own output instead of cutoff.
-        if(fxList[11].active&&audioReady){
+        // TREMOLO (10ms tick) — volume LFO, software 10ms tick modulating the volume
+        // pot's own output.
+        if(fxList[10].active&&audioReady){
             static float tremPhase=0.0f;
             static bool  tremWasActive=false;
-            float rate  = fxList[11].params[0];
-            float depth = fxList[11].params[1];
+            float rate  = fxList[10].params[0];
+            float depth = fxList[10].params[1];
             tremPhase += rate * 2.0f * (float)M_PI * 0.01f;
             if(tremPhase > 2.0f*(float)M_PI) tremPhase -= 2.0f*(float)M_PI;
             if(depth > 0.005f){
@@ -11376,11 +11443,11 @@ void loop() {
         }
 
         // AUTOPAN (10ms tick) — stereo pan LFO, same shape as TREMOLO but driving pan.
-        if(fxList[12].active&&audioReady){
+        if(fxList[11].active&&audioReady){
             static float panPhase=0.0f;
             static bool  panWasActive=false;
-            float rate  = fxList[12].params[0];
-            float depth = fxList[12].params[1];
+            float rate  = fxList[11].params[0];
+            float depth = fxList[11].params[1];
             panPhase += rate * 2.0f * (float)M_PI * 0.01f;
             if(panPhase > 2.0f*(float)M_PI) panPhase -= 2.0f*(float)M_PI;
             if(depth > 0.005f){
@@ -11400,15 +11467,35 @@ void loop() {
         // Smooth FILT cutoff application — anti-zipper when turning the cutoff encoder.
         // Use audioSetFilterFreq (no filter_type field) to avoid AMY biquad state resets
         // that cause an audible pop/click on each value change.
-        if (fxList[0].active && !fxList[6].active && audioReady) {
-            // Converge raw cutoff (anti-zipper)
-            float prevCut = lpfSmoothCut;
-            lpfSmoothCut += (fxList[0].params[0] - lpfSmoothCut) * 0.5f;
-            float   effCut = lpfSmoothCut;
-            float   effRes = fxList[0].params[1];
-            audioSetFilterFreq(effCut, effRes);
-            if (fabsf(lpfSmoothCut - prevCut) > 1.0f)
-                audioSetGranular2FilterFreq(effCut, effRes);
+        //
+        // Skipped while a mod slot is automating FILT's cutoff: modSlotApply() (called by
+        // modSlotsTick10ms() just above) writes the modulated value, calls applyFxEffect(0)
+        // to push it to AMY, then immediately restores fxList[0].params[0] back to the
+        // static pot-set base — so by the time THIS block ran right after, it always read
+        // that static base (never the modulated value) and smoothly converged lpfSmoothCut
+        // toward it, calling audioSetFilterFreq() and overwriting the very cutoff automation
+        // had just applied moments earlier. Net effect: the automated sweep was cancelled
+        // out within the same 10ms tick it was applied in — the cutoff value genuinely
+        // oscillated (visible in the FX0 FILT log line) but the audio never reflected it.
+        // While automation owns this param, its own per-tick apply is already the "current"
+        // value — the anti-zipper's job (smoothing a human turning a pot) doesn't apply.
+        if (fxList[0].active && audioReady) {
+            int8_t cutModSlot = modSlotFindFxParam(0, 0);
+            bool cutAutomated = (cutModSlot >= 0 && gModSlots[cutModSlot].active);
+            if (!cutAutomated) {
+                // Converge raw cutoff (anti-zipper)
+                float prevCut = lpfSmoothCut;
+                lpfSmoothCut += (fxList[0].params[0] - lpfSmoothCut) * 0.5f;
+                float   effCut = lpfSmoothCut;
+                float   effRes = fxList[0].params[1];
+                audioSetFilterFreq(effCut, effRes);
+                if (fabsf(lpfSmoothCut - prevCut) > 1.0f)
+                    audioSetGranular2FilterFreq(effCut, effRes);
+            } else {
+                // Keep in sync with the static base so turning automation back off resumes
+                // smoothing from a sane starting point instead of an old, stale value.
+                lpfSmoothCut = fxList[0].params[0];
+            }
         }
 
         // GR2 SEQ: advance head pointer when current slice's wall-clock deadline passes.
