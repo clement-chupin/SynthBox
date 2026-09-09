@@ -64,7 +64,7 @@ structure/
 | SS2 | `MODE_SS2` | Séquenceur sample 16 steps : 16 slots, altération par step |
 | ANIM | `MODE_ANIM` | Animations visuelles sur l'écran : WAVE/BARS/TECHNO/ACID/8BIT |
 | I303 | `MODE_I303` | TB-303 polyphonique : 6 voix accord/mélodie, moteur sonore 303S complet |
-| VID | `MODE_VID` | Lecteur vidéo : fichiers `.bvid` 128×128 1bpp depuis la carte SD |
+| VID | `MODE_VID` | Lecteur vidéo/MEDIA : fichiers `.bvid` 128×128 1bpp, `.jpg`/`.png`/**`.gif`** (auto-convertis), `.wav`/`.mp3` (aperçu audio) depuis la carte SD |
 | LANIM | `MODE_LANIM` | Animations LED : flash/rainbow/chase/noise/organic, pilotées aux pots |
 | EXP | `MODE_EXP` | Thérémine expérimental : joystick Y=pitch X=texture, touches=modificateurs |
 | EXP2 | `MODE_EXP2` | PolyBounce : balles physiques dans un hexagone tournant, rebonds = notes |
@@ -259,21 +259,80 @@ MODULAR ont été ajoutés ensuite (`audioApplyFilterToStone`/`audioApplyFilterT
 La 303S (bus 1) est mergée dans le bus 0 **avant** le traitement FX dans `amy.c`, donc les
 effets bus-0 s'appliquent au signal combiné sans allocation mémoire supplémentaire.
 
-### Automatisation des FX (double-clic) — `OVERLAY_FX_MOD`
+### FILT — plages de résonance et filtre natif des patches
 
-Double-cliquer un slot FX **déjà actif** dans la grille FX ouvre un éditeur dédié
-(`OVERLAY_FX_MOD`) plutôt que de désactiver l'effet : joystick X change quel paramètre du
-FX est automatisé, les pots P4-P7 règlent profondeur/vitesse/forme d'onde/synchro BPM.
+Le pot Res (P5 dans la grille FX) est un seul paramètre brut (`e.params[1]`, plage
+0.5–3.0) reprojeté séparément pour chaque type de filtre dans `applyFxEffect()` case 0
+(`resT` = position 0..1 sur cette plage, indépendante des deux mappings ci-dessous) :
+
+- **LPF/HPF/BPF (natif AMY)** : Q reprojeté sur 0.7 (neutre, valeur par défaut d'AMY
+  elle-même — donc « résonance à zéro » reste plat) à 9.7 (pic net, ~20dB). `Q=3.0` (l'ancien
+  plafond direct, sans reprojection) était perçu comme trop faible — un vrai filtre
+  « screamer » tourne plutôt autour de Q=8-15. `dsps_biquad_gen_lpf_f32` (`filters.c`) ne
+  plafonne que le bas (Q≥0.51), stable à n'importe quel Q fini.
+- **LADDER** : résonance brute reprojetée sur 2.25–18 (au lieu de `res*4.5` = 2.25–13.5) —
+  la borne haute dépasse maintenant volontairement le seuil (~15) où le soft-clip de
+  sécurité commence à compresser, pour laisser un peu de grain « intéressant » en bout de
+  course une fois le sifflement aigu ci-dessous corrigé.
+
+Pour les patches Juno/DX7 (`s_synthChIsPatch`), cutoff **et** résonance sont reprojetés en
+continu vers le filtre natif du patch (`remapCutoffResToNative()`, `audio_engine.cpp`,
+utilisé par `audioSetAllFiltersT`/`audioSetAllFilters`/`audioSetFilterFreq`) plutôt que
+bornés (`fminf`) : un simple `min(cutoff, nativeCC)` transformait tout le haut du pot
+(cutoff ≥ nativeCC, souvent la moitié+ de la course pour la plupart des patches, ex.
+~994Hz pour J:PNO sur une plage 65-18000Hz) en un plateau plat identique — plus aucune
+différence audible entre par ex. 1000Hz et 18000Hz de cutoff, alors que le bas du pot
+restait, lui, pleinement fonctionnel. `remapCutoffResToNative()` réutilise plutôt la même
+courbe exponentielle que le pot lui-même pour reprojeter tout `[65, 18000]` sur
+`[65, nativeCC]`, en continu — toute la course du potard redevient utile, tout en gardant
+exactement les mêmes points fixes qu'avant à chaque extrémité (fermé = plein contrôle FX,
+grand ouvert = exactement le son natif du patch, résonance native comprise — sinon activer
+le FX avec sa propre résonance réglée change la texture même à cutoff « transparent »).
+
+### LADDER — sifflement dans les aigus (fc2 taper)
+
+Le pic résonant de LADDER vient de la différence entre deux cascades passe-bas (une
+normale, une réglée 1.6× plus brillante) — voir le commentaire "History" dans le bloc bus-0
+de `amy.c`. À cutoff élevé, l'ancienne implémentation plafonnait dur la cascade brillante
+près de Nyquist (`fc2 = min(cutoff*1.6, fs*0.45)`), ce qui la rendait quasi transparente :
+la différence utilisée pour le pic devenait alors presque tout le contenu aigu brut du
+signal d'entrée, non filtré — entendu comme un grésillement large bande plutôt qu'un pic
+résonant propre. Fix : le ratio 1.6× lui-même se réduit progressivement vers 1.0× à mesure
+que le cutoff approche Nyquist (`headroom = (nyquist-cutoff)/nyquist`), gardant les deux
+cascades proches l'une de l'autre en permanence — le pic reste étroit sur toute la plage.
+Comportement inchangé aux cutoffs bas/moyens (la majorité de la plage pratique).
+
+### Automatisation des FX (appui long) — `OVERLAY_FX_MOD`
+
+Un **appui long** (≥`FX_LONGPRESS_MS`=500ms, `s_fxPressOpt`/`s_fxLongPressFired` dans
+`main.cpp`) sur un slot FX dans la grille FX ouvre un éditeur dédié (`OVERLAY_FX_MOD`)
+plutôt que de togglé l'effet — un appui **court** garde le comportement normal
+(active/désactive). Appuyer long sur un FX **inactif** l'active d'abord
+(`overlayFxToggle()`) puis entre directement dans l'éditeur, en un seul geste. Remplace
+l'ancien mécanisme au double-clic (retiré : sujet à une race condition sur le second clic,
+et moins découvrable qu'un appui long standard).
+
+Dans l'éditeur : joystick X change quel paramètre du FX est automatisé. Pots :
+- **P4** = profondeur (0 = pas de slot alloué tant qu'on ne monte pas au-dessus d'un seuil)
+- **P5** = **vitesse, un seul potard continu** couvrant tout le spectre : subdivisions
+  synchronisées au BPM (`kDelaySubdiv[]`, lentes → rapides) dans la moitié basse, Hz libre
+  (0.5–20Hz) dans la moitié haute — voir le bloc de dispatch pots dans `main.cpp` pour le
+  détail du remapping. Avant cette unification, P5 (Hz libre seul) et P7 (toggle sync +
+  subdivision, actif seulement au-dessus de 50%) étaient deux potards séparés ; la moitié
+  basse de P7 ne faisait alors *rien* une fois en mode Hz libre — perçu comme « le potard
+  reste bloqué ». P7 est désormais inutilisé dans cet overlay.
+- **P6** = forme d'onde (sine/tri/carré/sample&hold)
+
 Repose sur un moteur de modulation générique (`gModSlots[]`, struct `ModSlot`, `main.cpp`)
-— sine/tri/carré/sample&hold, Hz libre ou synchronisé au BPM (table `kDelaySubdiv[]`) —
 qui généralise le pattern déjà utilisé par les FX TREMOLO/AUTOPAN (accumulateur de
 phase + porte de profondeur + restauration propre à la désactivation), sans les modifier :
 `gModSlots[0..3]` sont un pool général alloué dynamiquement par cette UI,
 `gModSlots[4]` est réservé au LFO du synthé modulaire (voir plus bas).
 La cible `MODDEST_FX_PARAM` applique la modulation en écrivant temporairement dans
-`fxList[fx].params[param]`, en appelant `applyFxEffect(fx)`, puis en restaurant la valeur
-« centre » réglée par l'utilisateur — aucune modification n'était nécessaire dans
-`applyFxEffect()` lui-même.
+`fxList[fx].params[param]`, en appelant `applyFxEffect(fx, /*silent=*/true)` (le tick
+10ms de cette automatisation appelle `applyFxEffect()` en continu ; le flag `silent`
+évite de spammer le terminal à chaque tick — les appels normaux, hors automatisation,
+gardent leur log), puis en restaurant la valeur « centre » réglée par l'utilisateur.
 
 ---
 
@@ -347,6 +406,36 @@ overlay séparé interromprait le jeu.
 
 ---
 
+## MODE_VID / MEDIA — lecture de `.gif` animés
+
+En plus des `.bvid` natifs et des stills `.jpg`/`.png` (déjà auto-convertis via
+`loadOrConvertBvid()`), le navigateur de fichiers de MEDIA (`isMediaFile()`) accepte
+maintenant les `.gif` animés (`isGifFile()`), converties à la volée en `.bvid` multi-frame
+au premier accès et mises en cache à côté de la source (`<nom>.gif.anim.bvid` +
+`.anim.bvid.meta`, validité basée sur la taille du fichier source — même schéma que le
+cache mono-frame des stills). Une fois convertie, la lecture réutilise tel quel le
+mécanisme de streaming `.bvid` existant (`vidFile`/`vidPlaying`) — aucun changement côté
+lecture, seulement à l'ouverture.
+
+Le décodage GIF passe par `imgDecodeGifFrames()` (nouvelle fonction dans
+`{simulator/hal,include}/jpegdec.h`), qui s'appuie sur le décodeur GIF déjà vendorisé dans
+stb_image (`stbi_load_gif_from_memory`, jamais compilé avant faute d'appelant) — donc
+aucune nouvelle dépendance. **Limitation actuelle : simulateur/Android seulement.** Sur
+ESP32, `imgDecodeGifFrames()` est un stub qui log et pointe vers `tools/to_bvid.py` (voir
+son commentaire dans `include/jpegdec.h`) — écrire un décodeur GIF (LZW + multi-frame +
+palette) dans le même style *streaming* que le décodeur PNG maison de ce fichier serait un
+chantier bien plus gros que PNG (mono-frame) et n'a pas été tenté sans matériel réel pour
+le valider.
+
+`loadOrConvertBvid()` (utilisé par le picker d'animations de DRUM2, une seule frame par
+slot) accepte aussi les `.gif` maintenant, mais n'en garde que la **première frame** — son
+cache (`<nom>.bvid`) est délibérément un fichier séparé de celui de MEDIA
+(`<nom>.gif.anim.bvid`) : les deux consommateurs veulent un nombre de frames différent
+depuis la même source, partager un seul fichier de cache aurait fait que l'un écrase
+systématiquement la conversion de l'autre à la prochaine ouverture.
+
+---
+
 ## Pots (encodeurs rotatifs)
 
 | Pot | Plage | Rôle contextuel |
@@ -375,3 +464,31 @@ Buffer AMY bus ≈ ±9. Le wavefolder original sans normalisation produisait du 
 
 ### `config_reverb/echo` sur bus 1 → crash
 Ces fonctions allouent ~256KB de delay lines en PSRAM. Les appeler sur bus 0 ET bus 1 double l'allocation → PSRAM saturée. Solution : merger bus 1 dans bus 0 dans `amy.c` avant les FX.
+
+### FILT bypass au cutoff max → « s'active » aléatoirement
+`audioSetAllFiltersT()` etc. traitaient `cutoff >= 18000.0f` (exact) comme « FX transparent,
+ne pas appliquer de filtre du tout ». Le mapping exponentiel du pot Cut (`mn*powf(mx/mn,
+potValue)`) ne retombe pas forcément pile sur 18000.0f même à `potValue==1.0` exact — de
+simples arrondis flottants dans `powf` suffisent à faire basculer le résultat de quelques
+Hz d'un côté ou de l'autre du seuil, donc le filtre passait de façon imprévisible entre
+« complètement absent » (`FILTER_NONE`) et « réellement engagé » à cutoff quasi-max —
+entendu comme une activation aléatoire, surtout audible avec la résonance également au
+maximum. Fix définitif : le bypass ne signifie plus QUE « FX vraiment désactivé » (les
+appelants passent `0.0f` dans ce cas — voir `applyFxEffect` case 0) ; un cutoff élevé mais
+réel garde le filtre engagé en continu, sans bascule de topologie. Voir aussi la section
+FILT ci-dessus (`remapCutoffResToNative`) pour la suite de cette même investigation : même
+architecture propre, encore fallait-il que le filtre du patch, à cutoff élevé, converge
+en douceur vers le natif plutôt que de plafonner brutalement.
+
+### Seuils exacts / plafonds plats sur une plage de potard → zone morte
+Deux bugs distincts, même famille : un test d'égalité/seuil exact près du bord d'une plage
+de paramètre (`cutoff >= 18000.0f` ci-dessus) est fragile aux arrondis flottants ; un
+plafonnement plat (`fminf(cutoff, nativeCC)`) au-delà d'un seuil peut geler toute une
+portion de la course d'un potard sur une valeur identique (zone morte — la moitié+ du pot
+Cut ne changeait plus rien de perceptible pour la plupart des patches). Un potard séparé
+qui ne fait *rien* d'observable sur une partie de sa course (l'ancien P7 de l'automatisation
+FX en dessous de 50%, avant sa fusion avec P5 — voir la section automatisation ci-dessus)
+tombe dans la même famille perceptible côté utilisateur : « le potard reste bloqué ».
+Pattern de fix qui s'est répété trois fois cette session : remplacer le seuil/plafond dur
+par soit une marge/hystérésis, soit — mieux — un remapping continu qui garde toute la
+course du potard utile.

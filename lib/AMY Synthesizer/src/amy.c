@@ -2081,12 +2081,27 @@ int16_t * amy_fill_buffer() {
         float g = 1.0f - expf(-2.0f * (float)M_PI * amy_ladder_cutoff / (float)AMY_SAMPLE_RATE);
         if (g < 0.001f) g = 0.001f;
         if (g > 0.999f) g = 0.999f;
-        // Second cascade's cutoff is a fixed multiple brighter than the first, computed
-        // the same correct way (not by scaling the coefficient directly, which doesn't
+        // Second cascade's cutoff is a multiple brighter than the first, computed the
+        // same correct way (not by scaling the coefficient directly, which doesn't
         // correspond to a clean frequency ratio) — the gap between the two is what
-        // shapes the resonant bump's width, clamped so it stays sane near Nyquist.
-        float fc2 = amy_ladder_cutoff * 1.6f;
-        if (fc2 > AMY_SAMPLE_RATE * 0.45f) fc2 = AMY_SAMPLE_RATE * 0.45f;
+        // shapes the resonant bump's width. A FIXED 1.6x ratio, hard-clamped near
+        // Nyquist, meant that at high cutoff settings cascade B had no room left to
+        // actually be 1.6x brighter: it degenerated into a nearly all-pass stage (g2
+        // close to 1), letting almost all of the input's raw high-frequency content
+        // straight through into the (s[3]-s[1]) difference used for the bump below —
+        // audible as harsh broadband sizzle/crackle in the treble rather than a clean
+        // resonant hump ("le LDR grésille un peu trop dans les aigus"). Shrinking the
+        // ratio itself toward 1.0 as cutoff approaches Nyquist keeps cascade B
+        // proportionally close to cascade A throughout, so the bump stays a narrowband
+        // hump near the cutoff instead of degrading into broadband hiss — behavior at
+        // low/mid cutoff (most of the practical range, headroom≈1) is unchanged. This
+        // also makes fc2 self-limiting (it can only approach amy_ladder_cutoff itself,
+        // never exceed it), so the old hard Nyquist clamp is no longer needed.
+        float nyquist  = AMY_SAMPLE_RATE * 0.5f;
+        float headroom = (nyquist - amy_ladder_cutoff) / nyquist;  // 1 at low cutoff, ->0 near Nyquist
+        if (headroom < 0.0f) headroom = 0.0f;
+        if (headroom > 1.0f) headroom = 1.0f;
+        float fc2 = amy_ladder_cutoff * (1.0f + 0.6f * headroom);  // ratio tapers 1.6x -> 1.0x
         float g2 = 1.0f - expf(-2.0f * (float)M_PI * fc2 / (float)AMY_SAMPLE_RATE);
         if (g2 < 0.001f) g2 = 0.001f;
         if (g2 > 0.999f) g2 = 0.999f;

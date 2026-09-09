@@ -28,3 +28,25 @@ static inline bool imgDecodeGray(const uint8_t* buf, size_t len, uint8_t** outGr
     *outH    = h;
     return true;
 }
+
+// Decodes an animated GIF's frames to 8-bit grayscale, all frames concatenated
+// row-major (frame 0's w*h bytes, then frame 1's, ...). stb_image's GIF decoder
+// (vendored above, STBI_NO_GIF never defined here) already does the palette
+// resolution and multi-frame walk — this just requests 1 output channel
+// (grayscale) instead of the RGB/RGBA it'd otherwise produce, same as
+// imgDecodeGray() does for stills. On success, *outGray and *outDelaysMs (one
+// entry per frame, in ms) are buffers the caller must free() (both are plain
+// malloc under the hood); returns false on failure (nothing to free).
+static inline bool imgDecodeGifFrames(const uint8_t* buf, size_t len, uint8_t** outGray,
+                                       int* outW, int* outH, int* outFrameCount, int** outDelaysMs) {
+    int w = 0, h = 0, frames = 0, channels = 0;
+    int* delays = nullptr;
+    uint8_t* gray = stbi_load_gif_from_memory(buf, (int)len, &delays, &w, &h, &frames, &channels, 1);
+    if (!gray || w <= 0 || h <= 0 || frames <= 0) {
+        if (gray) stbi_image_free(gray);
+        if (delays) free(delays);
+        return false;
+    }
+    *outGray = gray; *outW = w; *outH = h; *outFrameCount = frames; *outDelaysMs = delays;
+    return true;
+}

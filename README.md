@@ -31,9 +31,18 @@ Le même code applicatif (`src/`) tourne sur quatre cibles :
 
 ## Nouveautés récentes
 
-- **Automatisation des effets** — double-cliquer un effet actif dans la grille FX ouvre
-  un éditeur de modulation (LFO assignable à n'importe quel paramètre de l'effet,
-  profondeur/vitesse/forme d'onde/synchro BPM réglables aux pots).
+- **Automatisation des effets** — un appui long sur un effet actif dans la grille FX
+  ouvre un éditeur de modulation (LFO assignable à n'importe quel paramètre de l'effet,
+  profondeur/vitesse/forme d'onde réglables aux pots, vitesse balayant en continu des
+  subdivisions BPM jusqu'au Hz libre sur un seul potard). Un appui long sur un effet
+  inactif l'active directement et ouvre l'éditeur.
+- **Résonance renforcée sur le filtre (LPF/HPF/BPF/LADDER)** — plage de résonance
+  élargie sur les deux types, et le sifflement dans les aigus du filtre LADDER à cutoff
+  élevé a été corrigé (le pic résonant reste étroit sur toute la plage au lieu de
+  dégénérer en bruit large bande près de Nyquist).
+- **Lecture de `.gif` animés dans MEDIA** — conversion automatique en interne (mise en
+  cache) vers le format vidéo natif, aucune étape manuelle requise ; simulateur/Android
+  pour l'instant (voir [CLAUDE.md](CLAUDE.md)).
 - **Synthé modulaire wavetable** (mode MODULAR, refonte complète) — deux oscillateurs
   qui parcourent des wavetables AMY (5 tables embarquées, 64 formes d'onde chacune),
   position de morphing indépendante par oscillateur, LFO de modulation, filtre partagé.

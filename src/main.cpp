@@ -1680,9 +1680,13 @@ static uint8_t  s_fxPressOpt       = 255; // opt currently held down in the FX g
 static uint32_t s_fxPressStartMs   = 0;
 static bool     s_fxLongPressFired = false;
 
-void applyFxEffect(uint8_t fx) {
+void applyFxEffect(uint8_t fx, bool silent = false) {
     FxEffect &e = fxList[fx];
     bool on = e.active;
+    // `silent`: the mod-slot automation tick (modSlotApply/modSlotRestore) calls this
+    // every 10ms per automated FX to push the modulated value through — logging every
+    // call would spam ~100 lines/sec while an LFO is running. Normal user-driven calls
+    // (toggle, pot edit) keep logging as before.
     // Helper: no FX filter active → safe to restore shape's native filter coefficients
     // BITCRS counts as filter-user when its Cut param is set (params[1] > 200Hz)
     auto noFilterFx = [&]() {
@@ -1695,15 +1699,39 @@ void applyFxEffect(uint8_t fx) {
             uint8_t ti  = (uint8_t)constrain((int)roundf(e.params[3]), 0, 3);
             bool ladder = (ti == 3);
             float   cut = e.params[0], res = e.params[1];
-            Serial.printf("FX0 FILT %s cut=%.0f res=%.2f typ=%s\n",
+            if (!silent) Serial.printf("FX0 FILT %s cut=%.0f res=%.2f typ=%s\n",
                 on?"ON":"off", on?cut:0.0f, on?res:1.5f, kFiltTypN[ti]);
+            // Res knob position, independent of its own param range (0..1, 0=paramMin,
+            // 1=paramMax) — used below to drive each filter type's own well-tuned
+            // resonance range off the SAME physical pot position, rather than feeding
+            // the raw 0.5-3.0 `res` value into both. Reported as too weak on both LPF
+            // and LADDER: AMY's native Q=3.0 ceiling (the old direct e.resonance=res)
+            // is a fairly mild peak by synth-filter standards (real "screamer" filters
+            // commonly run Q 8-15+), and LADDER's own raw-resonance ceiling was tuned
+            // independently (see nativeRes/ladderRes below) — coupling them 1:1 to the
+            // same 0.5-3.0 range would force one bad compromise between the two.
+            float resT = (res - e.paramMin[1]) / (e.paramMax[1] - e.paramMin[1]);
+            // AMY-native LPF/HPF/BPF: Q from 0.7 (AMY's own neutral/no-resonance
+            // default, see amy.c's default synth->resonance=0.7f — so "resonance
+            // dialed to zero" still reads as flat/neutral, not arbitrarily raised) up
+            // to 9.7, a genuinely strong resonant peak (dsps_biquad_gen_lpf_f32 in
+            // filters.c only floors Q at 0.51, no ceiling — stays stable at any finite Q).
+            float nativeRes = 0.7f + resT * (9.7f - 0.7f);
+            // LADDER: raw resonance 2.25 (same floor as the old res*4.5 mapping, no
+            // regression at the bottom of the knob) up to 18 — a bit past the ~15
+            // where the safety soft-clip in amy.c's bus-0 block starts visibly
+            // compressing further gains, intentionally: the fc2-taper fix in that same
+            // block (see amy.c) removes the broadband treble sizzle that used to make
+            // pushing resonance further feel harsh rather than "interesting", so there's
+            // now real headroom to lean into that soft-clip character at the very top.
+            float ladderRes = 2.25f + resT * (18.0f - 2.25f);
             // LADDER bypasses AMY's own per-voice filter (plain linear biquads, no
             // ladder topology exists in AMY) and instead runs a custom bus-level 4-pole
             // filter with tanh-saturated feedback — see audioSetLadderFilter() and
             // amy.c's bus-0 processing block for the actual "exotic" nonlinear rolloff.
-            audioSetAllFiltersT(on && !ladder ? cut : 0.0f, on && !ladder ? res : 1.5f,
+            audioSetAllFiltersT(on && !ladder ? cut : 0.0f, on && !ladder ? nativeRes : 1.5f,
                                 (on && !ladder) ? kFiltAMY[ti] : FILTER_LPF24);
-            audioSetLadderFilter(cut, res * 4.5f, on && ladder);  // *4.5: maps the shared 0.5-3.0 param range onto ~2.25-13.5, the smooth/dramatic part of the measured resonance-vs-RMS curve for this filter's feedforward design (RMS climbs ~7x smoothly across that span before the safety soft-clip starts compressing further gains past ~15)
+            audioSetLadderFilter(cut, ladderRes, on && ladder);
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
             // audioSetAllFiltersT() above reaches every channel including T303_CH, so
             // turning the FX LPF off leaves the 303 stuck on the FX's last cutoff/type
@@ -1714,33 +1742,33 @@ void applyFxEffect(uint8_t fx) {
             break;
         }
         case 1:  // Distortion: drive + tone
-            Serial.printf("FX1 DIST %s drv=%.2f ton=%.2f\n",
+            if (!silent) Serial.printf("FX1 DIST %s drv=%.2f ton=%.2f\n",
                           on?"ON":"off", on?e.params[0]:0.0f, e.params[1]);
             audioSetDistortion(on ? e.params[0] : 0.0f, e.params[1]);
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
             break;
         case 2:  // Reverb
-            Serial.printf("FX2 REV %s lvl=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
+            if (!silent) Serial.printf("FX2 REV %s lvl=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
             audioSetReverb(on ? e.params[0] : 0.0f, e.params[1], e.params[2], e.params[3]);
             break;
         case 3:  // Chorus
-            Serial.printf("FX3 CHO %s lvl=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
+            if (!silent) Serial.printf("FX3 CHO %s lvl=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
             audioSetChorus(on ? e.params[0] : 0.0f, e.params[1], e.params[2]);
             break;
         case 4:  // Flanger — params[3] controls max_delay (5-100ms; shorter=comb, longer=chorus)
-            Serial.printf("FX4 FLG %s lvl=%.2f dly=%.0fms\n", on?"ON":"off", on?e.params[0]:0.0f, e.params[3]);
+            if (!silent) Serial.printf("FX4 FLG %s lvl=%.2f dly=%.0fms\n", on?"ON":"off", on?e.params[0]:0.0f, e.params[3]);
             config_chorus(0, on ? e.params[0] : 0.0f, (uint16_t)e.params[3], e.params[1], e.params[2]);
             break;
         case 5: {  // Delay — tempo-synced; param[1] = subdivision index 0..6
             uint8_t si = (uint8_t)constrain((int)roundf(e.params[1]), 0, DELAY_SUBDIV_COUNT-1);
             float dms  = 60000.0f / (float)bpm * kDelaySubdiv[si];
             dms = constrain(dms, 30.0f, 700.0f);
-            Serial.printf("FX5 DLY %s lvl=%.2f div=%s %.0fms\n", on?"ON":"off", on?e.params[0]:0.0f, kDelaySubdivName[si], dms);
+            if (!silent) Serial.printf("FX5 DLY %s lvl=%.2f div=%s %.0fms\n", on?"ON":"off", on?e.params[0]:0.0f, kDelaySubdivName[si], dms);
             audioSetDelay(on ? e.params[0] : 0.0f, dms, e.params[2], e.params[3]);
             break;
         }
         case 6:  // EQ
-            Serial.printf("FX6 EQ  %s L=%.2f M=%.2f H=%.2f\n", on?"ON":"off",
+            if (!silent) Serial.printf("FX6 EQ  %s L=%.2f M=%.2f H=%.2f\n", on?"ON":"off",
                           on?e.params[0]:1.0f, on?e.params[1]:1.0f, on?e.params[2]:1.0f);
             audioSetEq(on ? e.params[0] : 1.0f,
                        on ? e.params[1] : 1.0f,
@@ -1750,7 +1778,7 @@ void applyFxEffect(uint8_t fx) {
             uint8_t si = (uint8_t)constrain((int)roundf(e.params[3]), 0, DELAY_SUBDIV_COUNT-1);
             float dms  = 60000.0f / (float)bpm * kDelaySubdiv[si];
             dms = constrain(dms, 30.0f, 700.0f);
-            Serial.printf("FX7 RES %s lvl=%.2f fb=%.2f tone=%.2f %s=%.0fms\n",
+            if (!silent) Serial.printf("FX7 RES %s lvl=%.2f fb=%.2f tone=%.2f %s=%.0fms\n",
                           on?"ON":"off", on?e.params[0]:0.0f, e.params[1], e.params[2],
                           kDelaySubdivName[si], dms);
             audioSetDelay(on ? e.params[0] : 0.0f, dms, e.params[1], e.params[2]);
@@ -1760,7 +1788,7 @@ void applyFxEffect(uint8_t fx) {
             float thr = constrain(e.params[0], 0.05f, 1.0f);
             float baseWf = (currentMode == MODE_POKEMON) ? kPokemon[pkmnSelected].wavefold : 1.0f;
             float gain = on ? (baseWf / thr) : baseWf;
-            Serial.printf("FX8 REP %s seuil=%.2f gain=%.1f\n", on?"ON":"off", thr, gain);
+            if (!silent) Serial.printf("FX8 REP %s seuil=%.2f gain=%.1f\n", on?"ON":"off", thr, gain);
             audioSetWavefold(gain);
             break;
         }
@@ -1769,7 +1797,7 @@ void applyFxEffect(uint8_t fx) {
             float baseWf = (currentMode == MODE_POKEMON) ? kPokemon[pkmnSelected].wavefold : 1.0f;
             float gain = on ? powf(2.0f, 9.0f - bits) : baseWf;  // 8bit→2x, 4bit→32x, 2bit→128x; off→restore
             float cut  = e.params[1];
-            Serial.printf("FX9 BITCRS %s bits=%.0f gain=%.1f cut=%.0f\n",
+            if (!silent) Serial.printf("FX9 BITCRS %s bits=%.0f gain=%.1f cut=%.0f\n",
                           on?"ON":"off", bits, gain, cut);
             audioSetWavefold(gain);
             // LPF: use audioSetAllFiltersT so the filter type is properly set (LPF24)
@@ -1785,19 +1813,34 @@ void applyFxEffect(uint8_t fx) {
         case 11:  // AUTOPAN — handled in the 10ms loop (pan LFO)
             break;
         case 12:  // OVERDRIVE — single-knob filter drive
-            Serial.printf("FX12 OVERDRV %s drv=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
+            if (!silent) Serial.printf("FX12 OVERDRV %s drv=%.2f\n", on?"ON":"off", on?e.params[0]:0.0f);
             audioSetOverdrive(on ? e.params[0] : 0.0f);
             if (!on && noFilterFx()) audioRestoreShapeFilter(currentShape);
             break;
         case 13:  // RINGMOD — bus-0 sine-carrier amplitude modulation
-            Serial.printf("FX13 RINGMOD %s freq=%.0f mix=%.2f\n", on?"ON":"off", e.params[0], e.params[1]);
+            if (!silent) Serial.printf("FX13 RINGMOD %s freq=%.0f mix=%.2f\n", on?"ON":"off", e.params[0], e.params[1]);
             audioSetRingmod(e.params[0], e.params[1], on);
             break;
         case 14:  // COMPRESSOR — bus-0 feedforward peak compressor
-            Serial.printf("FX14 COMPRESS %s thr=%.2f ratio=%.1f\n", on?"ON":"off", e.params[0], e.params[1]);
+            if (!silent) Serial.printf("FX14 COMPRESS %s thr=%.2f ratio=%.1f\n", on?"ON":"off", e.params[0], e.params[1]);
             audioSetCompressor(e.params[0], e.params[1], on);
             break;
     }
+}
+
+// Returns the (unscaled-by-depth) excursion from `base` for a modulation sample in
+// [-1,+1], sized so that sample=+1 reaches exactly `mx` and sample=-1 reaches exactly
+// `mn` — asymmetric halves, each scaled to whichever headroom `base` actually has on
+// that side, rather than one symmetric ±(mx-mn)/2 swing. A symmetric swing clips hard
+// against mn/mx whenever `base` sits closer to one edge than the other: for FILT's
+// cutoff (mn=65Hz, mx=18000Hz), a typical base around 2000Hz combined with a fairly
+// deep LFO meant the unclamped trough would go deep negative, so the wave spent a large
+// fraction of every cycle pinned dead flat at exactly 65Hz — audible as automation
+// "sometimes getting stuck, no sound" rather than a smooth sweep, not a one-off glitch.
+// This construction can only ever touch the exact edges momentarily, at the true
+// peak/trough of the wave, never sit flat against them.
+static float modExcursion(float sample, float base, float mn, float mx) {
+    return (sample >= 0.0f) ? sample * (mx - base) : sample * (base - mn);
 }
 
 // Apply one modulation sample. FX_PARAM uses an "apply then restore fxList[].params[],
@@ -1810,9 +1853,9 @@ static void modSlotApply(ModSlot &s, float sample) {
         FxEffect &fx = fxList[s.destA];
         float mn = fx.paramMin[s.destB], mx = fx.paramMax[s.destB];
         float base = fx.params[s.destB];
-        float mod = constrain(base + s.depth*(mx-mn)*0.5f*sample, mn, mx);
+        float mod = base + s.depth * modExcursion(sample, base, mn, mx);
         fx.params[s.destB] = mod;
-        applyFxEffect(s.destA);
+        applyFxEffect(s.destA, true);
         fx.params[s.destB] = base;
     }
     // MODDEST_MOD_WTPOS_B: the modular synth's one LFO destination for this MVP —
@@ -1821,7 +1864,7 @@ static void modSlotApply(ModSlot &s, float sample) {
     // (see Section 1's declaration comment); other MODDEST_MOD_* destinations exist in
     // the enum for a future deeper mod-matrix but aren't wired to anything yet.
     else if (s.destKind == MODDEST_MOD_WTPOS_B) {
-        float pos = constrain(modOscBPos + s.depth * 0.5f * sample, 0.0f, 1.0f);
+        float pos = modOscBPos + s.depth * modExcursion(sample, modOscBPos, 0.0f, 1.0f);
         audioModularSetWtPos(MOD3_OSCB_CH, pos);
     }
 }
@@ -1891,7 +1934,17 @@ bool isImgFile(const char* name) {
     const char* ext = strrchr(name, '.');
     return ext && (strcasecmp(ext,".jpg")==0 || strcasecmp(ext,".jpeg")==0 || strcasecmp(ext,".png")==0);
 }
-bool isVidOrImgFile(const char* name) { return isVidFile(name) || isImgFile(name); }
+// Animated GIF — auto-converted like isImgFile() above, but on the simulator/Android
+// target only (see imgDecodeGifFrames(): no on-device decoder on ESP32 yet, that
+// stub logs and points at tools/to_bvid.py instead). MEDIA plays it as a real
+// multi-frame animation (convertGifAnimToBvid()); anywhere else that only wants a
+// single still (DRUM2's animation-folder browser, via loadOrConvertBvid()) gets
+// just its first frame.
+bool isGifFile(const char* name) {
+    const char* ext = strrchr(name, '.');
+    return ext && strcasecmp(ext,".gif")==0;
+}
+bool isVidOrImgFile(const char* name) { return isVidFile(name) || isImgFile(name) || isGifFile(name); }
 // MEDIA mode's own browser filter — everything MODE_VID can open (.bvid/.png/.jpg/.jpeg
 // plus .wav/.mp3). Deliberately separate from isVidOrImgFile(): MODE_DRUM2's animation-
 // folder browser reuses isVidOrImgFile() too and must NOT gain audio files.
@@ -1968,7 +2021,8 @@ static bool loadOrConvertBvid(const String& path, uint8_t* outFrame2048) {
         f.close();
         return ok;
     }
-    if (!isImgFile(path.c_str())) return false;
+    bool isGif = isGifFile(path.c_str());
+    if (!isImgFile(path.c_str()) && !isGif) return false;
 
     File src = SD.open(path.c_str());
     if (!src) return false;
@@ -1978,8 +2032,8 @@ static bool loadOrConvertBvid(const String& path, uint8_t* outFrame2048) {
     String bvidPath = path + ".bvid";
     String metaPath  = path + ".bvid.meta";
 
-    // Cache hit: .meta's stored srcSize matches the jpg's current size, and the
-    // cached .bvid is exactly one frame long.
+    // Cache hit: .meta's stored srcSize matches the source file's current size, and
+    // the cached .bvid is exactly one frame long.
     File meta = SD.open(metaPath.c_str());
     if (meta) {
         uint32_t cachedSize = 0;
@@ -2000,11 +2054,11 @@ static bool loadOrConvertBvid(const String& path, uint8_t* outFrame2048) {
         }
     }
 
-    // Cache miss: decode the jpg, encode to a fresh .bvid, write both sidecars.
+    // Cache miss: decode the source image, encode to a fresh .bvid, write both sidecars.
     Serial.printf("IMG: converting %s (%u bytes)\n", path.c_str(), (unsigned)srcSize);
     File jsrc = SD.open(path.c_str());
     if (!jsrc) { Serial.println("IMG: source open failed"); return false; }
-    // ps_malloc (PSRAM), not malloc: a whole PNG/JPEG file can be several MB,
+    // ps_malloc (PSRAM), not malloc: a whole PNG/JPEG/GIF file can be several MB,
     // easily more than the ~200KB of internal RAM malloc() would otherwise try
     // to carve this out of.
     uint8_t* jbuf = (uint8_t*)ps_malloc(srcSize);
@@ -2014,12 +2068,23 @@ static bool loadOrConvertBvid(const String& path, uint8_t* outFrame2048) {
     if (got != srcSize) { Serial.printf("IMG: short read (%u/%u bytes)\n", (unsigned)got, (unsigned)srcSize); free(jbuf); return false; }
 
     uint8_t* gray = nullptr; int gw = 0, gh = 0;
-    bool decoded = imgDecodeGray(jbuf, srcSize, &gray, &gw, &gh);
+    int* delays = nullptr;  // only used/freed in the GIF branch
+    bool decoded;
+    if (isGif) {
+        int frames = 0;
+        // Only the first frame is used here — this path (unlike
+        // convertGifAnimToBvid()) is for single-still consumers (DRUM2's
+        // animation-folder browser), which only ever hold one frame per slot.
+        decoded = imgDecodeGifFrames(jbuf, srcSize, &gray, &gw, &gh, &frames, &delays);
+    } else {
+        decoded = imgDecodeGray(jbuf, srcSize, &gray, &gw, &gh);
+    }
     free(jbuf);
-    if (!decoded) { Serial.println("IMG: imgDecodeGray failed"); return false; }
+    if (!decoded) { Serial.println("IMG: decode failed"); return false; }
     Serial.printf("IMG: decoded %dx%d\n", gw, gh);
-    bvidEncodeFromGray(gray, gw, gh, outFrame2048);
+    bvidEncodeFromGray(gray, gw, gh, outFrame2048);  // gif: gray's first gw*gh bytes are frame 0
     free(gray);
+    if (delays) free(delays);
 
     BvidHeader hdr = {};
     memcpy(hdr.magic, "BVID", 4);
@@ -2036,6 +2101,93 @@ static bool loadOrConvertBvid(const String& path, uint8_t* outFrame2048) {
         mout.close();
     }
     return true;
+}
+
+// Convert an animated GIF to a proper multi-frame .bvid, cached alongside the
+// source as `<path>.anim.bvid` (+ `.anim.bvid.meta` for the same srcSize-based
+// staleness check as loadOrConvertBvid() above) — kept SEPARATE from that
+// function's own `<path>.bvid` single-frame cache (used by DRUM2's still-image
+// browser) since the two consumers want a different frame count from the same
+// source file; sharing one cache file would have each overwrite the other's
+// version on next open. Used by MEDIA (MODE_VID) when actually playing a GIF as
+// an animation — once written, the existing generic .bvid streaming playback
+// (vidFile/vidPlaying) plays it exactly like any native .bvid, no other changes
+// needed there. Returns the playable path on success (either freshly written or
+// a still-valid cached .anim.bvid), or "" on failure (see imgDecodeGifFrames()
+// for why this always fails on ESP32 for now).
+static String convertGifAnimToBvid(const String& path) {
+    File src = SD.open(path.c_str());
+    if (!src) return "";
+    uint32_t srcSize = src.size();
+    src.close();
+
+    String bvidPath = path + ".anim.bvid";
+    String metaPath  = path + ".anim.bvid.meta";
+
+    File meta = SD.open(metaPath.c_str());
+    if (meta) {
+        uint32_t cachedSize = 0;
+        bool metaOk = meta.read((uint8_t*)&cachedSize, sizeof(cachedSize)) == sizeof(cachedSize);
+        meta.close();
+        if (metaOk && cachedSize == srcSize) {
+            File cached = SD.open(bvidPath.c_str());
+            if (cached) {
+                bool ok = cached.size() > sizeof(BvidHeader);
+                cached.close();
+                if (ok) return bvidPath;
+            }
+        }
+    }
+
+    Serial.printf("VID: converting GIF %s (%u bytes)\n", path.c_str(), (unsigned)srcSize);
+    File gsrc = SD.open(path.c_str());
+    if (!gsrc) { Serial.println("VID: GIF source open failed"); return ""; }
+    uint8_t* gbuf = (uint8_t*)ps_malloc(srcSize);
+    if (!gbuf) { Serial.println("VID: ps_malloc(srcSize) failed"); gsrc.close(); return ""; }
+    uint32_t got = gsrc.read(gbuf, srcSize);
+    gsrc.close();
+    if (got != srcSize) { Serial.printf("VID: short read (%u/%u bytes)\n", (unsigned)got, (unsigned)srcSize); free(gbuf); return ""; }
+
+    uint8_t* gray = nullptr; int gw = 0, gh = 0, frameCount = 0; int* delaysMs = nullptr;
+    bool decoded = imgDecodeGifFrames(gbuf, srcSize, &gray, &gw, &gh, &frameCount, &delaysMs);
+    free(gbuf);
+    if (!decoded) { Serial.println("VID: GIF decode failed"); return ""; }
+
+    // Sanity cap: a pathologically long GIF turned frame-by-frame into 2048 bytes
+    // each would still eat real SD space — 300 frames is 30s at a typical 10fps,
+    // generous for the small looping clips this format is normally used for.
+    const int kMaxFrames = 300;
+    if (frameCount > kMaxFrames) {
+        Serial.printf("VID: GIF has %d frames, truncating to %d\n", frameCount, kMaxFrames);
+        frameCount = kMaxFrames;
+    }
+
+    long totalDelay = 0;
+    for (int i = 0; i < frameCount; i++) totalDelay += delaysMs[i];
+    float avgDelayMs = frameCount > 0 ? (float)totalDelay / frameCount : 100.0f;
+    if (avgDelayMs < 10.0f) avgDelayMs = 100.0f;  // 0/missing GIF delay -> conventional 10fps default
+    uint8_t fps = (uint8_t)constrain((int)roundf(1000.0f / avgDelayMs), 1, 30);
+    Serial.printf("VID: GIF decoded %dx%d, %d frames, ~%.0fms/frame -> %ufps\n", gw, gh, frameCount, avgDelayMs, fps);
+
+    BvidHeader hdr = {};
+    memcpy(hdr.magic, "BVID", 4);
+    hdr.width = 128; hdr.height = 128; hdr.fps = fps; hdr.frame_count = (uint32_t)frameCount;
+    File out = SD.open(bvidPath.c_str(), FILE_WRITE);
+    if (!out) { Serial.println("VID: .anim.bvid open-for-write failed"); free(gray); free(delaysMs); return ""; }
+    out.write((const uint8_t*)&hdr, sizeof(hdr));
+    uint8_t frameBuf[DRANI_FRAME_BYTES];
+    size_t frameStride = (size_t)gw * gh;
+    for (int i = 0; i < frameCount; i++) {
+        bvidEncodeFromGray(gray + (size_t)i * frameStride, gw, gh, frameBuf);
+        out.write(frameBuf, DRANI_FRAME_BYTES);
+    }
+    out.close();
+    free(gray);
+    free(delaysMs);
+
+    File mout = SD.open(metaPath.c_str(), FILE_WRITE);
+    if (mout) { mout.write((const uint8_t*)&srcSize, sizeof(srcSize)); mout.close(); }
+    return bvidPath;
 }
 
 static void draniLoadFolder(const String& folderPath) {
@@ -2989,13 +3141,13 @@ static void overlayFxToggle(uint8_t opt) {
     Serial.printf("OVL FX[%d] %s\n", opt, fxList[opt].active?"ON":"OFF");
 }
 
-// The FX grid's "long press" action: open the automation editor for an ALREADY-active
-// slot — automating an inactive FX makes no sense, so this is a no-op on an inactive one
-// (the short-press toggle already fired on press... no: press only arms the timer, so an
-// inactive FX held past the threshold just does nothing until release, which then performs
-// the normal toggle since s_fxLongPressFired stays false here).
+// The FX grid's "long press" action: open the automation editor, activating the FX
+// first if it wasn't already on — a long-press on an inactive slot is a single combo
+// gesture (turn it on + jump straight to automating it) rather than requiring a separate
+// short-press first. Reuses overlayFxToggle() for the activation since we already know
+// it's currently off here, so that call only ever flips it false->true.
 static void overlayFxEnterAutomation(uint8_t opt) {
-    if (!fxList[opt].active) return;
+    if (!fxList[opt].active) overlayFxToggle(opt);
     fxSelected = opt;
     s_fxModEditParam = 0;
     s_fxModEditSlot = modSlotFindFxParam(opt, 0);
@@ -9276,32 +9428,6 @@ void setup() {
     // same state handleButton()'s long-press-B1 path sets when opening the menu.
     menuOpen = true; menuRow = 0; menuCol = 0; menuOnTabBar = true;
 
-    // TEMP DBG: J:PNO brightness with FILT off / near-max-but-not-bypassed / genuinely low.
-    // Retrigger a FRESH note per phase (J:PNO has its own decay envelope even while held,
-    // so measuring across one continuous hold would conflate envelope decay with the
-    // filter's effect) — each phase measures the same early post-attack window instead.
-    menuOpen = false;
-    switchMode(MODE_SYNTH);
-    audioSetVolume(0.8f);
-    audioSetShape(SHAPE_JUNO_PIANO); // J:PNO
-    fxList[0].active = false; applyAllFx();
-    audioNoteOff(48); delay(200);
-    audioNoteOn(48, 0.8f);
-    Serial.println("TEMP DBG --- baseline, FILT off (native ~994Hz) ---"); delay(400);
-    audioNoteOff(48); delay(200);
-
-    fxList[0].active = true; fxList[0].params[0]=17000.0f; fxList[0].params[1]=1.5f; fxList[0].params[3]=0.0f;
-    applyAllFx();
-    audioNoteOn(48, 0.8f);
-    Serial.println("TEMP DBG --- FILT on, cutoff=17000 (near max, should be capped to native) ---"); delay(400);
-    audioNoteOff(48); delay(200);
-
-    fxList[0].params[0]=500.0f; applyAllFx();
-    audioNoteOn(48, 0.8f);
-    Serial.println("TEMP DBG --- FILT on, cutoff=500 (genuinely darker than native) ---"); delay(400);
-    audioNoteOff(48); delay(200);
-    Serial.println("TEMP DBG: J:PNO brightness check done");
-
     Serial.println("Ready");
 }
 
@@ -9502,6 +9628,11 @@ void loop() {
                         uint8_t tmpFrame[DRANI_FRAME_BYTES];
                         if (loadOrConvertBvid(fp, tmpFrame)) playPath = fp + ".bvid";
                         else { Serial.println("VID: image conversion failed, see IMG: log above"); playPath = ""; }
+                    } else if (isGifFile(fp.c_str())) {
+                        // Convert (or reuse the cached .anim.bvid) to a real multi-frame
+                        // animation, then stream that exactly like any native video.
+                        playPath = convertGifAnimToBvid(fp);
+                        if (!playPath.length()) Serial.println("VID: GIF conversion failed, see VID: log above");
                     }
                     if (playPath.length()) {
                         if (vidFileOpen) { vidFile.close(); vidFileOpen=false; }
@@ -10562,12 +10693,11 @@ void loop() {
         // FX-active-param dispatch below) since its meaning never depends on currentMode —
         // it's always "configure the automation for fxList[fxSelected]'s selected param."
         if (audioReady && s_overlay == OVERLAY_FX_MOD) {
-            static float lpFm[4] = {-1,-1,-1,-1};
+            static float lpFm[3] = {-1,-1,-1};
             bool changed = false;
             if (fabsf(pots[3].value - lpFm[0]) > 0.003f) { lpFm[0]=pots[3].value; changed=true; } // P4 depth
-            if (fabsf(pots[4].value - lpFm[1]) > 0.003f) { lpFm[1]=pots[4].value; changed=true; } // P5 rate
+            if (fabsf(pots[4].value - lpFm[1]) > 0.003f) { lpFm[1]=pots[4].value; changed=true; } // P5 rate (BPM sync + free Hz, merged)
             if (fabsf(pots[5].value - lpFm[2]) > 0.003f) { lpFm[2]=pots[5].value; changed=true; } // P6 shape
-            if (fabsf(pots[6].value - lpFm[3]) > 0.003f) { lpFm[3]=pots[6].value; changed=true; } // P7 bpm-sync/div
             if (changed) {
                 float depth = pots[3].value;
                 if (s_fxModEditSlot < 0 && depth > 0.01f) {
@@ -10578,10 +10708,26 @@ void loop() {
                     s.destKind = MODDEST_FX_PARAM;
                     s.destA = fxSelected; s.destB = s_fxModEditParam;
                     s.depth = depth;
-                    s.rateHz = 0.1f + pots[4].value * 19.9f;
+                    // P5 alone now sweeps the WHOLE rate spectrum, continuously: slow
+                    // BPM-synced subdivisions (1/2 down to 1/16) in the bottom half,
+                    // then free-running Hz (0.5-20Hz) in the top half — was split
+                    // across two pots before (P5=free-Hz only, P7=sync toggle+
+                    // subdivision, only reachable above 50%), and P7's lower half did
+                    // nothing to the rate at all: once in free-Hz mode, turning P7
+                    // further read as "the pot is stuck" (reported directly). One
+                    // continuous pot with no dead zone, matching the single "Rate:"
+                    // line already shown on screen. P7 is unused in this overlay now.
+                    const float kRateSplit = 0.5f;
+                    if (pots[4].value < kRateSplit) {
+                        s.bpmSync = true;
+                        float t = pots[4].value / kRateSplit;  // 0 (slowest) .. 1 (fastest)
+                        s.bpmDivIdx = (uint8_t)constrain((int)roundf((DELAY_SUBDIV_COUNT - 1) * (1.0f - t)), 0, DELAY_SUBDIV_COUNT - 1);
+                    } else {
+                        s.bpmSync = false;
+                        float t = (pots[4].value - kRateSplit) / (1.0f - kRateSplit);  // 0..1
+                        s.rateHz = 0.5f + t * (20.0f - 0.5f);
+                    }
                     s.shape = (ModWaveShape)constrain((int)(pots[5].value*3.99f), 0, MODSHAPE_COUNT-1);
-                    s.bpmSync = pots[6].value > 0.5f;
-                    if (s.bpmSync) s.bpmDivIdx = (uint8_t)constrain((int)((pots[6].value-0.5f)*2.0f*6.99f), 0, DELAY_SUBDIV_COUNT-1);
                     s.active = depth > 0.005f;
                 }
             }

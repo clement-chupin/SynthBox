@@ -132,6 +132,28 @@ default when touching related code:
   engine (`ModSlot`/`gModSlots[]`) can automate any `fxList[]` param already; a bespoke
   fixed-destination FX (the project used to have a dedicated filter-cutoff-only "LFO" FX
   slot) is redundant once that exists.
+- **Exact-equality thresholds and flat clamps near a parameter's own range boundary are
+  fragile, in two different ways.** (1) A hard `value >= 18000.0f`-style bypass check can
+  flicker unpredictably even at a fixed knob position, because an exponential pot-to-value
+  mapping (`mn*powf(mx/mn, potValue)`) doesn't reliably land exactly on the literal even at
+  `potValue==1.0` — plain float rounding in `powf` is enough to land a few units on either
+  side. (2) A flat clamp like `fminf(value, ceiling)` applied above some threshold can turn
+  a large fraction of a knob's travel into a dead zone with zero perceptible change (e.g.
+  capping FILT's cutoff at a patch's native ~994Hz made ~half the pot's range — everything
+  from 994Hz to 18000Hz — sound identical). The fix in both cases: don't gate on
+  "value crossed a threshold" — either add real margin/hysteresis, or better, replace the
+  clamp with a continuous remap so the *whole* physical range of the control stays
+  meaningful (see `remapCutoffResToNative()` in `audio_engine.cpp`). The same "half the
+  control does nothing" symptom can also come from splitting one physical pot into two
+  logically-independent halves (e.g. a BPM-sync toggle whose "off" half didn't drive the
+  displayed rate at all) — reads to a user as "the pot got stuck," worth checking for
+  whenever a single control's range is conceptually divided into sub-modes.
+- **GIF playback (MEDIA/`MODE_VID`) is simulator/Android-only.** `imgDecodeGifFrames()` (in
+  `simulator/hal/jpegdec.h`) uses stb_image's already-vendored GIF decoder
+  (`stbi_load_gif_from_memory`); the ESP32-side `include/jpegdec.h` copy is a stub that logs
+  and points at `tools/to_bvid.py` — no on-device LZW/multi-frame GIF decoder has been
+  written (a much bigger undertaking than the existing hand-rolled streaming PNG decoder in
+  that same file, and not something to attempt untested against real hardware).
 
 ## Conventions
 

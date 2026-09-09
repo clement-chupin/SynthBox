@@ -110,20 +110,22 @@ tenu), **Pluck** (attaque immédiate, chute rapide, pas de maintien).
 ## La grille d'effets (FX)
 
 Un appui bref sur **B1** (depuis SYNTH, POKEMON, I303, STONE, OMNI, MODULAR, GRANULAR2,
-DR2 ou GEST) ouvre une grille de **16 effets** organisée en 4×4 : filtre (LPF/HPF/BPF/
-LADDER résonant-saturant), distorsion/overdrive, réverbe, chorus, flanger, delay,
-LFO/tremolo/autopan (modulation), EQ 3 bandes, écho résonant, wavefold, bitcrush,
-ring modulator, compresseur.
+DR2 ou GEST) ouvre une grille de **15 effets** (dans une grille 4×4 de 16 cases, la
+dernière reste vide) : filtre (LPF/HPF/BPF/LADDER résonant-saturant), distorsion/overdrive,
+réverbe, chorus, flanger, delay, tremolo/autopan (modulation), EQ 3 bandes, écho résonant,
+wavefold, bitcrush, ring modulator, compresseur.
 
-- Une touche de la grille **active/désactive** l'effet correspondant.
+- Une touche de la grille **active/désactive** l'effet correspondant (appui court).
 - Une fois un effet actif, les pots **P4-P7** règlent ses paramètres (le nom de chaque
   paramètre s'affiche à l'écran au-dessus du pot correspondant).
-- **Double-cliquer** un effet déjà actif ouvre un éditeur d'**automatisation** : le
-  joystick (axe X) choisit quel paramètre de l'effet moduler, puis les pots règlent
-  profondeur, vitesse, forme d'onde (sinus/triangle/carré/aléatoire échantillonné) et
-  synchronisation au BPM. Un indicateur de phase en direct à l'écran montre la
-  modulation tourner pendant qu'on la règle. N'importe quelle touche referme
-  l'éditeur et revient à la grille FX normale.
+- **Un appui long** sur un effet ouvre un éditeur d'**automatisation** : le joystick
+  (axe X) choisit quel paramètre de l'effet moduler, puis les pots règlent profondeur
+  (P4), vitesse (P5 — un seul potard continu, des subdivisions lentes synchronisées au
+  BPM jusqu'au Hz libre rapide) et forme d'onde (P6 : sinus/triangle/carré/aléatoire
+  échantillonné). Un indicateur de phase en direct à l'écran montre la modulation
+  tourner pendant qu'on la règle. N'importe quelle touche referme l'éditeur et revient
+  à la grille FX normale. Appuyer long sur un effet **inactif** l'active directement et
+  ouvre l'éditeur, en un seul geste.
 
 \newpage
 
@@ -159,7 +161,8 @@ avant/arrière, découpage par pad).
 ## Utilitaires
 
 **LIGHT**/**LIGHTPLAY**/**LANIM**/**ANIM** (light shows et animations), **VID**
-(lecteur vidéo 1-bit), **MIDI** (périphérique MIDI USB), **TRACKER** (enregistreur
+(lecteur MEDIA 1-bit — vidéos `.bvid`, photos, **`.gif` animés** convertis automatiquement,
+aperçu audio `.wav`/`.mp3`), **MIDI** (périphérique MIDI USB), **TRACKER** (enregistreur
 quantisé), **PCMCLEAN** (nettoyage du cache SD), **IMPORT** (Android : import de
 fichiers depuis le téléphone), **BATTERY**/**SYSINFO** (diagnostics).
 

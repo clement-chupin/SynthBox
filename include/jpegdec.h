@@ -329,6 +329,20 @@ static inline bool imgDecodeGrayPng(const uint8_t* buf, size_t len, uint8_t** ou
     return true;
 }
 
+// No on-device GIF decoder on ESP32 yet (a from-scratch LZW+multi-frame+palette
+// decoder in the same streaming-only style as imgDecodeGrayPng() above is a much
+// bigger undertaking than PNG's single-frame case, and untested on real hardware
+// isn't a place to introduce one) — simulator/hal/jpegdec.h's equivalent already
+// works via vendored stb_image (desktop/Android RAM makes the whole-file decode
+// cheap there). On ESP32, point at the existing offline converter instead, same
+// as the PNG-interlaced/unsupported-bitDepth cases just above.
+static inline bool imgDecodeGifFrames(const uint8_t* buf, size_t len, uint8_t** outGray,
+                                       int* outW, int* outH, int* outFrameCount, int** outDelaysMs) {
+    (void)buf; (void)len; (void)outGray; (void)outW; (void)outH; (void)outFrameCount; (void)outDelaysMs;
+    Serial.println("IMG: GIF not supported on-device yet — pre-convert with tools/to_bvid.py");
+    return false;
+}
+
 // Decodes a JPEG or PNG buffer to 8-bit grayscale (row-major, 1 byte/pixel),
 // dispatching on the file's magic bytes. On success, *outGray is a heap buffer
 // the caller must free(); dimensions come back via *outW/*outH. Returns false on

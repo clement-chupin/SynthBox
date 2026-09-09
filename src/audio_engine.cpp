@@ -107,6 +107,38 @@ static void getPatchNativeFilter(int16_t patch, float& cc, float& res) {
     }
     cc = 18000.0f; res = 1.0f;  // DX7/unknown: filter is FILTER_NONE, these values are inert
 }
+
+// FILT's Cut param range/curve (see fxList[0] in main.cpp: paramMin=65, paramMax=18000,
+// mapped from the pot as mn*powf(mx/mn, potValue)) — needed here to invert cutoffHz back
+// to a 0..1 pot position for the remap below.
+static const float kFiltCutMin = 65.0f, kFiltCutMax = 18000.0f;
+
+// Remap the FX's raw cutoff/resonance onto the patch's own native filter, continuously
+// across the WHOLE pot travel, instead of hard-clamping every value above native down to
+// a single flat "native" plateau. An earlier version just did
+// `effCutoff = fminf(cutoffHz, nativeCC)`: correct at the very ends (never brighter than
+// native at max, full FX control at min) but for any patch whose native cutoff sits well
+// below the pot's own 18000Hz ceiling (every entry in kPatchNativeFilter does — as low as
+// ~180Hz), that clamp turns the entire upper portion of the pot's travel into a dead zone:
+// e.g. for J:PNO (native ~994Hz) a cutoff of 1000Hz and 18000Hz both clamped to the exact
+// same 994Hz, making roughly the top HALF of the knob's rotation produce literally no
+// audible difference — reported directly ("le son n'est pas modifié entre un cutoff à 1K
+// et à 18K"). Instead, re-derive the pot's 0..1 position from cutoffHz (inverting the same
+// exponential curve main.cpp uses to compute it) and use that position to sweep smoothly
+// across [kFiltCutMin, nativeCC] for cutoff and to blend resonance between the FX's own
+// dialed value (pot at minimum — the filter is genuinely doing its own thing) and the
+// patch's native resonance (pot at maximum — fully transparent, matching native exactly,
+// which is what stops merely activating the FX from changing the patch's texture). Both
+// end exactly at their old fixed-point values, so this changes nothing at the pot's
+// physical extremes — only restores a meaningful sweep everywhere in between.
+static void remapCutoffResToNative(float cutoffHz, float resonance, float nativeCC, float nativeRes,
+                                    float& effCutoff, float& effRes) {
+    if (nativeCC >= kFiltCutMax) { effCutoff = cutoffHz; effRes = resonance; return; }
+    float t = logf(cutoffHz / kFiltCutMin) / logf(kFiltCutMax / kFiltCutMin);
+    t = constrain(t, 0.0f, 1.0f);
+    effCutoff = kFiltCutMin * powf(nativeCC / kFiltCutMin, t);
+    effRes    = resonance + t * (nativeRes - resonance);
+}
 static volatile bool s_granularLoaded = false;  // set when GRANULAR_SOURCE_PRESET load completes
 static uint8_t s_granLastSliceCount = 0;  // stored by audioComputeGranularSlices
 
@@ -482,7 +514,22 @@ static void audioApplyFilterToModular(bool bypass, float cutoffHz, float resonan
 
 void audioSetAllFilters(float cutoffHz, float resonance) {
     if (!audioReady) return;
-    bool bypass = (cutoffHz <= 10.0f || cutoffHz >= 18000.0f);
+    // Bypass means ONLY "FX genuinely off" (callers pass 0.0f in that case — see
+    // applyFxEffect's case 0) — NOT "cutoff dialed near the top of its range". An
+    // earlier version of this also bypassed above ~18000Hz on the theory that a
+    // wide-open LPF24 is "basically transparent anyway", but treating a real,
+    // engaged filter (even at a very high cutoff) the same as no filter at all is
+    // exactly backwards: it made the actual audio path switch between "LPF24
+    // engaged" and "FILTER_NONE" — a genuine change in filter topology, not just a
+    // frequency change — right at the top of the pot's sweep, which is clearly
+    // audible (a real texture jump, not a subtle one) and, worse, depended on
+    // float-rounding of the pot's exponential mapping landing on one side or the
+    // other of the threshold, so it could trigger unpredictably even at a fixed
+    // pot position. The filter must stay engaged and simply track a high cutoff
+    // continuously — for patches the native-cutoff cap below already makes "cutoff
+    // dialed above native" converge smoothly to the patch's own untouched sound,
+    // with no separate bypass branch needed to achieve that.
+    bool bypass = (cutoffHz <= 10.0f);
     // Bypass: skip SYNTH_CH event for patches — sending FILTER_NONE would clobber the patch's
     // internal LPF (e.g. activating reverb changes J:PNO's texture via FILT inactive reset path).
     // Active (non-bypass): still apply so FX like LFO or FILT work on patches as expected.
@@ -495,15 +542,21 @@ void audioSetAllFilters(float cutoffHz, float resonance) {
         // Cap at the patch's own native cutoff — see the matching comment in
         // audioSetAllFiltersT() for why (an FX cutoff above native brightens the patch
         // instead of ever being able to just darken it, since there's one shared filter).
+        // See remapCutoffResToNative() for why this is a continuous remap rather than a
+        // flat clamp: resonance blends the same way, from the FX's own dialed value at
+        // the pot's low end to the patch's native resonance at the high end, so merely
+        // activating the FX at "wide open" settings stays fully transparent instead of
+        // slamming a resonant peak onto a patch that never had one.
         float effCutoff = cutoffHz;
+        float effRes = resonance;
         if (!bypass && s_synthChIsPatch) {
             float nativeCC, nativeRes;
             getPatchNativeFilter(s_currentPatchNumber, nativeCC, nativeRes);
-            effCutoff = fminf(cutoffHz, nativeCC);
+            remapCutoffResToNative(cutoffHz, resonance, nativeCC, nativeRes, effCutoff, effRes);
         }
         e.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : effCutoff;
         if (!bypass && !s_synthChIsPatch) { e.filter_freq_coefs[COEF_EG0] = 0.0f; e.filter_freq_coefs[COEF_EG1] = 0.0f; }
-        e.resonance = bypass ? 1.0f : resonance;
+        e.resonance = bypass ? 1.0f : effRes;
         amy_add_event(&e);
         if (!bypass && s_synthChIsPatch) s_patchFilterModified = true;
     } else if (s_patchFilterModified) {
@@ -551,7 +604,22 @@ void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType) {
     if (!audioReady) return;
     // Bypass when turned off (≤10 Hz) OR when cutoff is fully open (≥18000 Hz = paramMax).
     // A LPF24 at 18 kHz still colours the signal (phase shift + resonance peak) — treat as bypass.
-    bool bypass = (cutoffHz <= 10.0f || cutoffHz >= 18000.0f);
+    // Bypass means ONLY "FX genuinely off" (callers pass 0.0f in that case — see
+    // applyFxEffect's case 0) — NOT "cutoff dialed near the top of its range". An
+    // earlier version of this also bypassed above ~18000Hz on the theory that a
+    // wide-open LPF24 is "basically transparent anyway", but treating a real,
+    // engaged filter (even at a very high cutoff) the same as no filter at all is
+    // exactly backwards: it made the actual audio path switch between "LPF24
+    // engaged" and "FILTER_NONE" — a genuine change in filter topology, not just a
+    // frequency change — right at the top of the pot's sweep, which is clearly
+    // audible (a real texture jump, not a subtle one) and, worse, depended on
+    // float-rounding of the pot's exponential mapping landing on one side or the
+    // other of the threshold, so it could trigger unpredictably even at a fixed
+    // pot position. The filter must stay engaged and simply track a high cutoff
+    // continuously — for patches the native-cutoff cap below already makes "cutoff
+    // dialed above native" converge smoothly to the patch's own untouched sound,
+    // with no separate bypass branch needed to achieve that.
+    bool bypass = (cutoffHz <= 10.0f);
     // Bypass: skip SYNTH_CH event for patches — FILTER_NONE on bypass clobbers the patch's
     // internal LPF (e.g. toggling reverb would make J:PNO sound harpsichord-like).
     // Active (non-bypass): still apply so FILT/DISTORT FX work on patches as expected.
@@ -568,19 +636,22 @@ void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType) {
         // boosts the highs" instead of ever being able to just cut them, and is exactly
         // backwards from what turning on a low-pass filter should be able to do. Capping
         // at the native cutoff means the FX can only ever darken a patch further, matching
-        // normal LPF expectations, while a lower FX cutoff still works exactly as before.
+        // normal LPF expectations. See remapCutoffResToNative() for why this is a
+        // continuous remap across the whole pot travel (both cutoff and resonance)
+        // rather than a flat clamp above native.
         float effCutoff = cutoffHz;
+        float effRes = resonance;
         if (!bypass && s_synthChIsPatch) {
             float nativeCC, nativeRes;
             getPatchNativeFilter(s_currentPatchNumber, nativeCC, nativeRes);
-            effCutoff = fminf(cutoffHz, nativeCC);
+            remapCutoffResToNative(cutoffHz, resonance, nativeCC, nativeRes, effCutoff, effRes);
         }
         e.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : effCutoff;
         if (!bypass && !s_synthChIsPatch) {
             e.filter_freq_coefs[COEF_EG0] = 0.0f;
             e.filter_freq_coefs[COEF_EG1] = 0.0f;
         }
-        e.resonance = bypass ? 1.0f : resonance;
+        e.resonance = bypass ? 1.0f : effRes;
         amy_add_event(&e);
         if (!bypass && s_synthChIsPatch) s_patchFilterModified = true;
     } else if (s_patchFilterModified) {
@@ -635,7 +706,22 @@ void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType) {
 // the pot, not just once on toggling FILT on/off.
 void audioSetFilterFreq(float cutoffHz, float resonance) {
     if (!audioReady) return;
-    bool bypass = (cutoffHz <= 10.0f || cutoffHz >= 18000.0f);
+    // Bypass means ONLY "FX genuinely off" (callers pass 0.0f in that case — see
+    // applyFxEffect's case 0) — NOT "cutoff dialed near the top of its range". An
+    // earlier version of this also bypassed above ~18000Hz on the theory that a
+    // wide-open LPF24 is "basically transparent anyway", but treating a real,
+    // engaged filter (even at a very high cutoff) the same as no filter at all is
+    // exactly backwards: it made the actual audio path switch between "LPF24
+    // engaged" and "FILTER_NONE" — a genuine change in filter topology, not just a
+    // frequency change — right at the top of the pot's sweep, which is clearly
+    // audible (a real texture jump, not a subtle one) and, worse, depended on
+    // float-rounding of the pot's exponential mapping landing on one side or the
+    // other of the threshold, so it could trigger unpredictably even at a fixed
+    // pot position. The filter must stay engaged and simply track a high cutoff
+    // continuously — for patches the native-cutoff cap below already makes "cutoff
+    // dialed above native" converge smoothly to the patch's own untouched sound,
+    // with no separate bypass branch needed to achieve that.
+    bool bypass = (cutoffHz <= 10.0f);
     if (bypass && s_synthChIsPatch) {
         if (s_patchFilterModified) {
             s_patchFilterModified = false;
@@ -651,10 +737,22 @@ void audioSetFilterFreq(float cutoffHz, float resonance) {
         s_pcmLPFReso   = 1.5f;
         return;
     }
+    // Remap onto the patch's own native cutoff/resonance — same as audioSetAllFiltersT():
+    // this function had NO capping at all, so the anti-zipper smoothing tick (which
+    // calls this every 10ms while the cutoff pot is above the automation path) could
+    // push a patch's filter above its native character. See remapCutoffResToNative()
+    // for why this is a continuous remap rather than a flat clamp.
+    float effCutoff = cutoffHz;
+    float effRes = resonance;
+    if (s_synthChIsPatch) {
+        float nativeCC, nativeRes;
+        getPatchNativeFilter(s_currentPatchNumber, nativeCC, nativeRes);
+        remapCutoffResToNative(cutoffHz, resonance, nativeCC, nativeRes, effCutoff, effRes);
+    }
     amy_event e = amy_default_event();
     e.synth = SYNTH_CH;
-    e.filter_freq_coefs[COEF_CONST] = cutoffHz;
-    e.resonance = resonance;
+    e.filter_freq_coefs[COEF_CONST] = effCutoff;
+    e.resonance = effRes;
     amy_add_event(&e);
     if (s_synthChIsPatch) s_patchFilterModified = true;
     s_pcmLPFCutoff = cutoffHz;
