@@ -10382,6 +10382,24 @@ void loop() {
                 }
                 joyLongFired = true;
             }
+        } else if (currentMode==MODE_DJ && sdReady) {
+            // Same joystick-click-to-confirm convention as every other SD browser above
+            // (SAMPLE/STONE/SS2/VID/GRANULAR2) — was missing entirely, so a click here
+            // fell through to the generic "open main menu" else-branch below instead of
+            // navigating into the folder.
+            if (djBrowsing && sdCursor < sdFileCount) {
+                if (sdFiles[sdCursor]=="..") {
+                    if (sdPath=="/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true; }
+                    else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1), isAudioFile); }
+                } else if (sdFileIsDir[sdCursor]) {
+                    String np=sdPath; if(!np.endsWith("/"))np+="/"; np+=sdFiles[sdCursor];
+                    sdListDir(np, isAudioFile);
+                } else {
+                    audioLoadDJTrack(buildSdFilePath().c_str());
+                    djBrowsing = false;
+                }
+            }
+            joyLongFired = true;
         } else {
             audioAllNotesOff(); omniRoot=0xFF; omniStrumPos=-1;
             menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true;
@@ -10835,28 +10853,30 @@ void loop() {
             }
         }
     }
-    // Joystick X cycles the focused track — edge-triggered (must return past the
-    // dead-zone before the next cycle fires) since the stick self-centers, unlike a
-    // plain proportional mapping which would keep snapping focus back to the middle
-    // track every time the stick is released.
+    // Joystick X cycles the focused track, Y moves the write-pitch cursor (melodic tracks
+    // only) — same "fire immediately, then repeat every 300ms while held past threshold"
+    // pattern already used for I303/303S's own joystick-driven wave/octave cycling
+    // (see the i303jWvArm/i303jOctArm block above `jxH`/`jyH`, ~12677): a plain
+    // "must return to dead-zone" edge trigger (the original version of this block) is
+    // much harder to use for repeated steps — the stick has to fully re-center between
+    // every single increment — which is what made the 303/synth write-pitch cursor feel
+    // unresponsive/stuck after the first move.
     if (currentMode == MODE_GROOVE && !menuOpen) {
-        static bool grvJxArmed = true;
-        float jx = constrain(cachedJoyX / 64.0f, -1.0f, 1.0f);
-        if (fabsf(jx) < 0.2f) grvJxArmed = true;
-        else if (grvJxArmed && fabsf(jx) > 0.6f) {
+        static unsigned long grvJxMs = 0, grvJyMs = 0;
+        static bool grvJxArm = false, grvJyArm = false;
+        float jx = cachedJoyX / 64.0f, jy = cachedJoyY / 64.0f;
+        unsigned long now = millis();
+        bool jxH = (fabsf(jx) > 0.45f), jyH = (fabsf(jy) > 0.45f);
+        if (!jxH) grvJxArm = false;
+        if (!jyH) grvJyArm = false;
+        if (jxH && (!grvJxArm || now - grvJxMs >= 300)) {
             grvFocusTrack = (uint8_t)((grvFocusTrack + (jx > 0 ? 1 : GRV_TRACKS - 1)) % GRV_TRACKS);
-            grvJxArmed = false;
+            grvJxMs = now; grvJxArm = true;
         }
-    }
-    // Joystick Y moves the write-pitch cursor (melodic tracks only) — same edge-triggered
-    // shape as JX above, one semitone per crossing.
-    if (currentMode == MODE_GROOVE && !menuOpen && (grvFocusTrack == GRV_TRK_SYNTH || grvFocusTrack == GRV_TRK_303)) {
-        static bool grvJyArmed = true;
-        float jy = constrain(cachedJoyY / 64.0f, -1.0f, 1.0f);
-        if (fabsf(jy) < 0.2f) grvJyArmed = true;
-        else if (grvJyArmed && fabsf(jy) > 0.6f) {
+        if (jyH && (grvFocusTrack == GRV_TRK_SYNTH || grvFocusTrack == GRV_TRK_303) &&
+            (!grvJyArm || now - grvJyMs >= 150)) {
             grvWriteNote = (uint8_t)constrain((int)grvWriteNote + (jy > 0 ? 1 : -1), 0, 127);
-            grvJyArmed = false;
+            grvJyMs = now; grvJyArm = true;
         }
     }
 
