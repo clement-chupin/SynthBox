@@ -13,6 +13,7 @@ compile_commands.json
 
 # Desktop simulator build artifacts
 simulator/build/
+simulator/build-release/
 simulator/build-windows/
 simulator/.winbuild-toolchain/
 simulator/GrvEP.exe

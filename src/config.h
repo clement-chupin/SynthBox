@@ -37,6 +37,8 @@ enum AppMode : uint8_t {
     MODE_LIFE,      // Conway's-Game-of-Life on the key grid: column=pitch, birth=note-on
     MODE_SWARM,     // boids flocking: joystick-steered attractor zone triggers notes
     MODE_GEN,       // generative: joystick X=procedural texture, Y=sound-making method, independently tunable
+    MODE_DJ,        // DJ/remix deck: one big SD track (mp3/wav), scrub/speed/reverse + shared FX
+    MODE_GROOVE,    // unified step sequencer: 8 drum pads + synth + 303 on the full 4x8 grid
     MODE_COUNT
 };
 
@@ -65,6 +67,8 @@ enum MenuItem : uint8_t {
     MENU_LIFE,
     MENU_SWARM,
     MENU_GEN,
+    MENU_DJ,
+    MENU_GROOVE,
     MENU_ITEM_COUNT
 };
 static const char* menuLabels[] = {
@@ -79,7 +83,7 @@ static const char* menuLabels[] = {
     "PKMN","SERUM","GEST",
     "PURGPCM","STONE","GEST2",
     "IMPORT","LIFE","SWRM",
-    "GEN"
+    "GEN","DJ","GROOVE"
 };
 #define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
 
@@ -168,6 +172,22 @@ static const char* fxNames[] = {"LPF","DRIVE","DELAY","REVERB"};
 #define DRUM_MAX_STEPS 16
 #define AMY_OSC_DRUM_BASE 200
 
+// ==================== GROOVE (MODE_GROOVE) ====================
+// Unified step sequencer: DRUM2's 8 pads + one monophonic synth track + one
+// monophonic 303 track, all on the same full 4x8=32-key grid (one track's pattern
+// shown/edited at a time, cycled via joystick X). Per-step storage reuses the same
+// field shapes DR2/SYSEQ/303S/SS2 already use (grvOn: 0=off else velocity/note+1;
+// grvAlt: 0=normal, else track-type-specific articulation) rather than inventing a
+// new format — see main.cpp's GROOVE state block.
+#define GRV_MAX_STEPS 32
+#define GRV_PATS      4
+enum {
+    GRV_TRK_DRUM0 = 0, GRV_TRK_DRUM1, GRV_TRK_DRUM2, GRV_TRK_DRUM3,
+    GRV_TRK_DRUM4, GRV_TRK_DRUM5, GRV_TRK_DRUM6, GRV_TRK_DRUM7,
+    GRV_TRK_SYNTH, GRV_TRK_303,
+    GRV_TRACKS
+};
+
 // ==================== TRACKER (removed — stub only) ====================
 // ==================== AUDIO ====================
 #define SYNTH_CH 1
@@ -207,6 +227,27 @@ static const char* fxNames[] = {"LPF","DRIVE","DELAY","REVERB"};
 #define STONE_OSC_BASE   240   // AMY oscillators 240-245 (250 max_oscs; clear of all other fixed ranges)
 #define STONE_SOURCE_PRESET 362  // pristine 16-bit full-length buffer loaded from disk (pointer/length
                                  // database only, never played directly) — mirrors GRAN2_SOURCE_BASE.
+
+// ==================== DJ (MODE_DJ) ====================
+// One mono "deck" for a DJ/remix sample — same 16-bit PSRAM pipeline as STONE
+// (STONE_SOURCE_PRESET), added to the `isGran16` list in audio_engine.cpp's
+// svcLoadWav/svcLoadMp3. An EARLIER version of this used the flash pcmcache partition
+// instead (int8 @ 20kHz, ~8 minutes for ~0 PSRAM cost) — reverted: that partition is
+// real ESP32 hardware (a memory-mapped SPI flash region) with no equivalent on the
+// desktop/Android simulator targets, so `esp_partition_find_first` finds nothing there
+// and the whole mechanism is silently unusable on 2 of this project's 4 build targets,
+// including the one primarily used for development/testing. PSRAM works identically
+// everywhere. The real cost is capacity: 16-bit mono at PCM_TARGET_RATE (20kHz)
+// is ~2.4MB/minute, against a genuinely free PSRAM budget of maybe 5-6MB once AMY's own
+// allocations (~256KB delay lines, etc.) are accounted for — so roughly 2-3 minutes of
+// track, same ballpark as STONE's own budget. Good enough for "a big sample to remix",
+// not "a whole DJ set" — see structure/SOFTWARE.md's DJ section if a flash-backed
+// second attempt is ever worth revisiting specifically for the ESP32 target.
+#define DJ_OSC            246  // single fixed oscillator (mono deck; 250 max_oscs ceiling)
+#define DJ_SOURCE_PRESET  365  // pristine 16-bit full-length buffer loaded from disk (pointer/length
+                                // database only, never played directly) — mirrors STONE_SOURCE_PRESET.
+#define DJ_PRESET         363  // forward playback, re-windowed live into DJ_SOURCE_PRESET's buffer
+#define DJ_PRESET_REV     364  // reverse playback — lazily built reversed PSRAM copy, see audioDJSetReverse()
 
 // ==================== GRANULAR ====================
 // Row layout (8-slice mode): R0=one-shot px, R1=px+px+1, R2=sx→end, R3=px reversed

@@ -60,6 +60,23 @@ extern "C" const int16_t* pcm_get_sample_ram_for_preset(uint16_t preset_number, 
 // vel: 0 = load into RAM only, don't trigger playback.
 struct LoadReq { char path[256]; uint16_t preset; uint8_t osc; float vel; };
 static void amyStopOsc(uint8_t osc);  // forward declaration
+void audioDJSeek(float posFrac);      // forward declaration — defined near the other DJ functions further down, needed by bgServiceTask's load-completion hook
+
+// ==================== DJ (MODE_DJ) state ====================
+// See config.h's DJ_* block: same 16-bit PSRAM pipeline as STONE (DJ_SOURCE_PRESET is
+// in the isGran16 list), so these mirror STONE's own state variables closely.
+static bool     s_djLoaded      = false;
+static bool     s_djPlaying     = false;
+static float    s_djPosFrac     = 0.0f;   // playhead, 0..1, advanced by estimate (see audioDJGetPosFrac)
+static uint32_t s_djPlayStartMs = 0;
+static float    s_djPosFracAtPlayStart = 0.0f;
+static float    s_djSpeed       = 1.0f;   // 1.0 = normal, pitch-coupled (turntable-style)
+static bool     s_djReverse     = false;
+static int16_t* s_djRevBuf      = nullptr;  // lazily-built reversed PSRAM copy — pcm_load()'s own allocation (see djBuildReverseTask)
+static uint32_t s_djRevLen      = 0;
+static volatile bool s_djRevBuilding = false;
+static volatile bool s_djRevReady    = false;
+static uint32_t s_djLoadGen     = 0;   // bumped on each successful load — see audioDJGetLoadGen()
 static QueueHandle_t     s_loadQueue  = NULL;
 static volatile bool     s_svcAbort   = false;
 static volatile bool     s_svcDone    = true;
@@ -496,6 +513,17 @@ static void audioApplyFilterToStone(bool bypass, float cutoffHz, float resonance
     }
 }
 
+// Same gap as STONE above, for MODE_DJ's single dedicated deck oscillator.
+static void audioApplyFilterToDJ(bool bypass, float cutoffHz, float resonance, uint8_t filterType) {
+    amy_event de = amy_default_event();
+    de.osc = DJ_OSC;
+    de.filter_type = bypass ? FILTER_NONE : filterType;
+    de.filter_freq_coefs[COEF_CONST] = bypass ? 18000.0f : cutoffHz;
+    if (!bypass) { de.filter_freq_coefs[COEF_EG0] = 0.0f; de.filter_freq_coefs[COEF_EG1] = 0.0f; }
+    de.resonance = bypass ? 1.0f : resonance;
+    amy_add_event(&de);
+}
+
 // Same gap as STONE above, for the modular synth's 2 dedicated dynamic channels
 // (MOD3_OSCA_CH/MOD3_OSCB_CH — not SYNTH_CH, so the shared FILT FX never reached them
 // either, even after OVERLAY_FX was wired into MODE_MODULAR). Channels use e.synth (not
@@ -596,6 +624,7 @@ void audioSetAllFilters(float cutoffHz, float resonance) {
     }
     audioApplyFilterToStone(bypass, cutoffHz, resonance, FILTER_LPF24);
     audioApplyFilterToModular(bypass, cutoffHz, resonance, FILTER_LPF24);
+    audioApplyFilterToDJ(bypass, cutoffHz, resonance, FILTER_LPF24);
 }
 
 // Same as audioSetAllFilters but with a configurable AMY filter type constant.
@@ -689,6 +718,7 @@ void audioSetAllFiltersT(float cutoffHz, float resonance, uint8_t filterType) {
     }
     audioApplyFilterToStone(bypass, cutoffHz, resonance, filterType);
     audioApplyFilterToModular(bypass, cutoffHz, resonance, filterType);
+    audioApplyFilterToDJ(bypass, cutoffHz, resonance, filterType);
 }
 
 // Update only the cutoff/resonance of an already-active LPF — does NOT send filter_type.
@@ -1930,7 +1960,8 @@ static bool svcLoadWav(const char* path, uint16_t preset, uint8_t osc, float vel
     // Granular source presets need 16-bit PSRAM for int16_t* slice arithmetic.
     bool isGran16 = (preset == GRANULAR_SOURCE_PRESET)
                  || (preset >= GRAN2_SOURCE_BASE && preset < GRAN2_SOURCE_BASE + GRAN2_MAX_SAMPLES)
-                 || (preset == STONE_SOURCE_PRESET);
+                 || (preset == STONE_SOURCE_PRESET)
+                 || (preset == DJ_SOURCE_PRESET);
     if (isGran16) {
         if (svcTryCache16(path, preset, osc, vel, tStop, srcSize)) return !s_svcAbort;
     } else {
@@ -2090,7 +2121,8 @@ static bool svcLoadMp3(const char* path, uint16_t preset, uint8_t osc, float vel
     { File tmp = SD.open(path, FILE_READ); if (!tmp) { Serial.printf("MP3: open fail: %s\n", path); return false; } srcSize = tmp.size(); tmp.close(); }
     bool isGran16 = (preset == GRANULAR_SOURCE_PRESET)
                  || (preset >= GRAN2_SOURCE_BASE && preset < GRAN2_SOURCE_BASE + GRAN2_MAX_SAMPLES)
-                 || (preset == STONE_SOURCE_PRESET);
+                 || (preset == STONE_SOURCE_PRESET)
+                 || (preset == DJ_SOURCE_PRESET);
     if (isGran16) {
         if (svcTryCache16(path, preset, osc, vel, tStop, srcSize)) return !s_svcAbort;
     } else {
@@ -2355,6 +2387,16 @@ void bgServiceTask(void* /*param*/) {
         if (ok && !s_svcAbort && req.preset == STONE_SOURCE_PRESET) {
             s_stoneLoaded = true;
             audioStoneApplyWindow(0.0f, 1.0f, s_stoneLoop);  // full-range window; reflect current loop mode immediately, not just on the next pot nudge
+        }
+        if (ok && !s_svcAbort && req.preset == DJ_SOURCE_PRESET) {
+            s_djLoaded = true;
+            s_djLoadGen++;
+            s_djReverse = false; s_djRevReady = false; s_djRevBuilding = false;
+            s_djRevBuf = nullptr; s_djRevLen = 0;  // pcm_unload_preset(DJ_PRESET_REV) below frees the old one
+            pcm_unload_preset(DJ_PRESET_REV);
+            s_djSpeed = 1.0f;
+            audioDJSeek(0.0f);
+            Serial.printf("[DJ] loaded %s\n", req.path);
         }
         s_currentOsc = 0xFF;
         s_svcDone    = true;
@@ -3290,6 +3332,229 @@ void audioStoneApplyWindow(float startFrac, float endFrac, bool loopMode) {
     uint32_t registeredLen = loopMode ? (totalLen - s0) : len;
     pcm_register_extern16(STONE_PRESET, src + s0, registeredLen, PCM_TARGET_RATE / 2, 69, 0, (int32_t)(len - 1));
 }
+
+// ==================== DJ (MODE_DJ) ====================
+// One mono "deck" for a DJ/remix track — same 16-bit PSRAM pipeline as STONE
+// (DJ_SOURCE_PRESET is in the isGran16 list in svcLoadWav/svcLoadMp3, so
+// audioLoadDJTrack() needs no new decode code — see config.h's DJ_* block for the
+// capacity tradeoff this implies vs the flash-backed design it replaced).
+
+void audioLoadDJTrack(const char* path) {
+    if (!audioReady || !s_loadQueue) return;
+    audioDJPlayPause(false);  // stop whatever was on the deck before switching tracks
+    LoadReq req;
+    strncpy(req.path, path, sizeof(req.path) - 1);
+    req.path[sizeof(req.path) - 1] = '\0';
+    req.preset = DJ_SOURCE_PRESET;
+    req.osc    = DJ_OSC;
+    req.vel    = 0.0f;  // load only — audioDJPlayPause(true) starts it once ready
+    s_djLoaded = false;
+    s_svcAbort = true;  // abort any in-flight load for instant response
+    xQueueSendToFront(s_loadQueue, &req, 0);
+}
+
+bool audioDJIsLoaded() { return s_djLoaded; }
+uint32_t audioDJGetLoadGen() { return s_djLoadGen; }
+
+// Advances s_djPosFrac by however much time has elapsed since the last anchor
+// (s_djPlayStartMs/s_djPosFracAtPlayStart) at the current speed — AMY has no live
+// phase-readback API, so this is an ESTIMATE, not a measurement. Called whenever the
+// position is queried (audioDJGetPosFrac) or playback stops (so a subsequent resume/
+// query starts from an accurate baseline).
+static void audioDJAdvancePositionEstimate() {
+    if (!s_djPlaying) return;
+    uint32_t totalLen = 0;
+    if (s_djReverse) totalLen = s_djRevLen;
+    else pcm_get_sample_ram_for_preset(DJ_SOURCE_PRESET, &totalLen);
+    if (totalLen == 0) return;
+    float elapsedSec = (millis() - s_djPlayStartMs) / 1000.0f;
+    float fracAdvanced = (elapsedSec * (PCM_TARGET_RATE / 2.0f) * s_djSpeed) / (float)totalLen;
+    s_djPosFrac = constrain(s_djPosFracAtPlayStart + fracAdvanced, 0.0f, 1.0f);
+    if (s_djPosFrac >= 1.0f) {
+        // Reached the end — stop (no auto-loop for MVP). Inlined instead of calling
+        // audioDJPlayPause(false): THAT function calls this one first (to bake in
+        // elapsed time before stopping) — calling it back from here would recurse
+        // into audioDJAdvancePositionEstimate() forever (s_djPlaying doesn't get
+        // cleared until after its own call to this function returns), a real stack
+        // overflow reproduced while testing this feature.
+        amyStopOsc(DJ_OSC);
+        s_djPlaying = false;
+    }
+}
+
+// Re-anchors the position estimate to "now" at the current s_djPosFrac — call whenever
+// something the estimate formula depends on changes (play/pause, speed, seek, reverse
+// toggle), so the NEXT estimate starts from an accurate baseline instead of silently
+// assuming the OLD speed/direction applied since the last anchor.
+static void audioDJReanchor() {
+    s_djPlayStartMs = millis();
+    s_djPosFracAtPlayStart = s_djPosFrac;
+}
+
+// Seeks to a fractional position within whichever buffer is currently active (forward
+// DJ_SOURCE_PRESET, or the reverse PSRAM copy) and, if playing, retriggers from there.
+// A retrigger click is expected here — this is a real seek/cue jump, not a smooth
+// scratch (AMY has no API to move a SOUNDING voice's phase).
+void audioDJSeek(float posFrac) {
+    if (!s_djLoaded) return;
+    posFrac = constrain(posFrac, 0.0f, 1.0f);
+    s_djPosFrac = posFrac;
+    audioDJReanchor();
+    uint16_t preset = s_djReverse ? DJ_PRESET_REV : DJ_PRESET;
+    if (s_djReverse) {
+        if (!s_djRevReady || s_djRevLen < 2 || !s_djRevBuf) return;  // nothing to register yet
+        uint32_t pos = (uint32_t)(posFrac * s_djRevLen);
+        if (pos >= s_djRevLen) pos = s_djRevLen - 2;
+        pcm_register_extern16(DJ_PRESET_REV, s_djRevBuf + pos, s_djRevLen - pos, PCM_TARGET_RATE / 2, 69, 0, (int32_t)(s_djRevLen - pos - 1));
+    } else {
+        uint32_t totalLen = 0;
+        const int16_t* src = pcm_get_sample_ram_for_preset(DJ_SOURCE_PRESET, &totalLen);
+        if (!src || totalLen < 2) return;
+        uint32_t pos = (uint32_t)(posFrac * totalLen);
+        if (pos >= totalLen) pos = totalLen - 2;
+        pcm_register_extern16(DJ_PRESET, src + pos, totalLen - pos, PCM_TARGET_RATE / 2, 69, 0, (int32_t)(totalLen - pos - 1));
+    }
+    if (s_djPlaying) {
+        amyPlayPcm(DJ_OSC, preset, 1.0f);
+        amy_event e = amy_default_event();
+        e.osc = DJ_OSC; e.midi_note = 69.0f + 12.0f * log2f(s_djSpeed);
+        amy_add_event(&e);  // re-apply the current speed — the note-on above reset pitch to 69
+    }
+}
+
+float audioDJGetPosFrac() {
+    audioDJAdvancePositionEstimate();
+    return s_djPosFrac;
+}
+
+void audioDJPlayPause(bool playing) {
+    if (!s_djLoaded) { s_djPlaying = false; return; }
+    if (playing == s_djPlaying) return;
+    if (playing) {
+        uint16_t preset = s_djReverse ? DJ_PRESET_REV : DJ_PRESET;
+        amyPlayPcm(DJ_OSC, preset, 1.0f);
+        amy_event e = amy_default_event();
+        e.osc = DJ_OSC; e.midi_note = 69.0f + 12.0f * log2f(s_djSpeed);
+        amy_add_event(&e);
+        s_djPlaying = true;
+        audioDJReanchor();
+    } else {
+        audioDJAdvancePositionEstimate();  // bake in elapsed time BEFORE stopping
+        amyStopOsc(DJ_OSC);
+        s_djPlaying = false;
+    }
+}
+
+bool audioDJIsPlaying() { return s_djPlaying; }
+
+void audioDJSetSpeed(float speed) {
+    speed = constrain(speed, 0.25f, 4.0f);
+    if (s_djPlaying) audioDJAdvancePositionEstimate();  // bake in time elapsed at the OLD speed first
+    s_djSpeed = speed;
+    if (s_djPlaying) {
+        audioDJReanchor();
+        amy_event e = amy_default_event();
+        e.osc = DJ_OSC; e.midi_note = 69.0f + 12.0f * log2f(s_djSpeed);
+        amy_add_event(&e);
+    }
+}
+
+float audioDJGetSpeed() { return s_djSpeed; }
+
+// Whether audioDJSetReverse() should resume playback once djBuildReverseTask finishes —
+// needed because that build is asynchronous and, for any real (non-trivially-short)
+// track, will still be running by the time audioDJSetReverse() itself returns, so it
+// can't just resume playback synchronously the way it does for the "switch back to
+// forward" or "reverse buffer already built" cases.
+static bool s_djResumeAfterRevBuild = false;
+
+// Builds the lazy reverse copy on its own short-lived task — a pure in-memory
+// byte-reversal, cheap enough not to need the full async load-request machinery, but
+// still real work (a few MB of copying for a long track) so it must not block the
+// caller. Same pcm_load()+manual-reverse pattern already used for SS2's per-key REV
+// buffers (see bgServiceTask's key-load completion handler, s_keyHasRev). Runs on its
+// own task, but amyPlayPcm()/amy_add_event() below are already called from a non-main
+// task elsewhere (bgServiceTask itself), so this isn't a new threading concern.
+static void djBuildReverseTask(void*) {
+    uint32_t totalLen = 0;
+    const int16_t* src = pcm_get_sample_ram_for_preset(DJ_SOURCE_PRESET, &totalLen);
+    if (src && totalLen > 0) {
+        int16_t* rev = pcm_load(DJ_PRESET_REV, totalLen, PCM_TARGET_RATE / 2, 1, 69, 0, 0);
+        if (rev) {
+            for (uint32_t i = 0; i < totalLen; i++) rev[i] = src[totalLen - 1 - i];
+            s_djRevBuf = rev;
+            s_djRevLen = totalLen;
+            s_djRevReady = true;
+            Serial.printf("[DJ] reverse buffer built: %u frames (%.1fs)\n", totalLen, (float)totalLen / (PCM_TARGET_RATE / 2.0f));
+        } else {
+            Serial.println("[DJ] reverse buffer alloc FAILED (PSRAM exhausted)");
+        }
+    }
+    s_djRevBuilding = false;
+    if (s_djResumeAfterRevBuild) {
+        s_djResumeAfterRevBuild = false;
+        if (s_djRevReady) { audioDJSeek(0.0f); audioDJPlayPause(true); }
+    }
+    vTaskDelete(NULL);
+}
+
+// Toggles playback direction. First switch to reverse lazily builds s_djRevBuf (see
+// djBuildReverseTask) — that can take a moment for a long track, so this returns
+// immediately; audioDJIsReverseReady() tells the UI when it's actually usable, and if
+// playback was running when reverse was requested, it resumes automatically once the
+// build finishes (djBuildReverseTask's own s_djResumeAfterRevBuild handling) rather
+// than leaving the user silently paused until they press play again. Simplified for
+// MVP: switching direction re-anchors position to the start of whichever buffer
+// becomes active, rather than mapping a continuous position across two differently-
+// owned buffers.
+void audioDJSetReverse(bool reverse) {
+    if (!s_djLoaded || reverse == s_djReverse) return;
+    bool wasPlaying = s_djPlaying;
+    if (wasPlaying) audioDJPlayPause(false);
+    s_djReverse = reverse;
+    s_djPosFrac = 0.0f;
+    if (reverse && !s_djRevReady) {
+        if (!s_djRevBuilding) {
+            s_djRevBuilding = true;
+            s_djResumeAfterRevBuild = wasPlaying;
+            xTaskCreatePinnedToCore(djBuildReverseTask, "djRev", 4096, nullptr, 2, nullptr, 0);
+        } else {
+            s_djResumeAfterRevBuild = s_djResumeAfterRevBuild || wasPlaying;  // a build was already in flight for a previous toggle
+        }
+        return;  // djBuildReverseTask resumes playback itself once ready
+    }
+    audioDJSeek(0.0f);
+    if (wasPlaying) audioDJPlayPause(true);
+}
+
+bool audioDJGetReverse() { return s_djReverse; }
+bool audioDJIsReverseReady() { return s_djRevReady; }
+
+// Waveform (128 peak bins) from the loaded FORWARD buffer, for OLED display — mirrors
+// audioComputeStoneWaveform().
+bool audioDJComputeWaveform(uint8_t* waveform128) {
+    if (!s_djLoaded || !waveform128) return false;
+    uint32_t totalLen = 0;
+    const int16_t* src = pcm_get_sample_ram_for_preset(DJ_SOURCE_PRESET, &totalLen);
+    if (!src || totalLen < 16) return false;
+    uint32_t blk = totalLen / 128; if (blk < 1) blk = 1;
+    for (int i = 0; i < 128; i++) {
+        uint32_t s0 = (uint32_t)i * blk, e0 = s0 + blk;
+        if (e0 > totalLen) e0 = totalLen;
+        int32_t peak = 0;
+        for (uint32_t j = s0; j < e0; j++) { int32_t v = src[j]; if (v < 0) v = -v; if (v > peak) peak = v; }
+        waveform128[i] = (uint8_t)((int32_t)peak * 255 / 32768);
+    }
+    return true;
+}
+
+float audioDJGetLengthSeconds() {
+    if (!s_djLoaded) return 0.0f;
+    uint32_t totalLen = 0;
+    pcm_get_sample_ram_for_preset(DJ_SOURCE_PRESET, &totalLen);
+    return (float)totalLen / (PCM_TARGET_RATE / 2.0f);
+}
+
 
 void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, bool reverse, float vel, uint8_t playMode, uint16_t attackMs, uint32_t amyTime) {
     if (!audioReady || sampleIdx >= GRAN2_MAX_SAMPLES) return;

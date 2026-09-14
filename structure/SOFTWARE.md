@@ -38,7 +38,7 @@ structure/
 
 ---
 
-## Modes (32 implémentés)
+## Modes (35 implémentés)
 
 > Table régénérée depuis l'enum `AppMode` de `config.h` (source de vérité — en cas de
 > doute, relire l'enum directement). Les anciens noms `MODE_DRUMS`/`MODE_FX`/`MODE_SEQ`/
@@ -77,8 +77,11 @@ structure/
 | STONE | `MODE_STONE` | Sample-tone : un sample SD réparti sur tout le clavier |
 | DR2 | `MODE_DR2` | Séquenceur batterie hiérarchique : 64 steps adressés en beat.step.micro (4.4.4) |
 | IMPORT | `MODE_IMPORT` | Android uniquement : sélecteur de dossier SAF, importe les fichiers du téléphone |
-| **LIFE** | `MODE_LIFE` | **Nouveau** — Jeu de la vie de Conway sur la grille de touches (colonne=hauteur, naissance=note) |
-| **SWARM** | `MODE_SWARM` | **Nouveau** — Essaim de boids (cohésion/séparation/alignement), zone d'attraction pilotée au joystick |
+| LIFE | `MODE_LIFE` | Jeu de la vie de Conway sur la grille de touches (colonne=hauteur, naissance=note) |
+| SWARM | `MODE_SWARM` | Essaim de boids (cohésion/séparation/alignement), zone d'attraction pilotée au joystick |
+| GEN | `MODE_GEN` | Génératif : joystick X=texture procédurale, Y=méthode sonore, indépendamment réglables |
+| DJ | `MODE_DJ` | Platine DJ/remix : un gros sample SD (mp3/wav), scrub/vitesse/reverse + FX partagés |
+| **GROOVE** | `MODE_GROOVE` | **Nouveau** — Séquenceur unifié drums+synth+303 : la grille 4×8 entière = le pattern de la piste focus (voir section dédiée plus bas) |
 
 Trois modes « expérimentaux » historiques (EXP/EXP2/EXP3) partagent une philosophie : jouer
 des notes/sons intéressants sans connaissance de théorie musicale, contrairement aux modes
@@ -368,6 +371,47 @@ oscs_per_voice/enveloppe) — cela réinitialisait le canal et tuait silencieuse
 train de jouer (même classe de bug que `patches_load_patch()`/`reset_osc()` sur un shape
 switch classique). Fix : `audioModularSetTable()`, une variante allégée qui ne touche que
 `e.preset`, réservée au changement de table en direct (le contrôle P2).
+
+---
+
+## MODE_GROOVE — Séquenceur unifié drums/synth/303
+
+Nouveau mode, additif (ne remplace aucun séquenceur existant). Répond au constat que DR2
+("GEST2"), bien qu'il combine déjà 8 pads batterie + une piste synthé + une piste 303 sur
+une horloge partagée, expose ses 64 pas via une hiérarchie à 3 niveaux (`beat.step.micro`,
+4.4.4) browsée par 3 rangées de 4 touches empilées — peu lisible. GROOVE répond en affichant
+**le pattern entier d'une seule piste sur toute la grille 4×8** (jusqu'à 32 pas), "ce que tu
+vois est ce que tu presses".
+
+- **10 pistes** (`GRV_TRK_DRUM0..7`, `GRV_TRK_SYNTH`, `GRV_TRK_303`), focus cyclé au
+  joystick X (armé/désarmé par zone morte — le stick étant à rappel automatique, un mapping
+  proportionnel ferait revenir le focus au centre à chaque relâchement). Réutilise
+  directement les moteurs sonores existants — `playDrum()` (pads DRUM2), `audioNoteOn/Off`
+  (synthé), `audioT303*` (303, monophonique — pas `audioI303*` qui est polyphonique) — aucun
+  nouveau moteur de synthèse.
+- **Stockage par pas** compact, même forme que DR2/SYSEQ/303S/SS2 : `grvOn[10][32]` (0=off,
+  sinon vélocité ou note+1) et `grvAlt[10][32]` (0=normal ; pistes batterie : 1=50%
+  probabilité/2=ratchet, repris de `dr2Mod` ; pistes synthé/303 : 1=accent/2=slide, repris
+  de `s303Alt`). ~640 octets/pattern, 4 slots de banque — négligeable.
+- **Longueur de pattern indépendante par piste** (`grvLen[10]`, 1-32, défaut 16) — chaque
+  piste avance sur la **même horloge maître** mais boucle à sa propre longueur, ce qui
+  permet un vrai polymètre (ex: batterie sur 8 pas contre 303 sur 13 pas qui déphase au fil
+  des mesures) — vérifié en test headless (voir historique de session).
+- **Horloge propre**, volontairement indépendante de `drum2Step` (celle partagée par
+  DRUM2/SYSEQ/303S/SS2/GEST, qui tourne sans condition sur `currentMode` dans `loop()`) —
+  la réutiliser aurait fait entrer en collision audible le pattern de GROOVE avec celui
+  d'un DRUM2/SYSEQ/etc. resté en lecture en arrière-plan. Cadence 16ᵉ de note
+  (`60000/bpm/4`, comme DRUM2), pas la subdivision 64ᵉ de DR2.
+- **Édition "stamp"** (aucune nouvelle UI de type overlay) : un pot/joystick fixe la valeur
+  courante à poser (accent/slide/probabilité + note pour les pistes mélodiques), une simple
+  pression pose ou efface un pas — identique au principe déjà utilisé par DR2/303S/SYSEQ/SS2.
+- **Boutons** — convention séquenceur (pas convention synthé) : **B1** Play/Stop, **B2**
+  FX (double-clic = Scale/Arp), **B3** mute piste focus (double-clic = solo — Korg Electribe
+  a normalisé cette paire mute/solo), **B4** cycle banque de patterns (double-clic =
+  copier/coller, identique à DR2). Le mute/solo comblait un vrai manque : aucun autre mode
+  du projet n'a de mute/solo réel (DR2 le documente explicitement en commentaire).
+- **Swing persistant** (P2) — sauvegardé avec le pattern, contrairement au swing transitoire
+  piloté par le joystick X de DRUM2/SYSEQ (perdu au changement de mode).
 
 ---
 

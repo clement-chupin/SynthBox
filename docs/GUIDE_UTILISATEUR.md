@@ -142,7 +142,10 @@ gammes/octave/arpégiateur, accès à la grille FX complète.
 **DRUM2** (boîte à rythmes 8 pads), **DR2** (séquenceur batterie hiérarchique 64 pas),
 **SYSEQ** (séquenceur synthé polyphonique 16 pas), **303S** (séquenceur TB-303 avec
 accent/glissando), **SS2** (séquenceur d'échantillons 16 pas), **GEST** (gestionnaire de
-motifs — copier/coller entre séquenceurs, mode LOOP/LIVE).
+motifs — copier/coller entre séquenceurs, mode LOOP/LIVE), **GROOVE** *(nouveau)*
+(séquenceur unifié drums+synthé+303 : toute la grille 4×8 affiche le pattern d'une seule
+piste parmi 10, avec mute/solo, swing persistant et longueur de pattern indépendante par
+piste).
 
 ## Samples & granulaire
 

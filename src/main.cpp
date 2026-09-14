@@ -535,6 +535,149 @@ static void dr2RecordNearestSlot(uint8_t* outBeat, uint8_t* outStep, uint8_t* ou
     *outBeat=b; *outStep=s; *outMicro=m;
 }
 
+// ==================== GROOVE STATE (MODE_GROOVE) ====================
+// Unified sequencer: DRUM2's 8 pads (GRV_TRK_DRUM0..7) + one monophonic synth track
+// (GRV_TRK_SYNTH) + one monophonic 303 track (GRV_TRK_303), all ticking off one shared
+// clock but each with its own independent step position/length (polymetric — see
+// grvLen[]). One track's full pattern is shown/edited across the ENTIRE 4x8 grid at a
+// time (grvFocusTrack, cycled via joystick X) instead of DR2's beat.step.micro hierarchy
+// — this "what you see is what you press" layout is the whole reason this mode exists.
+static bool           grvPlaying      = false;
+static unsigned long  grvLastStepMs   = 0;
+static uint8_t        grvFocusTrack   = GRV_TRK_DRUM0;
+static uint8_t        grvStep[GRV_TRACKS] = {};                      // playback position per track
+static uint8_t        grvLen [GRV_TRACKS] = {16,16,16,16,16,16,16,16,16,16};  // pattern length per track
+static bool            grvMute[GRV_TRACKS] = {};
+static int8_t          grvSolo         = -1;    // -1 = none, else the one soloed track
+static float           grvSwing        = 0.0f;  // 0..1, PERSISTENT (unlike DRUM2/SYSEQ's transient JX-only swing)
+
+// Per-step storage, same field shapes DR2/SYSEQ/303S/SS2 already use (0=off convention),
+// just consolidated across all GRV_TRACKS instead of one array per mode:
+//   grvOn:  drum tracks = velocity 1-127 (mirrors drum2SeqVel); synth/303 = MIDI note+1
+//           (mirrors syseqNotes/s303Note)
+//   grvAlt: drum tracks: 0=NRM 1=50% 2=RATCHET (mirrors drum2SeqMod/dr2Mod, minus the
+//           "random pitch" mode which is a DR2-specific gag not needed here);
+//           synth/303 tracks: 0=NRM 1=ACC 2=SLD (mirrors s303Alt exactly)
+static uint8_t  grvOn [GRV_TRACKS][GRV_MAX_STEPS] = {};
+static uint8_t  grvAlt[GRV_TRACKS][GRV_MAX_STEPS] = {};
+
+// "Write stamp" applied to newly-placed hits (same idea as s303SelNote/s303PendingAlt at
+// 559-560) — a pot/joystick sets these, a plain tap on an empty step places a hit using
+// them; tapping a filled step just clears it (no per-step edit overlay needed).
+static uint8_t  grvWriteAlt  = 0;   // cycled via P2 when B3 isn't held
+static uint8_t  grvWriteNote = 60;  // MIDI note (middle C), moved via joystick Y — synth/303 only
+
+// Drum ratchet (double-hit) deferred fire, mirrors drum2DblPendingAt/dr2DblPendingAt.
+static unsigned long grvDblPendingAt[DRUM2_PADS] = {};
+static uint8_t        grvDblPitch[DRUM2_PADS] = {};
+
+// Synth/303 need an explicit note-off (audioNoteOn/audioT303NoteOn hold until released) —
+// drums are one-shot PCM via playDrum(), no bookkeeping needed. Mirrors
+// dr2SynthNoteOffAt/dr2T303NoteOffAt (476/480).
+static unsigned long grvSynthNoteOffAt   = 0;
+static uint8_t         grvSynthPlayedNote = 0;
+static float           grvSynthVolume     = 1.0f;  // 0-2x headroom, P6-controlled (mirrors dr2SynthVolume)
+static unsigned long grvT303NoteOffAt    = 0;
+static uint8_t         grvT303CurNote     = 0;
+
+// 303 track's own tone + slide state — deliberately separate from the shared t303*/
+// t303Slide* globals (those are actively written by 303S/303S2/DR2/I303; sharing them
+// would let GROOVE's tone/slide state get stomped by whichever of those modes ran most
+// recently, and vice versa).
+static float    grv303Cutoff = 2000.0f, grv303Reso = 1.5f, grv303EnvMod = 2.0f, grv303Decay = 200.0f;
+static uint8_t  grv303Wave    = SAW_DOWN;  // AMY wave constant, same default as t303Wave (179)
+static bool     grv303Inited  = false;
+static uint8_t  grvSlideFrom = 0, grvSlideTo = 0;
+static unsigned long grvSlideMs = 0;
+static bool           grvSlideActive = false;
+
+// Pattern bank (GRV_PATS slots), mirrors DR2's dr2Pats[]/dr2PatFilled[]/copy-paste
+// (3871-3905, reused verbatim for GROOVE's B4 handling).
+static uint8_t  grvOnPats [GRV_PATS][GRV_TRACKS][GRV_MAX_STEPS] = {};
+static uint8_t  grvAltPats[GRV_PATS][GRV_TRACKS][GRV_MAX_STEPS] = {};
+static uint8_t  grvLenPats[GRV_PATS][GRV_TRACKS] = {};
+static bool     grvPatFilled[GRV_PATS] = {};
+static uint8_t  grvActivePat = 0;
+static bool     grvCopied    = false;
+static uint8_t  grvCopyPat   = 0;
+
+// True if the given track is currently audible under the mute/solo rules.
+static inline bool grvTrackAudible(uint8_t t) {
+    if (grvSolo >= 0) return t == (uint8_t)grvSolo;
+    return !grvMute[t];
+}
+
+// Recomputes grvPatFilled[grvActivePat] from the live buffers — call after any edit
+// that might empty or fill the active pattern. Mirrors dr2RecomputeActivePatFilled (517).
+static void grvRecomputeActivePatFilled() {
+    bool hasHits = false;
+    for (uint8_t t = 0; t < GRV_TRACKS && !hasHits; t++)
+        for (uint8_t s = 0; s < GRV_MAX_STEPS; s++)
+            if (grvOn[t][s]) { hasHits = true; break; }
+    grvPatFilled[grvActivePat] = hasHits;
+}
+
+static inline void playDrum(uint8_t pi, float v, uint8_t pitch, float dec);  // defined further below
+
+// Triggers one drum-track step: normal hit, 50%-probability gate, or a ratchet
+// (deferred second hit at half the step interval, mirrors dr2's DBL handling at
+// 10347-10366 / the drum2DblPendingAt fire block at 10086-10092).
+static void grvTriggerDrum(uint8_t pad, uint8_t step, unsigned long stepMs) {
+    uint8_t vel = grvOn[pad][step];
+    if (!vel) return;
+    uint8_t alt = grvAlt[pad][step];
+    if (alt == 1 && !random(2)) return;  // 50% probability, skip this hit (mirrors dr2Mod==1, 10488-10490)
+    playDrum(pad, drum2Volume[pad] * (vel / 127.0f), drum2Pitch[pad], drum2Decay[pad]);
+    drum2PadFlashMs[pad] = millis();
+    if (alt == 2) {  // RATCHET: schedule a second hit halfway to the next step (mirrors dr2Mod==3, 10496-10500)
+        grvDblPendingAt[pad] = millis() + stepMs / 2;
+        grvDblPitch[pad] = drum2Pitch[pad];
+    }
+}
+
+// Triggers the synth track's step (mirrors dr2TriggerSynth, 496-501, but reads GROOVE's
+// own step data and applies ACC as a velocity boost like the 303/syseq alt convention).
+static void grvTriggerSynth(uint8_t step) {
+    uint8_t noteP1 = grvOn[GRV_TRK_SYNTH][step];
+    if (!noteP1) return;
+    if (grvSynthNoteOffAt) audioNoteOff(grvSynthPlayedNote);
+    uint8_t note = noteP1 - 1;
+    float vel = ((grvAlt[GRV_TRK_SYNTH][step] == 1) ? 1.0f : 0.75f) * grvSynthVolume;
+    audioNoteOn(note, vel);
+    grvSynthPlayedNote = note;
+    grvSynthNoteOffAt = millis() + DR2_NOTE_DUR_MS;
+}
+
+// Triggers the 303 track's step: accent (louder vel) or slide (pitch-bend glide from the
+// previously-sounding note) — exact mirror of the 303S/SYSEQ/GEST2 shared-step accent/
+// slide block (10209-10238), using GROOVE's own slide state instead of the shared t303Slide*.
+static void grvTriggerT303(uint8_t step) {
+    uint8_t noteP1 = grvOn[GRV_TRK_303][step];
+    if (!noteP1) {
+        if (grvT303CurNote) { audioT303NoteOff(grvT303CurNote); grvT303CurNote = 0; }
+        grvSlideActive = false;
+        audioT303PitchBend(1.0f);
+        return;
+    }
+    uint8_t midiNote = noteP1 - 1;
+    uint8_t alt = grvAlt[GRV_TRK_303][step];
+    float vel = (alt == 1) ? 0.85f : 0.5f;
+    if (alt == 2 && grvT303CurNote > 0) {
+        grvSlideFrom = grvT303CurNote;
+        grvSlideTo   = midiNote;
+        grvSlideMs   = millis();
+        grvSlideActive = true;
+        audioT303NoteOn(midiNote, vel);  // retrigger at new pitch; AMY blends via pitch-bend poll
+    } else {
+        grvSlideActive = false;
+        audioT303PitchBend(1.0f);
+        if (grvT303CurNote) audioT303NoteOff(grvT303CurNote);
+        audioT303NoteOn(midiNote, vel);
+    }
+    grvT303CurNote = midiNote;
+    grvT303NoteOffAt = millis() + DR2_NOTE_DUR_MS;
+}
+
 // ==================== SYSEQ STATE ====================
 #define SYSEQ_STEPS 16
 #define SYSEQ_CHORD 16   // max notes per step
@@ -674,7 +817,18 @@ static StoneWinState stoneWin;
 // instead of playing once through — see audioStoneSetLoopMode() (audio_engine.cpp).
 static bool stoneLoopMode = false;
 
-// ==================== POKEMON MODE ====================
+// ==================== DJ MODE ====================
+// Standalone/performance mode (structure/TEMPLATES.md §3 — no fixed B1-B4 convention
+// required, though B1=FX is kept for consistency with the rest of the app). Two views:
+// browsing (pick a track from the SD card, reusing the same sdFiles[]/sdListDir/
+// sdCursor machinery as MODE_SAMPLE/MODE_VID) and playing (waveform + transport once a
+// track is loaded). The 4×8 key grid, once playing, doubles as 32 cue points — key N
+// seeks to N/32 of the track, a discoverable way to "navigate inside" a long track
+// without needing continuous joystick scrubbing (see audioDJSeek() for why continuous
+// scrub isn't smooth on this engine — every seek is a real retrigger).
+static bool  djBrowsing = true;   // true = SD browser showing; false = play/transport screen
+static float djLastP1   = -1.0f;  // pot-pickup baseline for speed (P1)
+
 enum PokemonType : uint8_t {
     PKMN_NORMAL=0, PKMN_FIRE, PKMN_WATER, PKMN_GRASS,
     PKMN_ELECTRIC, PKMN_ICE, PKMN_FIGHTING, PKMN_POISON,
@@ -1384,16 +1538,16 @@ static const MenuItem kMenuCatInstr[] = {
     MENU_MOD2, MENU_I303, MENU_MODULAR,
     MENU_GRANULAR2, MENU_EXP,
     MENU_EXP2, MENU_EXP3, MENU_POKEMON,
-    MENU_LIFE, MENU_SWARM, MENU_GEN
+    MENU_LIFE, MENU_SWARM, MENU_GEN, MENU_DJ
 };
 static const MenuItem kMenuCatSeq[] = {
-    MENU_DRUM2, MENU_DR2, MENU_303S2, MENU_SYSEQ, MENU_SS2, MENU_GEST
+    MENU_DRUM2, MENU_DR2, MENU_303S2, MENU_SYSEQ, MENU_SS2, MENU_GEST, MENU_GROOVE
 };
 static const MenuItem kMenuCatAut[] = {
     MENU_LIGHT, MENU_LIGHTPLAY, MENU_ABOUT, MENU_SD, MENU_ANIM, MENU_VID, MENU_LANIM, MENU_PCMCLEAN, MENU_IMPORT, MENU_MIDI
 };
 static const MenuItem* kMenuCatItems[] = { kMenuCatInstr, kMenuCatSeq, kMenuCatAut };
-static const uint8_t kMenuCatSizes[] = { 15, 6, 10 };
+static const uint8_t kMenuCatSizes[] = { 16, 7, 10 };
 
 // ==================== VID STATE ====================
 struct __attribute__((packed)) BvidHeader {
@@ -1671,6 +1825,20 @@ int8_t modSlotFindFxParam(uint8_t fx, uint8_t param) {
 static uint8_t s_fxModEditParam = 0;   // which of fxList[fxSelected]'s params is being automated
 static int8_t  s_fxModEditSlot  = -1;  // gModSlots[] index owning this (fx,param); -1 = unassigned
 static int8_t  s_fxModProfileIdx = -1; // joystick-Y cursor into kLfoProfiles[]; -1 = none picked yet (custom/pot-tuned)
+
+// Ensure a general-pool slot is bound to (fxSelected, s_fxModEditParam), allocating one
+// via modSlotAllocFxParam() if needed. A slot index freed by an unrelated PAST (fx,param)
+// automation (e.g. deactivated by pulling its depth back to 0) still holds that old
+// automation's rate/shape/depth until reused — rebinding it without resetting first would
+// silently inherit that stale, unrelated state into the new (fx,param) pair. Returns false
+// if the pool is full (all 4 general slots active).
+static bool fxModEnsureSlot() {
+    if (s_fxModEditSlot >= 0) return true;
+    s_fxModEditSlot = modSlotAllocFxParam();
+    if (s_fxModEditSlot < 0) return false;
+    gModSlots[s_fxModEditSlot] = ModSlot{};
+    return true;
+}
 // Long-press tracking for the FX grid: press arms this without acting yet; released
 // before the threshold performs the normal toggle (overlayFxKeyRelease()), held past it
 // opens the automation editor instead (polled in loop(), same idiom as btn1PressTime's
@@ -1679,11 +1847,50 @@ static int8_t  s_fxModProfileIdx = -1; // joystick-Y cursor into kLfoProfiles[];
 static uint8_t  s_fxPressOpt       = 255; // opt currently held down in the FX grid, 255=none
 static uint32_t s_fxPressStartMs   = 0;
 static bool     s_fxLongPressFired = false;
+// Double-click tracking for the FX grid (separate from the long-press machinery above,
+// which only distinguishes short-vs-long on a SINGLE press): a double-click resets that
+// FX's LFO automation. Tracks the opt+time of the last completed SHORT click (long
+// presses don't count) so the next short click on the SAME opt within the window is
+// recognized as a double-click, on top of the normal toggle each click already does.
+#define FX_DBLCLICK_MS 350
+static uint8_t  s_fxLastClickOpt = 255;
+static uint32_t s_fxLastClickMs  = 0;
+
+// Clears every gModSlots[] automation targeting this FX (all of its params) — used by
+// double-clicking an FX slot in the grid. Resetting to ModSlot{} (not just active=false)
+// immediately frees the slot for reuse, matching fxModEnsureSlot()'s "never leave a
+// slot holding stale state" rule.
+static void resetFxLfo(uint8_t opt) {
+    bool any = false;
+    for (uint8_t i = 0; i < 4; i++) {
+        if (gModSlots[i].active && gModSlots[i].destKind == MODDEST_FX_PARAM && gModSlots[i].destA == opt) {
+            gModSlots[i] = ModSlot{};
+            any = true;
+        }
+    }
+    if (any) {
+        // If the automation editor happens to be open on this exact (fx,param) right
+        // now, its cached slot index is now stale/invalid.
+        if (s_fxModEditSlot >= 0 && fxSelected == opt) s_fxModEditSlot = -1;
+        Serial.printf("OVL FX[%d] LFO reset\n", opt);
+    }
+}
+
+// FILT's Res knob drives two independently-tuned resonance ranges off the SAME
+// physical pot position (see the long comment where this used to be inlined, in
+// applyFxEffect's case 0) — factored out so the anti-zipper smoothing block (which
+// needs the SAME ladderRes value every 10ms while the user turns Cutoff, not just
+// when applyFxEffect() itself runs) can't drift out of sync with it.
+static void filtResonances(float res, float paramMin, float paramMax, float &nativeRes, float &ladderRes) {
+    float resT = (res - paramMin) / (paramMax - paramMin);
+    nativeRes  = 0.7f  + resT * (9.7f  - 0.7f);
+    ladderRes  = 2.25f + resT * (18.0f - 2.25f);
+}
 
 void applyFxEffect(uint8_t fx, bool silent = false) {
     FxEffect &e = fxList[fx];
     bool on = e.active;
-    // `silent`: the mod-slot automation tick (modSlotApply/modSlotRestore) calls this
+    // `silent`: the mod-slot automation tick (modSlotsTick10ms/modSlotRestore) calls this
     // every 10ms per automated FX to push the modulated value through — logging every
     // call would spam ~100 lines/sec while an LFO is running. Normal user-driven calls
     // (toggle, pot edit) keep logging as before.
@@ -1701,34 +1908,20 @@ void applyFxEffect(uint8_t fx, bool silent = false) {
             float   cut = e.params[0], res = e.params[1];
             if (!silent) Serial.printf("FX0 FILT %s cut=%.0f res=%.2f typ=%s\n",
                 on?"ON":"off", on?cut:0.0f, on?res:1.5f, kFiltTypN[ti]);
-            // Res knob position, independent of its own param range (0..1, 0=paramMin,
-            // 1=paramMax) — used below to drive each filter type's own well-tuned
-            // resonance range off the SAME physical pot position, rather than feeding
-            // the raw 0.5-3.0 `res` value into both. Reported as too weak on both LPF
-            // and LADDER: AMY's native Q=3.0 ceiling (the old direct e.resonance=res)
-            // is a fairly mild peak by synth-filter standards (real "screamer" filters
-            // commonly run Q 8-15+), and LADDER's own raw-resonance ceiling was tuned
-            // independently (see nativeRes/ladderRes below) — coupling them 1:1 to the
-            // same 0.5-3.0 range would force one bad compromise between the two.
-            float resT = (res - e.paramMin[1]) / (e.paramMax[1] - e.paramMin[1]);
-            // AMY-native LPF/HPF/BPF: Q from 0.7 (AMY's own neutral/no-resonance
-            // default, see amy.c's default synth->resonance=0.7f — so "resonance
-            // dialed to zero" still reads as flat/neutral, not arbitrarily raised) up
-            // to 9.7, a genuinely strong resonant peak (dsps_biquad_gen_lpf_f32 in
-            // filters.c only floors Q at 0.51, no ceiling — stays stable at any finite Q).
-            float nativeRes = 0.7f + resT * (9.7f - 0.7f);
-            // LADDER: raw resonance 2.25 (same floor as the old res*4.5 mapping, no
-            // regression at the bottom of the knob) up to 18 — a bit past the ~15
-            // where the safety soft-clip in amy.c's bus-0 block starts visibly
-            // compressing further gains, intentionally: the fc2-taper fix in that same
-            // block (see amy.c) removes the broadband treble sizzle that used to make
-            // pushing resonance further feel harsh rather than "interesting", so there's
-            // now real headroom to lean into that soft-clip character at the very top.
-            float ladderRes = 2.25f + resT * (18.0f - 2.25f);
+            // See filtResonances(): FILT's Res knob drives two independently-tuned
+            // resonance ranges (AMY-native Q for LPF/HPF/BPF, LADDER's own raw scalar)
+            // off the SAME physical pot position.
+            float nativeRes, ladderRes;
+            filtResonances(res, e.paramMin[1], e.paramMax[1], nativeRes, ladderRes);
             // LADDER bypasses AMY's own per-voice filter (plain linear biquads, no
             // ladder topology exists in AMY) and instead runs a custom bus-level 4-pole
             // filter with tanh-saturated feedback — see audioSetLadderFilter() and
             // amy.c's bus-0 processing block for the actual "exotic" nonlinear rolloff.
+            // `cut` here may be a mod-slot's momentarily-staged modulated value (see
+            // modSlotsTick10ms()) — must be passed through as-is, NOT replaced by
+            // lpfSmoothCut, or FILT automation would never actually reach AMY. The
+            // continuous (non-automated) cutoff smoothing lives entirely in loop()'s
+            // "Smooth FILT cutoff application" tick, which also now handles LADDER.
             audioSetAllFiltersT(on && !ladder ? cut : 0.0f, on && !ladder ? nativeRes : 1.5f,
                                 (on && !ladder) ? kFiltAMY[ti] : FILTER_LPF24);
             audioSetLadderFilter(cut, ladderRes, on && ladder);
@@ -1843,27 +2036,13 @@ static float modExcursion(float sample, float base, float mn, float mx) {
     return (sample >= 0.0f) ? sample * (mx - base) : sample * (base - mn);
 }
 
-// Apply one modulation sample. FX_PARAM uses an "apply then restore fxList[].params[],
-// call applyFxEffect()" trick: fxList[].params[] holds the user's pot-set "center" value,
-// which we temporarily overwrite, push through the normal FX-apply path (zero changes
-// needed to applyFxEffect() itself), then restore — so the center value the user dialed in
-// is never lost, only the AMY-facing state is momentarily modulated.
-static void modSlotApply(ModSlot &s, float sample) {
-    if (s.destKind == MODDEST_FX_PARAM) {
-        FxEffect &fx = fxList[s.destA];
-        float mn = fx.paramMin[s.destB], mx = fx.paramMax[s.destB];
-        float base = fx.params[s.destB];
-        float mod = base + s.depth * modExcursion(sample, base, mn, mx);
-        fx.params[s.destB] = mod;
-        applyFxEffect(s.destA, true);
-        fx.params[s.destB] = base;
-    }
-    // MODDEST_MOD_WTPOS_B: the modular synth's one LFO destination for this MVP —
-    // wobbles osc B's wavetable morph position around its pot-set base (modOscBPos),
-    // giving the classic "evolving wavetable" motion. gModSlots[4] is reserved for this
-    // (see Section 1's declaration comment); other MODDEST_MOD_* destinations exist in
-    // the enum for a future deeper mod-matrix but aren't wired to anything yet.
-    else if (s.destKind == MODDEST_MOD_WTPOS_B) {
+// MODDEST_MOD_WTPOS_B: the modular synth's one LFO destination for this MVP — wobbles
+// osc B's wavetable morph position around its pot-set base (modOscBPos), giving the
+// classic "evolving wavetable" motion. gModSlots[4] is reserved for this (see Section 1's
+// declaration comment) — a dedicated single-purpose setter, so (unlike MODDEST_FX_PARAM
+// below) there's no risk of two slots' modulation of it colliding.
+static void modSlotApplyDirect(ModSlot &s, float sample) {
+    if (s.destKind == MODDEST_MOD_WTPOS_B) {
         float pos = modOscBPos + s.depth * modExcursion(sample, modOscBPos, 0.0f, 1.0f);
         audioModularSetWtPos(MOD3_OSCB_CH, pos);
     }
@@ -1878,6 +2057,25 @@ static void modSlotRestore(ModSlot &s) {
 }
 
 void modSlotsTick10ms() {
+    // Two (or more) active slots can target DIFFERENT params of the SAME fx — e.g.
+    // FILT's Cutoff and Resonance automated independently. But applyFxEffect() sends
+    // ONE combined AMY event covering that fx's WHOLE params[] array, not a per-field
+    // write. The original design applied+restored each slot immediately, one at a time:
+    // slot A would set params[destB]=modulated, call applyFxEffect() (sending BOTH
+    // params, the other one still at its resting base), then restore params[destB] back
+    // to base. When slot B (same fx, different destB) then ran its OWN apply+restore
+    // cycle, its own applyFxEffect() call re-sent slot A's param at ITS resting base —
+    // silently undoing whatever slot A had just set moments earlier in the SAME tick.
+    // Net effect: only the LAST-processed slot's modulation ever actually reached AMY;
+    // reported directly as "setting an LFO on Resonance erases the one on Cutoff".
+    // Fix: stage every active FX_PARAM slot's modulated value into fxList[].params[]
+    // first, without applying yet, then call applyFxEffect() exactly ONCE per touched
+    // fx — by then every one of that fx's automated params already reflects this tick's
+    // modulation simultaneously — then restore params[] back to the true base.
+    bool  fxTouched[FX_COUNT] = {};
+    bool  paramTouched[FX_COUNT][4] = {};
+    float savedBase[FX_COUNT][4];
+
     for (uint8_t i = 0; i < MOD_SLOT_COUNT; i++) {
         ModSlot &s = gModSlots[i];
         if (!s.active || s.depth < 0.005f) {
@@ -1892,8 +2090,25 @@ void modSlotsTick10ms() {
         }
         float sample = modWaveformSample(s.shape, s.phase, s.shHold);
         s.wasActive = true;
-        modSlotApply(s, sample);
+
+        if (s.destKind == MODDEST_FX_PARAM) {
+            FxEffect &fx = fxList[s.destA];
+            float mn = fx.paramMin[s.destB], mx = fx.paramMax[s.destB];
+            float base = fx.params[s.destB];
+            if (!paramTouched[s.destA][s.destB]) {
+                savedBase[s.destA][s.destB] = base;
+                paramTouched[s.destA][s.destB] = true;
+            }
+            fx.params[s.destB] = base + s.depth * modExcursion(sample, base, mn, mx);
+            fxTouched[s.destA] = true;
+        } else {
+            modSlotApplyDirect(s, sample);
+        }
     }
+    for (uint8_t fx = 0; fx < FX_COUNT; fx++) if (fxTouched[fx]) applyFxEffect(fx, true);
+    for (uint8_t fx = 0; fx < FX_COUNT; fx++)
+        for (uint8_t p = 0; p < 4; p++)
+            if (paramTouched[fx][p]) fxList[fx].params[p] = savedBase[fx][p];
 }
 
 void applyAllFx() {
@@ -2429,6 +2644,14 @@ static CtrlLabels ctrlLabelsFor(AppMode m) {
             return {"SHAPE", "FLOCK", "SPEED", "ATTRACT", "ZONE", "-", "-", "-", "-"};
         case MODE_GEN:
             return {"TEXTURE PARAM", "TICKRATE", "SCALE", "OCTAVE", "VOICE PARAM", "PAUSE", "-", "-", "-"};
+        case MODE_GROOVE:
+            if (anyFxActive())
+                return {"-", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX/SCALE", "MUTE/SOLO", "BANK"};
+            if (grvFocusTrack == GRV_TRK_SYNTH)
+                return {"SWING", "LENGTH", "STAMP", "VOLUME", "-", "PLAY", "FX/SCALE", "MUTE/SOLO", "BANK"};
+            if (grvFocusTrack == GRV_TRK_303)
+                return {"SWING", "LENGTH", "STAMP", "RESO", "CUTOFF", "PLAY", "FX/SCALE", "MUTE/SOLO", "BANK"};
+            return {"SWING", "LENGTH", "STAMP", "-", "-", "PLAY", "FX/SCALE", "MUTE/SOLO", "BANK"};  // drum track
         default:
             return {"-", "-", "-", "-", "-", "-", "-", "-", "-"};
     }
@@ -2640,7 +2863,9 @@ void switchMode(AppMode newMode) {
                 true,                          // GEST
                 false,false,true, false,       // PCMCLEAN,STONE,DR2,IMPORT
                 false,false,                   // LIFE,SWARM
-                false                          // GEN
+                false,                          // GEN
+                false,                           // DJ
+                true                             // GROOVE
             };
             if (!kIsSeq[currentMode]) {
                 audioSetFilter(0.0f, 1.5f);
@@ -2658,7 +2883,7 @@ void switchMode(AppMode newMode) {
           "BATT","DIAG","MOD2","GRANU",
           "MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303","MEDIA","LANIM",
           "EXP","EXP2","EXP3","303S","PKMN","SERUM","GEST",
-          "PURGPCM","STONE","GEST2","IMPORT","LIFE","SWARM","GEN"};
+          "PURGPCM","STONE","GEST2","IMPORT","LIFE","SWARM","GEN","DJ","GRV"};
       // This array must have exactly MODE_COUNT entries in AppMode order — the
       // compiler silently pads any missing trailing ones with nullptr (no size
       // mismatch warning), and printf("%s", nullptr) crashes (LoadProhibited).
@@ -2679,10 +2904,24 @@ void switchMode(AppMode newMode) {
         if (sdReady) { sdListDir("/"); stoneRebuildAudioIdx(); }
         if (audioReady) { audioStoneInit(); audioStoneSetLoopMode(stoneLoopMode); lp_stoneP2 = pots[1].value; }  // pre-arm P2 pickup — no jump on entry
     }
+    if (newMode==MODE_DJ) {
+        djBrowsing = true;
+        djLastP1 = pots[1].value;  // pre-arm P1 (speed) pickup — no jump on entry
+        if (sdReady) sdListDir("/", isAudioFile);
+    }
     if (newMode==MODE_DR2) {
         dr2Playing = false; dr2PlayBeat = dr2PlayStep = dr2PlayMicro = 0;
         dr2SelBeat = dr2SelStep = 0;
         dr2BeatSelMask = 0x1; dr2StepSelMask = 0x1;  // single-select by default — see declaration comment
+    }
+    if (newMode==MODE_GROOVE) {
+        grvPlaying = false; grvLastStepMs = millis();
+        grvSynthNoteOffAt = 0; grvT303NoteOffAt = 0; grvT303CurNote = 0;
+        grvSlideActive = false;
+        if (audioReady && !grv303Inited) {
+            audioT303Init(grv303Cutoff, grv303Reso, grv303EnvMod, grv303Decay, t303AmyWave(grv303Wave));
+            grv303Inited = true;
+        }
     }
     if (newMode==MODE_LIGHTPLAY) memset(rippleBrightMap,0,sizeof(rippleBrightMap));
     if (newMode==MODE_SYNTH && audioReady) {
@@ -3005,6 +3244,8 @@ static void dispatchMenuItem(MenuItem item) {
         case MENU_LIFE:      switchMode(MODE_LIFE);      break;
         case MENU_SWARM:     switchMode(MODE_SWARM);     break;
         case MENU_GEN:       switchMode(MODE_GEN);       break;
+        case MENU_DJ:        switchMode(MODE_DJ);        break;
+        case MENU_GROOVE:    switchMode(MODE_GROOVE);    break;
         default: break;
     }
 }
@@ -3157,27 +3398,42 @@ static void overlayFxEnterAutomation(uint8_t opt) {
 }
 
 // Called on key RELEASE (not press) while OVERLAY_FX is open, from the key-event loop —
-// performs the deferred short-click toggle if the long-press threshold was never reached.
+// performs the deferred short-click toggle if the long-press threshold was never reached,
+// and recognizes a second short click on the same slot within FX_DBLCLICK_MS as a
+// double-click that resets that FX's LFO automation (on top of the toggle each click
+// already does — two clicks toggle `active` twice, net unchanged).
 void overlayFxKeyRelease(uint8_t row, uint8_t col) {
     if (col < 4) return; // not a slot cell in the FX grid
     uint8_t opt = (uint8_t)((3 - row) + (uint8_t)(7 - col) * 4);
     if (opt != s_fxPressOpt) return; // release doesn't match the currently-armed press
-    if (!s_fxLongPressFired) overlayFxToggle(opt);
+    if (!s_fxLongPressFired) {
+        overlayFxToggle(opt);
+        uint32_t now = millis();
+        if (opt == s_fxLastClickOpt && (now - s_fxLastClickMs) <= FX_DBLCLICK_MS) {
+            resetFxLfo(opt);
+            s_fxLastClickOpt = 255;  // consume — a third rapid click starts a fresh pair, not another reset
+        } else {
+            s_fxLastClickOpt = opt;
+            s_fxLastClickMs = now;
+        }
+    }
     s_fxPressOpt = 255;
 }
 
 void overlayKeyPress(uint8_t row, uint8_t col) {
     if (s_overlayCloseAt) return;
 
-    // FX automation editor: cols 0-3 (note-grid keys) are left alone here so the user can
-    // play/preview notes and hear the effect of the modulation while dialing it in — audio
-    // for them is handled separately by handleNoteKeyAudio (gated by
-    // notePreviewSafeDuringFxOverlay(), same exemption OVERLAY_FX itself uses). Any other
-    // key (cols 4-7) closes back to OVERLAY_FX — param selection is via joystick X, not
-    // the key grid.
+    // FX automation editor: the WHOLE grid (cols 0-7, including the FX-selection cells
+    // cols 4-7 normally use in OVERLAY_FX) plays/previews notes here instead of
+    // toggling FX — audio is handled separately by handleNoteKeyAudio (gated by
+    // notePreviewSafeDuringFxOverlay()). This used to close back to OVERLAY_FX on any
+    // cols 4-7 press, which meant a stray grid press while jamming along to the LFO
+    // silently kicked you out of the editor — param selection is via joystick X, not
+    // the key grid, so nothing on the grid actually needs to do anything but play. Use
+    // B1-B4 to navigate away instead (B1 specifically returns to the FX grid — see
+    // handleButton()'s per-mode btn==0 case, already toggles back to OVERLAY_FX from
+    // any other overlay including this one).
     if (s_overlay == OVERLAY_FX_MOD) {
-        if (col < 4) return;
-        s_overlay = OVERLAY_FX; s_overlayCloseAt = 0;
         return;
     }
 
@@ -3463,7 +3719,8 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                     case MODE_I303:
                     case MODE_STONE:
                     case MODE_OMNI:
-                    case MODE_MODULAR: {  // newly wired in — was unreachable from this mode before
+                    case MODE_MODULAR:  // newly wired in — was unreachable from this mode before
+                    case MODE_DJ: {
                         OverlayType old = s_overlay; s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
                         if (old != OVERLAY_FX) s_overlay = OVERLAY_FX;
                         break;
@@ -3589,6 +3846,20 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                         }
                         break;
                     }
+                    case MODE_GROOVE:
+                        grvPlaying = !grvPlaying;
+                        if (grvPlaying) {
+                            grvLastStepMs = millis();
+                        } else {
+                            if (grvSynthNoteOffAt) { audioNoteOff(grvSynthPlayedNote); grvSynthNoteOffAt = 0; }
+                            if (grvT303NoteOffAt || grvT303CurNote) {
+                                if (grvT303CurNote) audioT303NoteOff(grvT303CurNote);
+                                grvT303NoteOffAt = 0; grvT303CurNote = 0;
+                            }
+                            grvSlideActive = false; audioT303PitchBend(1.0f);
+                            memset(grvDblPendingAt, 0, sizeof(grvDblPendingAt));
+                        }
+                        break;
                     case MODE_303S:
                         drum2Playing = !drum2Playing;
                         if (drum2Playing) { drum2Step=0; drum2LastStepMs=millis(); }
@@ -3684,6 +3955,19 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                 audioStoneSetLoopMode(stoneLoopMode);
             }
             if (btn==3) noteMap.nextOctave();
+            break;
+        case MODE_DJ:
+            if (btn==3) {
+                // B4: browsing -> back to the play view (only if something's already
+                // loaded — otherwise there's nothing to go back TO); play view -> open
+                // the browser to pick a different track.
+                if (djBrowsing) { if (audioDJIsLoaded()) djBrowsing = false; }
+                else { djBrowsing = true; if (sdReady) sdListDir("/", isAudioFile); }
+                break;
+            }
+            if (djBrowsing) break;  // B2/B3 only act once a track is loaded and playing
+            if (btn==1) audioDJPlayPause(!audioDJIsPlaying());    // B2: play/pause
+            if (btn==2) audioDJSetReverse(!audioDJGetReverse());  // B3: reverse toggle
             break;
         case MODE_POKEMON:
             if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_ENV) s_overlay=OVERLAY_ENV; }
@@ -3793,6 +4077,68 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                     memcpy(dr2SynthPats[dr2ActivePat], dr2SynthVel, sizeof(dr2SynthVel));
                     memcpy(dr2T303Pats[dr2ActivePat], dr2T303Vel, sizeof(dr2T303Vel));
                     dr2PatFilled[dr2ActivePat] = true;
+                }
+            }
+            break;
+        case MODE_GROOVE:
+            // B1 (play/stop) handled in the btn==0 block above.
+            if (btn==1) {  // B2: single-click = FX overlay; double-click = Scale/Arp overlay
+                            // (moved off B3 — DR2's own binding — since B3 here already owns
+                            // mute/solo; also how octave gets adjusted for the melodic tracks).
+                static uint32_t _grvB2Last = 0;
+                uint32_t _now = millis();
+                bool isDbl = (_now - _grvB2Last) < 350;
+                _grvB2Last = isDbl ? 0 : _now;
+                OverlayType want = isDbl ? OVERLAY_SCALE_ARP : OVERLAY_FX;
+                OverlayType old = s_overlay; s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
+                if (old != want) s_overlay = want;
+            }
+            if (btn==2) {  // B3: single-click = mute focused track; double-click = solo it
+                            // (Korg Electribe's PART MUTE/PART SOLO precedent — a paired
+                            // feature, not mute-only). Scale/Arp moved to B2 double-click
+                            // below since B3 already owns two gestures here.
+                static uint32_t _grvB3Last = 0;
+                uint32_t _now = millis();
+                bool isDbl = (_now - _grvB3Last) < 350;
+                _grvB3Last = isDbl ? 0 : _now;
+                if (isDbl) {
+                    grvSolo = (grvSolo == (int8_t)grvFocusTrack) ? (int8_t)-1 : (int8_t)grvFocusTrack;
+                } else {
+                    grvMute[grvFocusTrack] = !grvMute[grvFocusTrack];
+                }
+            }
+            if (btn==3) {  // B4: single-click = cycle pattern bank slot; double-click = copy/paste,
+                            // same semantics as DR2's B4 (4035-4069).
+                static uint32_t _grvB4Last = 0;
+                uint32_t _now = millis();
+                bool isDbl = (_now - _grvB4Last) < 350;
+                _grvB4Last = isDbl ? 0 : _now;
+                if (isDbl) {
+                    grvCopied = false;
+                    memcpy(grvOnPats[grvActivePat], grvOn, sizeof(grvOn));
+                    memcpy(grvAltPats[grvActivePat], grvAlt, sizeof(grvAlt));
+                    memcpy(grvLenPats[grvActivePat], grvLen, sizeof(grvLen));
+                    grvCopied = true; grvCopyPat = grvActivePat;
+                } else {
+                    grvActivePat = (uint8_t)((grvActivePat + 1) % GRV_PATS);
+                    if (grvPatFilled[grvActivePat]) {
+                        memcpy(grvOn, grvOnPats[grvActivePat], sizeof(grvOn));
+                        memcpy(grvAlt, grvAltPats[grvActivePat], sizeof(grvAlt));
+                        memcpy(grvLen, grvLenPats[grvActivePat], sizeof(grvLen));
+                    } else if (grvCopied) {
+                        memcpy(grvOn, grvOnPats[grvCopyPat], sizeof(grvOn));
+                        memcpy(grvAlt, grvAltPats[grvCopyPat], sizeof(grvAlt));
+                        memcpy(grvLen, grvLenPats[grvCopyPat], sizeof(grvLen));
+                        memcpy(grvOnPats[grvActivePat], grvOn, sizeof(grvOn));
+                        memcpy(grvAltPats[grvActivePat], grvAlt, sizeof(grvAlt));
+                        memcpy(grvLenPats[grvActivePat], grvLen, sizeof(grvLen));
+                        grvPatFilled[grvActivePat] = true;
+                    } else {
+                        memset(grvOn, 0, sizeof(grvOn));
+                        memset(grvAlt, 0, sizeof(grvAlt));
+                        for (uint8_t t = 0; t < GRV_TRACKS; t++) grvLen[t] = 16;
+                    }
+                    grvRecomputeActivePatFilled();
                 }
             }
             break;
@@ -4350,16 +4696,55 @@ void drawScreen(bool blockWait) {
         else                        snprintf(l4, sizeof(l4), assigned ? "Profile: custom" : "Profile: --");
         oled.drawStr(2, 56, l4);
 
-        // Live phase indicator: horizontal track + moving dot, only while assigned+active.
-        oled.drawFrame(4, 70, 120, 8);
-        if (assigned) {
-            float t = s.phase / (2.0f * (float)PI);
-            int x = 5 + (int)(t * 117.0f);
-            oled.drawBox(x, 71, 3, 6);
+        // Waveform preview: draws the LFO's actual shape as a curve (not just a plain
+        // sliding dot in a blank track, which showed elapsed-time-within-cycle but
+        // nothing about the shape itself) plus a moving marker at the current phase —
+        // "which waveform is this LFO" and "where in its cycle right now" at a glance.
+        // Drawn from `s` (real slot if assigned, else the same all-defaults `dummy`
+        // already used for the Shape/Rate/Depth text above) so it previews what a
+        // fresh slot would start as even before one exists; the phase marker only
+        // appears once a slot is actually assigned+ticking.
+        {
+            const int wx = 4, wy = 62, ww = 120, wh = 28;
+            oled.drawFrame(wx, wy, ww, wh);
+            int midY = wy + wh / 2;
+            int plotX0 = wx + 1, plotW = ww - 2, plotH = wh - 4;
+            if (s.shape == MODSHAPE_SH) {
+                // Sample & hold isn't a smooth function of phase (a fresh random value
+                // only at each wrap) — draw a schematic random staircase instead of a
+                // live curve, just to convey "stepped/random" at a glance.
+                const int steps = 8;
+                uint32_t seed = 12345;
+                int prevY = midY, prevX = plotX0;
+                for (int i = 1; i <= steps; i++) {
+                    seed = seed * 1103515245u + 12345u;
+                    float r = ((float)((seed >> 16) & 0x7fff) / 32767.0f) * 2.0f - 1.0f;
+                    int y = midY - (int)(r * (plotH / 2));
+                    int x = plotX0 + (i * plotW) / steps;
+                    oled.drawHLine(prevX, prevY, x - prevX);
+                    oled.drawVLine(x, min(prevY, y), abs(y - prevY) + 1);
+                    prevX = x; prevY = y;
+                }
+            } else {
+                int prevX = -1, prevY = midY;
+                for (int dx = 0; dx <= plotW; dx++) {
+                    float ph = (float)dx / (float)plotW * 2.0f * (float)PI;
+                    float v = modWaveformSample(s.shape, ph, 0.0f);
+                    int x = plotX0 + dx;
+                    int y = midY - (int)(v * (plotH / 2));
+                    if (prevX >= 0) oled.drawLine(prevX, prevY, x, y);
+                    prevX = x; prevY = y;
+                }
+            }
+            if (assigned) {
+                float t = s.phase / (2.0f * (float)PI);
+                int mx = plotX0 + (int)(t * plotW);
+                oled.drawVLine(mx, wy + 1, wh - 2);
+            }
         }
-        oled.drawStr(2, 88, "Joy X: param  Joy Y: profile");
-        oled.drawStr(2, 98, assigned ? "Keys: play notes" : "P4: raise depth");
-        oled.drawStr(2, 108, "B1: back to FX");
+        oled.drawStr(2, 100, "Joy X: param  Joy Y: profile");
+        oled.drawStr(2, 108, assigned ? "Keys: play notes" : "P4: raise depth");
+        oled.drawStr(2, 116, "B1: back to FX");
 
         if (s_displayTaskHandle) xTaskNotifyGive(s_displayTaskHandle);
         return;
@@ -5110,6 +5495,93 @@ void drawScreen(bool blockWait) {
                 }
                 break;
             }
+            // ---- DJ ----
+            case MODE_DJ: {
+                oled.setFont(u8g2_font_4x6_tf);
+                if (djBrowsing) {
+                    oled.drawStr(0, 7, "DJ - choisir un morceau"); oled.drawHLine(0, 9, 128);
+                    if (!sdReady) {
+                        oled.drawStr(10, 30, "SD not found");
+                    } else {
+                        for (int i = 0; i < 7 && (i + sdScroll) < sdFileCount; i++) {
+                            int idx = i + sdScroll; bool sel = (idx == sdCursor);
+                            char line[29];
+                            if (sdFileIsDir[idx]) snprintf(line, sizeof(line), "%c[%.24s]", sel ? '>' : ' ', sdFiles[idx].c_str());
+                            else snprintf(line, sizeof(line), "%c%.26s", sel ? '>' : ' ', sdFiles[idx].c_str());
+                            oled.drawStr(0, 20 + i * 9, line);
+                            if (sel) oled.drawHLine(0, 21 + i * 9, 128);
+                        }
+                    }
+                    oled.drawStr(0, 122, "JY=parcourir  touche=charger");
+                    break;
+                }
+
+                // Play/transport view.
+                {
+                    String fn = "----";
+                    if (sdCursor < sdFileCount) fn = sdFiles[sdCursor];
+                    snprintf(buf, sizeof(buf), "DJ %.20s", fn.c_str());
+                }
+                oled.drawStr(0, 7, buf); oled.drawHLine(0, 9, 128);
+
+                // Waveform (y=11..40) + playhead — same geometry family as STONE's window view.
+                // Cached against the load-generation counter: audioDJComputeWaveform()
+                // scans the WHOLE track (can be millions of samples), far too expensive
+                // to call every drawScreen() frame — only recompute when the loaded track
+                // actually changed.
+                static uint8_t djWave[128]; static bool djWaveComputed = false; static uint32_t djWaveGen = 0xFFFFFFFF;
+                if (djWaveGen != audioDJGetLoadGen()) {
+                    djWaveComputed = audioDJComputeWaveform(djWave);
+                    djWaveGen = audioDJGetLoadGen();
+                }
+                if (djWaveComputed) {
+                    for (int x = 0; x < 128; x++) {
+                        uint8_t h = (uint8_t)(djWave[x] * 27 / 255);
+                        if (h < 1) h = 1;
+                        oled.drawVLine(x, 40 - h, h);
+                    }
+                    int px = (int)(audioDJGetPosFrac() * 127.f);
+                    oled.drawVLine(px, 11, 29);
+                }
+
+                // Transport status.
+                snprintf(buf, sizeof(buf), "%s  %s  x%.2f",
+                         audioDJIsPlaying() ? "> PLAY" : "|| PAUSE",
+                         audioDJGetReverse() ? (audioDJIsReverseReady() ? "REV" : "REV(...)") : "FWD",
+                         audioDJGetSpeed());
+                oled.drawStr(0, 51, buf);
+
+                {
+                    float lenS = audioDJGetLengthSeconds();
+                    float posS = audioDJGetPosFrac() * lenS;
+                    snprintf(buf, sizeof(buf), "Pos %d:%02d / %d:%02d",
+                             (int)posS / 60, (int)posS % 60, (int)lenS / 60, (int)lenS % 60);
+                    oled.drawStr(0, 60, buf);
+                }
+
+                // FX status — identical pattern to STONE's footer.
+                {
+                    bool anyFxDisp = false;
+                    for (uint8_t fi = 0; fi < FX_COUNT; fi++) if (fxList[fi].active) { anyFxDisp = true; break; }
+                    if (anyFxDisp) {
+                        const FxEffect& fx = fxList[fxSelected];
+                        const char* fxdn = (fxSelected==0) ? fxFiltTypName() : fx.name;
+                        char l1[32] = {};
+                        int o1 = snprintf(l1, sizeof(l1), "%s%s:", fx.active ? "*" : "-", fxdn);
+                        for (int p = 0; p < 4 && p < 2; p++) {
+                            if (!fx.paramNames[p][0]) continue;
+                            char v[8];
+                            if (fxSelected==0 && p==3) strncpy(v, fxFiltTypName(), sizeof(v)-1);
+                            else if (fx.params[p] >= 1000.f) snprintf(v, 8, "%.0fk", fx.params[p]/1000.f);
+                            else snprintf(v, 8, "%.2f", fx.params[p]);
+                            o1 += snprintf(l1+o1, sizeof(l1)-o1, " %.3s=%s", fx.paramNames[p], v);
+                        }
+                        oled.drawStr(0, 111, l1);
+                    }
+                }
+                oled.drawStr(0, 122, "B2 Play  B3 Rev  B4 Browse");
+                break;
+            }
             // ---- SEQUENCER ----
             // ---- LIGHT PLAY ----
             case MODE_LIGHTPLAY: {
@@ -5658,6 +6130,85 @@ void drawScreen(bool blockWait) {
                     oled.drawStr(x0+dw+ow, 125, c3);
                     oled.setFont(u8g2_font_5x7_tf);
                 }
+                break;
+            }
+            // ---- GROOVE — unified drums/synth/303 sequencer, full 4x8 grid = one
+            // track's pattern (see handleNoteKeyAudio's MODE_GROOVE case for the
+            // identical step-index formula this render mirrors: step=(3-r)*8+sc).
+            case MODE_GROOVE: {
+                static const char* kTrackNames[GRV_TRACKS] = {
+                    "KK1","SN1","HHC","CLP","BNG","OHH","CHH","RDE","SYNTH","303"
+                };
+                static const char* kDrumAltName[3] = {"NRM","50%","RTCH"};
+                static const char* kMelAltName[3]   = {"NRM","ACC","SLD"};
+                uint8_t t = grvFocusTrack;
+                bool melodic = (t >= 8);
+                const char* trackName = (t < DRUM2_PADS) ? kDrum2Labels[t] : kTrackNames[t];
+                bool solo = (grvSolo == (int8_t)t);
+                bool muted = grvMute[t] && grvSolo < 0;
+
+                oled.setFont(u8g2_font_5x7_tf);
+                snprintf(buf, sizeof(buf), "%s %-5s %d%s", grvPlaying?"[>]":"[ ]",
+                         trackName, bpm, muted?" M":(solo?" S":""));
+                oled.drawStr(0, 7, buf);
+                oled.drawHLine(0, 9, 128);
+
+                // 4 rows x 8 cols, 15px wide x 20px tall — the whole physical grid mapped
+                // 1:1 (row0=top=steps24-31 ... row3=bottom=steps0-7, matching
+                // handleNoteKeyAudio's (3-row)*8+col formula).
+                for (int r = 0; r < 4; r++) {
+                    int cy = 11 + r * 20;
+                    for (int sc = 0; sc < 8; sc++) {
+                        uint8_t step = (uint8_t)((3 - r) * 8 + sc);
+                        int cx = sc * 15 + 4;
+                        bool inLen = step < grvLen[t];
+                        bool act = grvOn[t][step] > 0;
+                        bool cur = grvPlaying && inLen && (step == grvStep[t]);
+                        uint8_t alt = act ? grvAlt[t][step] : 0;
+                        if (!inLen) {
+                            // Beyond the track's current pattern length: dim placeholder only.
+                            oled.drawPixel(cx+6, cy+9);
+                        } else if (cur) {
+                            oled.drawBox(cx, cy, 13, 18);
+                            if (!act) { oled.setDrawColor(0); oled.drawBox(cx+2,cy+2,9,14); oled.setDrawColor(1); }
+                        } else if (act) {
+                            switch (alt) {
+                                case 0: oled.drawBox(cx+1, cy+1, 11, 16); break;
+                                case 1: oled.drawBox(cx+1, cy+1, 11, 8); oled.drawFrame(cx+1, cy+9, 11, 8); break;
+                                default: oled.drawBox(cx+1, cy+1, 11, 16);
+                                         oled.setDrawColor(0); oled.drawBox(cx+4, cy+6, 5, 6); oled.setDrawColor(1); break;
+                            }
+                        } else {
+                            oled.drawFrame(cx, cy, 13, 18);
+                        }
+                    }
+                }
+                oled.drawHLine(0, 92, 128);
+
+                oled.setFont(u8g2_font_4x6_tf);
+                const char* const* altNames = melodic ? kMelAltName : kDrumAltName;
+                if (melodic) {
+                    snprintf(buf, sizeof(buf), "Note:%d Stamp:%s Len:%d Pat:%d", grvWriteNote, altNames[grvWriteAlt], grvLen[t], grvActivePat+1);
+                } else {
+                    snprintf(buf, sizeof(buf), "Stamp:%s Len:%d Pat:%d", altNames[grvWriteAlt], grvLen[t], grvActivePat+1);
+                }
+                oled.drawStr(0, 100, buf);
+                snprintf(buf, sizeof(buf), "Swing:%d%%", (int)(grvSwing*100));
+                oled.drawStr(0, 108, buf);
+
+                char fxstr[32] = "";
+                for (uint8_t fi = 0; fi < FX_COUNT; fi++) {
+                    if (!fxList[fi].active) continue;
+                    if (fxstr[0]) strncat(fxstr, " ", sizeof(fxstr)-strlen(fxstr)-1);
+                    char a[4];
+                    if (fi==0) { strncpy(a, fxFiltTypName(), sizeof(a)-1); a[3]='\0'; }
+                    else       { strncpy(a, fxList[fi].name, 3); a[3]='\0'; }
+                    strncat(fxstr, a, sizeof(fxstr)-strlen(fxstr)-1);
+                }
+                if (!fxstr[0]) strncpy(fxstr, "--", 3);
+                snprintf(buf, sizeof(buf), "FX:%s", fxstr);
+                oled.drawStr(0, 116, buf);
+                oled.drawStr(0, 124, "B1 PLAY B2 FX B3 MUTE B4 BANK");
                 break;
             }
             // ---- SYSEQ — 16-step polyphonic synth sequencer ----
@@ -7150,9 +7701,23 @@ void drawScreen(bool blockWait) {
 // but the physics tick runs uninterrupted at 10ms throughout.
 static void displayTask(void*) {
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
-        oled.sendBuffer();
-        if (s_oledDone) xSemaphoreGive(s_oledDone);
+        // The 200ms arg is only a safety net against this task ever blocking forever —
+        // it must NOT unconditionally call sendBuffer() on that timeout. drawScreen()
+        // (main.cpp) takes s_oledDone before writing a frame and only calls
+        // xTaskNotifyGive() once every drawStr/drawBox/etc. for that frame is done —
+        // every one of its exit paths does this, so a genuine notification always means
+        // "a complete frame is ready." But the OLD code called sendBuffer()
+        // unconditionally whenever this wait returned, notified or not — if a
+        // drawScreen() call was still mid-write when the 200ms timeout independently
+        // elapsed (more likely under heavy CPU load, e.g. many notes/an arpeggiator
+        // competing for the core running loop()), this task would transmit a
+        // PARTIALLY-DRAWN buffer — a torn frame, visible as random display corruption
+        // that gets worse under load. Only ever send a frame that was actually
+        // completely finished being drawn.
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200))) {
+            oled.sendBuffer();
+            if (s_oledDone) xSemaphoreGive(s_oledDone);
+        }
     }
 }
 
@@ -7929,6 +8494,30 @@ static void updateLedsAndShow()
                 }
                 break;
             }
+            case MODE_GROOVE: {
+                // Full 4x8 grid = the focused track's pattern, same step-index formula as
+                // handleNoteKeyAudio's MODE_GROOVE case and drawScreen's render.
+                uint8_t t = grvFocusTrack;
+                bool melodic = (t >= 8);
+                uint8_t hue = melodic ? (t == GRV_TRK_SYNTH ? 160 : 208) : 96;  // synth=blue 303=purple drums=green
+                for (int r=0;r<KBD_NOTE_ROWS;r++) for (int c=0;c<KBD_COLS;c++) {
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
+                    if (idx<0||idx>=NUM_LEDS+4) continue;
+                    int li=crdToIdx(idx,0);
+                    if (li<0||li>=NUM_LEDS) continue;
+                    uint8_t sc = (uint8_t)(KBD_COLS-1-c);
+                    uint8_t step = (uint8_t)((3-r)*8+sc);
+                    bool inLen = step < grvLen[t];
+                    bool act = inLen && grvOn[t][step] > 0;
+                    bool playing = grvPlaying && inLen && (step == grvStep[t]);
+                    CRGB col = playing ? (act ? CHSV(0,255,255) : CHSV(0,140,90))
+                             : !inLen  ? CHSV(0,0,0)
+                             : act     ? CHSV(hue,255,200)
+                                       : CHSV(hue,120,12);
+                    leds[li]=col;
+                }
+                break;
+            }
             default:
                 for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
                     int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
@@ -8170,14 +8759,16 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
     // colMin check below, silently closed the overlay too — so by the time a pot got
     // touched, the overlay was already gone and pots fell back to whatever the mode's
     // own params are).
-    // col>=4 is excluded even when otherwise "safe": those are the FX overlay's own
+    // col>=4 is excluded for OVERLAY_FX specifically: those are the FX overlay's own
     // 4x4 selection grid (16 slots, colMin=4 in overlayKeyPress) — a key press there
     // is picking/toggling which FX is selected, not a performance gesture, so it
     // shouldn't also fire whatever note that same physical key would play outside
-    // the overlay.
-    if (menuOpen || !audioReady ||
-        (s_overlay != OVERLAY_NONE &&
-         !((s_overlay == OVERLAY_FX || s_overlay == OVERLAY_FX_MOD) && col < 4 && notePreviewSafeDuringFxOverlay())))
+    // the overlay. OVERLAY_FX_MOD has no such grid use (param selection is via
+    // joystick X, not the keys — see overlayKeyPress's OVERLAY_FX_MOD case), so the
+    // WHOLE grid plays notes there, not just cols 0-3.
+    bool overlayAllowsNotes = notePreviewSafeDuringFxOverlay() &&
+        ((s_overlay == OVERLAY_FX && col < 4) || s_overlay == OVERLAY_FX_MOD);
+    if (menuOpen || !audioReady || (s_overlay != OVERLAY_NONE && !overlayAllowsNotes))
         return;
     switch(currentMode){
         case MODE_SYNTH:{
@@ -8618,6 +9209,40 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                 }
                 // DR2_INSTR_TBD: rows 0-2 no-op.
             }
+            break;
+        }
+        case MODE_GROOVE: {
+            // The ENTIRE 4x8 grid is the focused track's pattern (steps 0-31, bottom row
+            // =0-7, top row=24-31 — same "(3-row)*8 + (KBD_COLS-1-col)" shape as DRUM2's
+            // flat 16-step view, 8782, just extended to 4 rows instead of 2). Tapping an
+            // empty step places a hit using the current write-stamp (grvWriteAlt/
+            // grvWriteNote, set via P2/joystick Y — see the pot-dispatch switch); tapping
+            // a filled step with the SAME stamp clears it, a different stamp re-stamps it
+            // — identical "toggle vs re-stamp" behavior to DRUM2's SEQ view (8785-8802).
+            if (!pressed) break;
+            uint8_t step = (uint8_t)((3 - row) * 8 + (KBD_COLS - 1 - col));
+            uint8_t t = grvFocusTrack;
+            unsigned long stepMs = (unsigned long)fmaxf(10.0f, 60000.0f / bpm / 4.0f);
+            if (t < 8) {  // drum track
+                if (grvOn[t][step]) {
+                    if (grvAlt[t][step] == grvWriteAlt) { grvOn[t][step] = 0; grvAlt[t][step] = 0; }
+                    else grvAlt[t][step] = grvWriteAlt;
+                } else {
+                    grvOn[t][step] = 100; grvAlt[t][step] = grvWriteAlt;
+                }
+                if (grvOn[t][step]) grvTriggerDrum(t, step, stepMs);
+            } else {  // synth/303 melodic track
+                uint8_t stampNote = (uint8_t)(grvWriteNote + 1);
+                if (grvOn[t][step] == stampNote && grvAlt[t][step] == grvWriteAlt) {
+                    grvOn[t][step] = 0; grvAlt[t][step] = 0;
+                } else {
+                    grvOn[t][step] = stampNote; grvAlt[t][step] = grvWriteAlt;
+                }
+                if (grvOn[t][step]) {
+                    if (t == GRV_TRK_SYNTH) grvTriggerSynth(step); else grvTriggerT303(step);
+                }
+            }
+            grvRecomputeActivePatFilled();
             break;
         }
         case MODE_303S: {
@@ -9063,6 +9688,35 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     exp3Balls[b].active    = true;
                     exp3Balls[b].triggered = false;
                 }
+            }
+            break;
+        case MODE_DJ:
+            // Grid reinterpreted (structure/TEMPLATES.md §3, no fixed note-grid meaning).
+            // Browsing: joystick Y moves the cursor (shared SD-browser nav block, same as
+            // SAMPLE/GRANULAR2/STONE/VID), any key confirms the entry at sdCursor — plain
+            // list selection, not a spatial grid mapping (32 files rarely fill the screen,
+            // and a scrollable list needs a cursor concept anyway). Playing: each key seeks
+            // to that fraction of the track (32 cue points spread across the grid) — see
+            // audioDJSeek()'s comment for why this is a real retrigger/seek, not a smooth
+            // scratch.
+            if (!pressed) break;
+            if (djBrowsing) {
+                if (sdCursor < sdFileCount) {
+                    if (sdFiles[sdCursor] == "..") {
+                        if (sdPath != "/") {
+                            int ls = sdPath.lastIndexOf('/', sdPath.length()-2);
+                            sdListDir(ls<=0?"/":sdPath.substring(0,ls+1), isAudioFile);
+                        }
+                    } else if (sdFileIsDir[sdCursor]) {
+                        String np = sdPath; if (!np.endsWith("/")) np += "/"; np += sdFiles[sdCursor];
+                        sdListDir(np, isAudioFile);
+                    } else {
+                        audioLoadDJTrack(buildSdFilePath().c_str());
+                        djBrowsing = false;
+                    }
+                }
+            } else if (audioDJIsLoaded()) {
+                audioDJSeek((float)(row * KBD_COLS + col) / 31.0f);
             }
             break;
         case MODE_LIFE:
@@ -10141,6 +10795,71 @@ void loop() {
         }
     }
 
+    // ---- GROOVE SEQUENCER ----
+    // Deliberately its own clock, independent of drum2Step — DRUM2/SYSEQ/303S/SS2/GEST
+    // all share that one clock and tick unconditionally regardless of currentMode, so
+    // reusing it here would make GROOVE's pattern audibly collide with whatever those
+    // modes have loaded in the background (see DR2's own independent dr2LastMicroMs
+    // clock above for the same reasoning).
+    for (uint8_t pi = 0; pi < DRUM2_PADS; pi++) {
+        if (grvDblPendingAt[pi] && millis() >= grvDblPendingAt[pi]) {
+            playDrum(pi, drum2Volume[pi] * 0.65f, grvDblPitch[pi], drum2Decay[pi] * 0.5f);
+            drum2PadFlashMs[pi] = millis();
+            grvDblPendingAt[pi] = 0;
+        }
+    }
+    // Pending note-offs release even after grvPlaying stops, so a step's gate never hangs.
+    if (grvSynthNoteOffAt && millis() >= grvSynthNoteOffAt) {
+        audioNoteOff(grvSynthPlayedNote);
+        grvSynthNoteOffAt = 0;
+    }
+    if (grvT303NoteOffAt && millis() >= grvT303NoteOffAt) {
+        if (grvT303CurNote) { audioT303NoteOff(grvT303CurNote); grvT303CurNote = 0; }
+        grvT303NoteOffAt = 0;
+    }
+    if (grvPlaying) {
+        static bool grvEven = true;
+        float factor = grvEven ? (1.0f + grvSwing) : (1.0f - grvSwing);
+        unsigned long stepMs = (unsigned long)fmaxf(10.0f, 60000.0f / bpm / 4.0f * factor);
+        if (millis() - grvLastStepMs >= stepMs) {
+            grvLastStepMs += stepMs;
+            if (millis() - grvLastStepMs > stepMs) grvLastStepMs = millis();  // catch-up guard
+            grvEven = !grvEven;
+            for (uint8_t t = 0; t < GRV_TRACKS; t++) {
+                uint8_t len = grvLen[t] ? grvLen[t] : 1;
+                grvStep[t] = (uint8_t)((grvStep[t] + 1) % len);
+                if (!grvTrackAudible(t)) continue;
+                if (t < 8)                      grvTriggerDrum(t, grvStep[t], stepMs);
+                else if (t == GRV_TRK_SYNTH)    grvTriggerSynth(grvStep[t]);
+                else                            grvTriggerT303(grvStep[t]);
+            }
+        }
+    }
+    // Joystick X cycles the focused track — edge-triggered (must return past the
+    // dead-zone before the next cycle fires) since the stick self-centers, unlike a
+    // plain proportional mapping which would keep snapping focus back to the middle
+    // track every time the stick is released.
+    if (currentMode == MODE_GROOVE && !menuOpen) {
+        static bool grvJxArmed = true;
+        float jx = constrain(cachedJoyX / 64.0f, -1.0f, 1.0f);
+        if (fabsf(jx) < 0.2f) grvJxArmed = true;
+        else if (grvJxArmed && fabsf(jx) > 0.6f) {
+            grvFocusTrack = (uint8_t)((grvFocusTrack + (jx > 0 ? 1 : GRV_TRACKS - 1)) % GRV_TRACKS);
+            grvJxArmed = false;
+        }
+    }
+    // Joystick Y moves the write-pitch cursor (melodic tracks only) — same edge-triggered
+    // shape as JX above, one semitone per crossing.
+    if (currentMode == MODE_GROOVE && !menuOpen && (grvFocusTrack == GRV_TRK_SYNTH || grvFocusTrack == GRV_TRK_303)) {
+        static bool grvJyArmed = true;
+        float jy = constrain(cachedJoyY / 64.0f, -1.0f, 1.0f);
+        if (fabsf(jy) < 0.2f) grvJyArmed = true;
+        else if (grvJyArmed && fabsf(jy) > 0.6f) {
+            grvWriteNote = (uint8_t)constrain((int)grvWriteNote + (jy > 0 ? 1 : -1), 0, 127);
+            grvJyArmed = false;
+        }
+    }
+
     // ---- SAMPLE SEQUENCER ----
     if(seqPlaying){
         static unsigned long lastSeqStep=0;
@@ -10692,23 +11411,37 @@ void loop() {
         // OVERLAY_FX_MOD pot dispatch: centralized here (not duplicated per-mode like the
         // FX-active-param dispatch below) since its meaning never depends on currentMode —
         // it's always "configure the automation for fxList[fxSelected]'s selected param."
+        //
+        // Each pot writes ONLY its own field(s) below, gated on that SPECIFIC pot having
+        // moved — not on a single combined "any of the 3 moved" flag. With one shared
+        // flag, nudging e.g. only the rate pot while editing Resonance's automation would
+        // ALSO rewrite depth/shape from P4/P6's CURRENT absolute position — which, on
+        // real (non-motorized) potentiometers, is very likely still wherever Cutoff's own
+        // automation left it, since switching params via joystick X doesn't move the
+        // physical pots. That silently pulled Cutoff's leftover depth/shape into
+        // Resonance's slot — reported directly as "confusion between cutoff and
+        // resonance". Gating per-field means touching only the rate pot only ever touches
+        // rate; a freshly-allocated slot (fxModEnsureSlot()) starts from ModSlot's plain
+        // defaults for whatever fields haven't been touched yet, instead of inheriting
+        // stale values left behind by a completely different (fx,param) pair.
         if (audioReady && s_overlay == OVERLAY_FX_MOD) {
             static float lpFm[3] = {-1,-1,-1};
-            bool changed = false;
-            if (fabsf(pots[3].value - lpFm[0]) > 0.003f) { lpFm[0]=pots[3].value; changed=true; } // P4 depth
-            if (fabsf(pots[4].value - lpFm[1]) > 0.003f) { lpFm[1]=pots[4].value; changed=true; } // P5 rate (BPM sync + free Hz, merged)
-            if (fabsf(pots[5].value - lpFm[2]) > 0.003f) { lpFm[2]=pots[5].value; changed=true; } // P6 shape
-            if (changed) {
-                float depth = pots[3].value;
-                if (s_fxModEditSlot < 0 && depth > 0.01f) {
-                    s_fxModEditSlot = modSlotAllocFxParam();
+            bool depthMoved = fabsf(pots[3].value - lpFm[0]) > 0.003f; // P4 depth
+            bool rateMoved  = fabsf(pots[4].value - lpFm[1]) > 0.003f; // P5 rate (BPM sync + free Hz, merged)
+            bool shapeMoved = fabsf(pots[5].value - lpFm[2]) > 0.003f; // P6 shape
+            if (depthMoved) lpFm[0] = pots[3].value;
+            if (rateMoved)  lpFm[1] = pots[4].value;
+            if (shapeMoved) lpFm[2] = pots[5].value;
+            if ((depthMoved || rateMoved || shapeMoved) && fxModEnsureSlot()) {
+                ModSlot &s = gModSlots[s_fxModEditSlot];
+                s.destKind = MODDEST_FX_PARAM;
+                s.destA = fxSelected; s.destB = s_fxModEditParam;
+                if (depthMoved) {
+                    s.depth = pots[3].value;
+                    s.active = s.depth > 0.005f;
                 }
-                if (s_fxModEditSlot >= 0) {
-                    ModSlot &s = gModSlots[s_fxModEditSlot];
-                    s.destKind = MODDEST_FX_PARAM;
-                    s.destA = fxSelected; s.destB = s_fxModEditParam;
-                    s.depth = depth;
-                    // P5 alone now sweeps the WHOLE rate spectrum, continuously: slow
+                if (rateMoved) {
+                    // P5 alone sweeps the WHOLE rate spectrum, continuously: slow
                     // BPM-synced subdivisions (1/2 down to 1/16) in the bottom half,
                     // then free-running Hz (0.5-20Hz) in the top half — was split
                     // across two pots before (P5=free-Hz only, P7=sync toggle+
@@ -10727,8 +11460,9 @@ void loop() {
                         float t = (pots[4].value - kRateSplit) / (1.0f - kRateSplit);  // 0..1
                         s.rateHz = 0.5f + t * (20.0f - 0.5f);
                     }
+                }
+                if (shapeMoved) {
                     s.shape = (ModWaveShape)constrain((int)(pots[5].value*3.99f), 0, MODSHAPE_COUNT-1);
-                    s.active = depth > 0.005f;
                 }
             }
         } else if(audioReady&&!menuOpen){
@@ -10762,6 +11496,21 @@ void loop() {
                         // Pots 3-6 = active FX params
                         if(fxList[fxSelected].active){
                             static float lp_fx[4]={-1,-1,-1,-1};
+                            static uint8_t lpSynthFxSel=0xFF;
+                            // Re-sync tracking when FX selection changes or FX was just
+                            // (re)activated — without this, lp_fx[] keeps stale pot
+                            // positions from whichever FX was last adjusted, and since
+                            // physical pots don't move on their own when switching FX or
+                            // toggling one off/on, a pot can then read as "unchanged"
+                            // indefinitely — the FX looks dead and won't respond until
+                            // the pot happens to be moved away from that stale value.
+                            // Every other mode's FX pot dispatch already does this
+                            // (fxPotNeedSync, set by overlayFxToggle() on activation) —
+                            // this block was missing it.
+                            if(lpSynthFxSel!=fxSelected || fxPotNeedSync){
+                                for(int p=0;p<4;p++) lp_fx[p]=pots[3+p].value;
+                                lpSynthFxSel=fxSelected; fxPotNeedSync=false;
+                            }
                             const int pIdx[4]={3,4,5,6};
                             bool changed=false;
                             for(int p=0;p<4;p++){
@@ -10792,6 +11541,54 @@ void loop() {
                     // Pot 1 unused (shape set by pokemon); pots 3-6 = active FX params
                     if (fxList[fxSelected].active) {
                         static float lp_fx[4]={-1,-1,-1,-1};
+                        static uint8_t lpPkmnFxSel=0xFF;
+                        // Re-sync on FX-selection change or (re)activation — see the
+                        // matching comment in MODE_SYNTH's copy of this block.
+                        if(lpPkmnFxSel!=fxSelected || fxPotNeedSync){
+                            for(int p=0;p<4;p++) lp_fx[p]=pots[3+p].value;
+                            lpPkmnFxSel=fxSelected; fxPotNeedSync=false;
+                        }
+                        const int pIdx[4]={3,4,5,6};
+                        bool changed=false;
+                        for(int p=0;p<4;p++){
+                            if(fxList[fxSelected].paramNames[p][0]=='\0') continue;
+                            if(fabsf(pots[pIdx[p]].value-lp_fx[p])>0.001f){
+                                float mn=fxList[fxSelected].paramMin[p];
+                                float mx=fxList[fxSelected].paramMax[p];
+                                if (fxSelected==0 && p==0)
+                                    fxList[0].params[0]=mn*powf(mx/mn, pots[pIdx[0]].value);
+                                else if (fxSelected==0 && p==3) {
+                                    fxList[0].params[3]=floorf(pots[pIdx[p]].value*3.9999f);
+                                    s_filtMetaChanged=true;
+                                } else {
+                                    fxList[fxSelected].params[p]=mn+(mx-mn)*pots[pIdx[p]].value;
+                                    if (fxSelected==0) s_filtMetaChanged=true;
+                                }
+                                lp_fx[p]=pots[pIdx[p]].value;
+                                changed=true;
+                            }
+                        }
+                        if(changed && fxSelected!=0) applyFxEffect(fxSelected);
+                        else if(changed && fxSelected==0 && fxList[0].active && s_filtMetaChanged) { applyFxEffect(0); s_filtMetaChanged=false; }
+                    }
+                    break;
+                }
+                case MODE_DJ: {
+                    // P1 = speed, pitch-coupled (turntable-style) — exponential so most of
+                    // the pot's travel sits in the musically useful 0.5x-2x range, with the
+                    // extremes (0.25x/4x) reachable at the very ends. Pots 3-6 (P4-P7) =
+                    // active FX params, same convention as every other instrument mode.
+                    if (!djBrowsing && audioDJIsLoaded() && fabsf(pots[1].value - djLastP1) > 0.003f) {
+                        djLastP1 = pots[1].value;
+                        audioDJSetSpeed(0.25f * powf(16.0f, pots[1].value));
+                    }
+                    if (fxList[fxSelected].active) {
+                        static float lp_fx[4]={-1,-1,-1,-1};
+                        static uint8_t lpDjFxSel=0xFF;
+                        if (lpDjFxSel!=fxSelected || fxPotNeedSync) {
+                            for (int p=0;p<4;p++) lp_fx[p]=pots[3+p].value;
+                            lpDjFxSel=fxSelected; fxPotNeedSync=false;
+                        }
                         const int pIdx[4]={3,4,5,6};
                         bool changed=false;
                         for(int p=0;p<4;p++){
@@ -11207,6 +12004,70 @@ void loop() {
                     }
                     break;
                 }
+                case MODE_GROOVE: {
+                    // FX overlay open: P4-P7 belong to the active FX's own params instead
+                    // of GROOVE's own controls — same established pattern as DR2/DRUM2/etc.
+                    static float lpGrvFx[4] = {-1.f,-1.f,-1.f,-1.f};
+                    static uint8_t lpGrvFxSel = 0xFF;
+                    bool anyFxActive = false;
+                    for (int f=0;f<FX_COUNT;f++) if(fxList[f].active){anyFxActive=true;break;}
+                    if (anyFxActive) {
+                        if (lpGrvFxSel != fxSelected || fxPotNeedSync) {
+                            for (int p=0;p<4;p++) lpGrvFx[p]=pots[3+p].value;
+                            lpGrvFxSel=fxSelected; fxPotNeedSync=false;
+                        }
+                        bool fxChanged=false;
+                        for (int p=0;p<4;p++) {
+                            if (fxList[fxSelected].paramNames[p][0]=='\0') continue;
+                            if (fabsf(pots[3+p].value-lpGrvFx[p])>0.001f) {
+                                float mn=fxList[fxSelected].paramMin[p];
+                                float mx=fxList[fxSelected].paramMax[p];
+                                if (fxSelected==0 && p==0)
+                                    fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
+                                else
+                                    fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
+                                lpGrvFx[p]=pots[3+p].value; fxChanged=true;
+                            }
+                        }
+                        if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
+                        break;
+                    }
+                    lpGrvFxSel = 0xFF;
+                    // Soft-pickup pattern (snapshot + threshold-gated apply, same idea as
+                    // DR2's lp303[]/lpDr2303wf above) — the pots are infinite encoders, not
+                    // fixed-travel, so applying pots[i].value directly would jump the param
+                    // to wherever that shared integral happened to sit on entry/track-switch.
+                    static float lpSwing=-1.f, lpLen=-1.f, lpStamp=-1.f, lpP6=-1.f, lpP7=-1.f;
+                    static uint8_t lpTrack = 0xFF;
+                    if (lpTrack != grvFocusTrack) {
+                        lpLen = pots[3].value; lpStamp = pots[4].value;
+                        lpP6 = pots[5].value; lpP7 = pots[6].value;
+                        lpTrack = grvFocusTrack;
+                    }
+                    if (lpSwing < 0.0f) lpSwing = pots[1].value;
+                    if (fabsf(pots[1].value - lpSwing) > 0.003f) {
+                        grvSwing = pots[1].value * 0.6f;
+                        lpSwing = pots[1].value;
+                    }
+                    if (fabsf(pots[3].value - lpLen) > 0.003f) {
+                        grvLen[grvFocusTrack] = (uint8_t)constrain(1 + (int)roundf(pots[3].value * (GRV_MAX_STEPS-1)), 1, GRV_MAX_STEPS);
+                        grvStep[grvFocusTrack] %= grvLen[grvFocusTrack];
+                        lpLen = pots[3].value;
+                    }
+                    if (fabsf(pots[4].value - lpStamp) > 0.01f) {
+                        grvWriteAlt = (uint8_t)constrain((int)(pots[4].value * 3.0f), 0, 2);
+                        lpStamp = pots[4].value;
+                    }
+                    if (grvFocusTrack == GRV_TRK_SYNTH) {
+                        if (fabsf(pots[5].value - lpP6) > 0.003f) { grvSynthVolume = pots[5].value * 2.0f; lpP6 = pots[5].value; }
+                    } else if (grvFocusTrack == GRV_TRK_303) {
+                        bool ch = false;
+                        if (fabsf(pots[5].value - lpP6) > 0.003f) { grv303Reso = 1.0f + pots[5].value*2.0f; lpP6 = pots[5].value; ch = true; }
+                        if (fabsf(pots[6].value - lpP7) > 0.003f) { grv303Cutoff = 80.0f * powf(25.0f, pots[6].value); lpP7 = pots[6].value; ch = true; }
+                        if (ch && audioReady) audioT303Params(grv303Cutoff, grv303Reso, grv303EnvMod, grv303Decay);
+                    }
+                    break;
+                }
                 case MODE_MOD2: {
                     // P2 = algo selection (discrete, 8 steps)
                     static float lp2_algo=-1.0f;
@@ -11611,12 +12472,28 @@ void loop() {
         if (audioReady) modSlotsTick10ms();
 
         // Smooth FILT cutoff application — anti-zipper when turning the cutoff encoder.
-        // Use audioSetFilterFreq (no filter_type field) to avoid AMY biquad state resets
-        // that cause an audible pop/click on each value change.
+        // For LPF/HPF/BPF, uses audioSetFilterFreq (no filter_type field) to avoid AMY
+        // biquad state resets that cause an audible pop/click on each value change.
         //
-        // Skipped while a mod slot is automating FILT's cutoff: modSlotApply() (called by
-        // modSlotsTick10ms() just above) writes the modulated value, calls applyFxEffect(0)
-        // to push it to AMY, then immediately restores fxList[0].params[0] back to the
+        // For LADDER: this used to be missing entirely — the block below called
+        // audioSetFilterFreq() UNCONDITIONALLY whenever FILT was active, regardless of
+        // Typ, which re-engages AMY's own per-voice filter (SYNTH_CH) every 10ms even
+        // while LADDER is selected. applyFxEffect(0)'s LADDER branch deliberately
+        // bypasses that same native filter (cut=0) since LADDER does all its shaping on
+        // the bus-0 DSP instead — so the two fought every tick: applyFxEffect() (fired
+        // on Resonance/Typ changes) turns AMY's native filter off, this block turns it
+        // straight back on one tick later. Audibly: turning Cutoff while on LADDER did
+        // nothing at all (LADDER's own cutoff was never smoothed/updated here, only on
+        // the rare on-demand applyFxEffect() call), while Resonance/Typ tweaks caused a
+        // real, audible "jump" as the two competing filters alternated who was engaged
+        // — reported directly ("le LDR... fait des sauts quand je le règle"). Fix:
+        // this block now smooths LADDER's own cutoff too (audioSetLadderFilter every
+        // tick, matching LPF/HPF/BPF's own continuous update) and never touches AMY's
+        // native filter while LADDER is selected.
+        //
+        // Skipped while a mod slot is automating FILT's cutoff: modSlotsTick10ms() just
+        // above stages the modulated value, calls applyFxEffect(0) to push it to AMY,
+        // then immediately restores fxList[0].params[0] back to the
         // static pot-set base — so by the time THIS block ran right after, it always read
         // that static base (never the modulated value) and smoothly converged lpfSmoothCut
         // toward it, calling audioSetFilterFreq() and overwriting the very cutoff automation
@@ -11632,11 +12509,18 @@ void loop() {
                 // Converge raw cutoff (anti-zipper)
                 float prevCut = lpfSmoothCut;
                 lpfSmoothCut += (fxList[0].params[0] - lpfSmoothCut) * 0.5f;
-                float   effCut = lpfSmoothCut;
-                float   effRes = fxList[0].params[1];
-                audioSetFilterFreq(effCut, effRes);
-                if (fabsf(lpfSmoothCut - prevCut) > 1.0f)
-                    audioSetGranular2FilterFreq(effCut, effRes);
+                float effCut = lpfSmoothCut;
+                bool ladder = ((uint8_t)constrain((int)roundf(fxList[0].params[3]), 0, 3)) == 3;
+                if (ladder) {
+                    float nativeRes, ladderRes;
+                    filtResonances(fxList[0].params[1], fxList[0].paramMin[1], fxList[0].paramMax[1], nativeRes, ladderRes);
+                    audioSetLadderFilter(effCut, ladderRes, true);
+                } else {
+                    float effRes = fxList[0].params[1];
+                    audioSetFilterFreq(effCut, effRes);
+                    if (fabsf(lpfSmoothCut - prevCut) > 1.0f)
+                        audioSetGranular2FilterFreq(effCut, effRes);
+                }
             } else {
                 // Keep in sync with the static base so turning automation back off resumes
                 // smoothing from a sane starting point instead of an old, stale value.
@@ -11765,6 +12649,21 @@ void loop() {
             } else {
                 float frac  = (float)elapsed / (float)slideDur;
                 float semis = (float)(int8_t)((int)t303SlideFrom - (int)t303SlideTo) * (1.0f - frac);
+                audioT303PitchBend(powf(2.0f, semis / 12.0f));
+            }
+        }
+
+        // GROOVE's own 303 slide poll — own state (grvSlide*), not t303Slide*, so it
+        // can't be stomped by / stomp on 303S/303S2/DR2/I303's slide state.
+        if (currentMode==MODE_GROOVE && grvSlideActive && audioReady) {
+            unsigned long elapsed = millis() - grvSlideMs;
+            unsigned long slideDur = max(30UL, 60000UL / (unsigned long)bpm / 4); // one 16th note
+            if (elapsed >= slideDur) {
+                audioT303PitchBend(1.0f);
+                grvSlideActive = false;
+            } else {
+                float frac  = (float)elapsed / (float)slideDur;
+                float semis = (float)(int8_t)((int)grvSlideFrom - (int)grvSlideTo) * (1.0f - frac);
                 audioT303PitchBend(powf(2.0f, semis / 12.0f));
             }
         }
@@ -12206,8 +13105,13 @@ void loop() {
                 }
                 if (nprof >= 0) {
                     s_fxModProfileIdx = nprof;
-                    if (s_fxModEditSlot < 0) s_fxModEditSlot = modSlotAllocFxParam();
-                    if (s_fxModEditSlot >= 0) {
+                    // fxModEnsureSlot() resets a freshly-allocated slot to ModSlot's plain
+                    // defaults (depth=0.0f included) — without that reset, a pool slot
+                    // freed by a previous, unrelated (fx,param) automation could still be
+                    // sitting at ITS old depth, and the `s.depth < 0.01f` check just below
+                    // would then wrongly see it as "already configured" and skip giving
+                    // this genuinely new automation its audible default depth.
+                    if (fxModEnsureSlot()) {
                         ModSlot &s = gModSlots[s_fxModEditSlot];
                         const LfoProfile &p = kLfoProfiles[nprof];
                         s.destKind = MODDEST_FX_PARAM;
@@ -12339,7 +13243,8 @@ void loop() {
                        || currentMode==MODE_GRANULAR2
                        || currentMode==MODE_STONE
                        || (currentMode==MODE_VID && !vidPlaying && !mediaAudioPlaying)
-                       || (currentMode==MODE_DRUM2 && drum2View==2 && draniBrowse);
+                       || (currentMode==MODE_DRUM2 && drum2View==2 && draniBrowse)
+                       || (currentMode==MODE_DJ && djBrowsing);
         if(needsSdNav&&!menuOpen&&sdReady){
             static unsigned long lastSdNav=0;
             float ny=cachedJoyY/64.0f;
@@ -12347,7 +13252,7 @@ void loop() {
             if (currentMode==MODE_GRANULAR2) for (uint8_t _s=0;_s<GRAN2_MAX_SAMPLES;_s++) if (gran2[_s].computed) { gran2AnyComputed=true; break; }
             uint8_t visLines=(currentMode==MODE_GRANULAR2&&!gran2AnyComputed)?13
                             :(currentMode==MODE_GRANULAR2)?7
-                            :(currentMode==MODE_STONE)?7:8;
+                            :(currentMode==MODE_STONE||currentMode==MODE_DJ)?7:8;
             if(millis()-lastSdNav>=150){
                 if(ny<-0.3f&&sdCursor>0){sdCursor--;if(sdCursor<sdScroll)sdScroll=sdCursor;lastSdNav=millis();}
                 if(ny>0.3f&&sdCursor<sdFileCount-1){sdCursor++;if(sdCursor>=(int)(sdScroll+visLines))sdScroll=sdCursor-visLines+1;lastSdNav=millis();}

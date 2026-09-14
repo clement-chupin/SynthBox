@@ -1,6 +1,8 @@
 # GrvEP
 
 - **Exécutable Windows prêt à l'emploi** : [releases/GrvEP-windows.exe](releases/GrvEP-windows.exe) — aucune installation, double-clic pour lancer.
+- **Exécutable Linux prêt à l'emploi** : [releases/GrvEP-linux](releases/GrvEP-linux) — nécessite SDL2 installé (`apt install libsdl2-2.0-0` sur Debian/Ubuntu), `chmod +x` puis lancer.
+- **APK Android** : [releases/GrvEP.apk](releases/GrvEP.apk) — non signé, `adb install -r` ou activer les sources inconnues.
 - **Vidéo de présentation** : [Instagram](https://www.instagram.com/p/DdB59hfBGcy/)
 
 ![GrvEP](./images/image.png)
@@ -31,6 +33,12 @@ Le même code applicatif (`src/`) tourne sur quatre cibles :
 
 ## Nouveautés récentes
 
+- **MODE_GROOVE — séquenceur unifié drums/synth/303** — toute la grille 4×8 affiche/édite
+  le pattern (jusqu'à 32 pas) d'une seule piste parmi 10 (8 pads batterie + synthé + 303),
+  focus cyclé au joystick X, au lieu de la hiérarchie à 3 niveaux de DR2. Mute/solo par
+  piste, swing persistant (sauvegardé avec le pattern), longueur de pattern indépendante
+  par piste (polymètre), accent/slide/probabilité/ratchet par pas. Détails dans
+  [structure/SOFTWARE.md](structure/SOFTWARE.md).
 - **Automatisation des effets** — un appui long sur un effet actif dans la grille FX
   ouvre un éditeur de modulation (LFO assignable à n'importe quel paramètre de l'effet,
   profondeur/vitesse/forme d'onde réglables aux pots, vitesse balayant en continu des

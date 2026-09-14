@@ -151,6 +151,57 @@ Grille de pas (typiquement 8 ou 16 pas sur 2 lignes), BPM, octave, slide/accent.
 
 ---
 
+## 2b. GROOVE — Séquenceur unifié drums/synth/303 (variante du template SEQUENCER)
+
+GROOVE suit la philosophie SEQUENCER (programmation de pattern + sync BPM) mais s'écarte du
+gabarit "8-16 pas sur 2 lignes" : **toute la grille 4×8 = le pattern d'une seule piste**
+(10 pistes disponibles, cyclées au joystick X), pas de vue "pad" séparée. Voir
+`structure/SOFTWARE.md`'s section MODE_GROOVE pour l'architecture complète.
+
+### Pots
+
+| Pot | Rôle |
+|-----|------|
+| P1 | Volume global. |
+| P2 | Swing (persistant, sauvegardé avec le pattern — pas transitoire comme DRUM2/SYSEQ). |
+| P3 | BPM. |
+| P4 | Longueur de pattern de la piste focus (1-32). |
+| P5 | Stamp d'écriture (accent/slide ou probabilité/ratchet selon le type de piste). |
+| P6-P7 | Spécifique à la piste focus (303 : Reso/Cutoff ; synthé : Volume) **ou**, si un FX est actif, paramètres de cet FX (P4-P7 basculent entièrement). |
+
+### Boutons (B1–B4)
+
+Convention séquenceur classique (**B1**=Play/Stop, **B2**=FX — pas la convention SYNTH
+où B1=FX) :
+
+| Bouton | Court | Double-clic |
+|--------|-------|--------------|
+| B1 | Play/Stop | — |
+| B2 | `OVERLAY_FX` | `OVERLAY_SCALE_ARP` (octave/gamme des pistes mélodiques) |
+| B3 | Mute piste focus | Solo piste focus |
+| B4 | Cycle banque de pattern (4 slots) | Copier/coller (identique à DR2) |
+
+### Joystick
+
+| Axe | Rôle |
+|-----|------|
+| JX | Cycle la piste focus (10 pistes) — déclenché par franchissement de seuil, pas proportionnel (le stick est à rappel auto). |
+| JY | Curseur de note d'écriture (pistes synthé/303 uniquement), un demi-ton par franchissement. |
+
+### Édition de pas — modèle "stamp" (pas de nouvel overlay)
+
+Une pression courte sur une case vide pose un pas avec le stamp courant (P5 + JY) ; une
+pression sur une case déjà posée l'efface. Identique au principe déjà utilisé par
+DR2/303S/SYSEQ/SS2 — aucune nouvelle mécanique d'édition per-pas nécessaire.
+
+### LEDs / OLED
+
+Même convention que le template SEQUENCER (tête de lecture = pleine luminosité, pas actif =
+intermédiaire, pas vide = éteint), mais sur les 32 touches physiques 1:1 avec les 32 pas du
+pattern affiché — pas de vue à 2 lignes.
+
+---
+
 ## 3. Template STANDALONE / PERFORMANCE
 
 > Modes : `EXP`, `EXP2`, `EXP3`, `LIFE`, `SWARM`
@@ -252,6 +303,7 @@ Moteur LFO background (10ms tick) indépendant des pots.
 | SYSEQ | SEQUENCER | — | Octave |
 | SS2 | SEQUENCER | — | Mode play |
 | GRANULAR2 | SEQUENCER | — | Granular opts |
+| GROOVE | SEQUENCER (variante 2b) | — | Cycle banque pattern / copier-coller |
 | EXP | STANDALONE | libre | libre |
 | EXP2 | STANDALONE | libre | libre |
 | EXP3 | STANDALONE | libre | libre |

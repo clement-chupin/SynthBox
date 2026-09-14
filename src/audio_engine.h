@@ -111,6 +111,45 @@ void audioStoneApplyWindow(float startFrac, float endFrac, bool loopMode = false
 void audioStoneSetLoopMode(bool loop);
 bool audioStoneGetLoopMode();
 
+// ==================== DJ (MODE_DJ) ====================
+// One mono "deck" for a whole song — scrub/speed/reverse, see config.h's DJ_* block for
+// why this is flash-backed rather than PSRAM like every other sample mode.
+// audioLoadDJTrack: background load (decode-once, then flash-cached forever by path+size —
+// re-opening the same file is instant on subsequent loads, same as any other flash-tier sample).
+void audioLoadDJTrack(const char* path);
+bool audioDJIsLoaded();
+// Increments once per successful track load — lets the UI know when to recompute its
+// cached waveform (audioDJComputeWaveform() scans the whole track, too expensive to
+// call every drawScreen() frame) without needing to compare file paths.
+uint32_t audioDJGetLoadGen();
+// Starts/resumes or stops playback from the current position (see audioDJSeek()).
+void audioDJPlayPause(bool playing);
+bool audioDJIsPlaying();
+// Seeks to a fractional position (0..1) in the track and, if playing, retriggers from
+// there (an audible retrigger click is expected — this is a real seek, not a smooth
+// scratch; see structure/SOFTWARE.md for why AMY has no live-phase API to avoid it).
+void audioDJSeek(float posFrac);
+// Current playhead position (0..1), continuously estimated from elapsed time (AMY has
+// no live phase readback) — good enough for a UI playhead, not sample-accurate.
+float audioDJGetPosFrac();
+// Playback rate, pitch coupled (turntable-style, like a real deck's speed/pitch fader) —
+// 1.0 = normal, 0.5 = half speed/an octave down, 2.0 = double/an octave up. Updates a
+// SOUNDING voice smoothly with no retrigger (AMY's per-voice fractional midi_note).
+void audioDJSetSpeed(float speed);
+float audioDJGetSpeed();
+// Reverse toggle. First call lazily builds a reversed copy (PSRAM, capped at
+// DJ_REV_MAX_BYTES — see config.h) of the loaded track; this can take a moment for a
+// long track, so it's a real background task, not instant. audioDJIsReverseReady()
+// tells the UI whether that build finished yet.
+void audioDJSetReverse(bool reverse);
+bool audioDJGetReverse();
+bool audioDJIsReverseReady();
+// Waveform (128 peak bins) from the loaded (forward) buffer, for OLED display —
+// mirrors audioComputeStoneWaveform().
+bool audioDJComputeWaveform(uint8_t* waveform128);
+// Track length in seconds, from the loaded buffer's frame count/rate. 0 if not loaded.
+float audioDJGetLengthSeconds();
+
 // Legacy wrappers (delegate to audioLoadAndPlay with vel=0)
 bool audioLoadFromSD(const char* path, uint16_t preset);
 bool audioLoadWavFromSD(const char* path, uint16_t preset);
