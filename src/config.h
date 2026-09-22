@@ -31,6 +31,7 @@ enum AppMode : uint8_t {
     MODE_MODULAR,   // 6-encoder modular: OSC/filter/env/LFO + joystick velocity
     MODE_GEST,      // sequencer manager: 4×8 pattern grid, volume pots, copy/paste, LOOP/LIVE
     MODE_PCMCLEAN,  // SD cache cleaner: recursively delete all .pcm/.pcm16 cache files
+    MODE_USB,       // USB Mass Storage: exposes the SD card as a normal drive on the PC
     MODE_STONE,     // sample tone: one SD sample pitched across the keyboard; JY=browse P2=cycle folder
     MODE_DR2,       // hierarchical drum sequencer: 64 steps addressed as beat.step.micro (4.4.4)
     MODE_IMPORT,    // Android-only: SAF folder picker, imports phone files onto the SD root
@@ -39,6 +40,9 @@ enum AppMode : uint8_t {
     MODE_GEN,       // generative: joystick X=procedural texture, Y=sound-making method, independently tunable
     MODE_DJ,        // DJ/remix deck: one big SD track (mp3/wav), scrub/speed/reverse + shared FX
     MODE_GROOVE,    // unified step sequencer: 8 drum pads + synth + 303 on the full 4x8 grid
+    MODE_NOOB,      // generative melody: density/rhythm/shape/variation pots, keys pick scale
+    MODE_EUCLI,     // euclidean drum sequencer: 4 lanes, per-lane step count + pulse count, concentric-ring display
+    MODE_CRUNCH,    // CrunchE-inspired sample instrument: the 32-sample drum bank replayed pitched, across the keyboard
     MODE_COUNT
 };
 
@@ -61,6 +65,7 @@ enum MenuItem : uint8_t {
     MENU_MODULAR,
     MENU_GEST,
     MENU_PCMCLEAN,
+    MENU_USB,
     MENU_STONE,
     MENU_DR2,
     MENU_IMPORT,
@@ -69,6 +74,9 @@ enum MenuItem : uint8_t {
     MENU_GEN,
     MENU_DJ,
     MENU_GROOVE,
+    MENU_NOOB,
+    MENU_EUCLI,
+    MENU_CRUNCH,
     MENU_ITEM_COUNT
 };
 static const char* menuLabels[] = {
@@ -81,9 +89,11 @@ static const char* menuLabels[] = {
     "MEDIA","LANIM","EXP",
     "EXP2","EXP3","303S",
     "PKMN","SERUM","GEST",
-    "PURGPCM","STONE","GEST2",
+    "PURGPCM","USB","STONE",
+    "GEST2",
     "IMPORT","LIFE","SWRM",
-    "GEN","DJ","GROOVE"
+    "GEN","DJ","GROOVE",
+    "NOOB","EUCLI","CRUNCH"
 };
 #define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
 
@@ -209,6 +219,48 @@ enum {
 #define SAMPLE_OSC_BASE     182  // AMY oscillators 182-213 for key sample playback (above SYNTH_CH range 125-148 and GRANULAR 150-181)
 #define SAMPLE_KEY_COUNT     32  // 4×8 keys, each can hold one RAM-loaded sample
 
+// ==================== CRUNCH (MODE_CRUNCH) ====================
+// Ported instrument bank inspired by the sibling CrunchE_GroovePadBox project. Rather than
+// converting/duplicating CrunchE's own sample ROM, CRUNCH aliases GrvEP's EXISTING 32-slot
+// drum-pad sample bank (kDrumPads[]/audioLoadDrumSamples(), audio_engine.cpp) — confirmed
+// (src/sounds/README.md + directory listing) to be the same sample set CrunchE itself ships
+// (kick/snare/hihat/clap/crash/ride/bongo/sfx/bass/guitar/synth/pad). CRUNCH registers a
+// SECOND set of AMY presets pointing at those already-loaded PSRAM buffers (via
+// pcm_get_sample_ram_for_preset(DRUM_PRESET_BASE+i)+pcm_register_extern16 — see
+// audioLoadCrunchSamples()/kCrunchSamples[] in audio_engine.cpp), with CRUNCH-specific loop
+// points (5 melodic samples loop, the other 27 are one-shot) and real per-note pitch
+// (audioStoneNoteOn()'s round-robin-voice pattern, not amyPlayPcm()'s fixed-pitch-69). Zero
+// new sample data, zero flash/PSRAM cost beyond the preset table itself. Presets sit in the
+// genuinely-free 133-199 gap between DRUM_PRESET_BASE's end (132) and SAMPLE_PRESET_BASE's
+// start (200). Oscillators sit right after SAMPLE_OSC_BASE's own range (182-213) —
+// AMY_OSC_DRUM_BASE (200, above) looks like it overlaps that gap on paper, but its only
+// caller (main.cpp's triggerDrumSound()) is dead code (confirmed: zero call sites) — 214-239
+// has no LIVE user before STONE_OSC_BASE (240).
+#define CRUNCH_PRESET_BASE  133  // AMY presets 133-164 (32 slots, one per kDrumPads[] entry)
+#define CRUNCH_SAMPLE_COUNT  32
+// 5 real MothOS instrument samples (instrument1/2/3/7/10 from the user's own
+// MothOS_GroovePadBox fork, converted int32->int16_t), vendored directly (NOT aliased —
+// this audio content doesn't exist anywhere else in GrvEP) to fill out CRUNCH's melodic
+// instrument slots with genuine distinct timbres instead of repurposed drum one-shots.
+// ~194KB total flash — picked the 5 smallest of the original's 11 for safety margin.
+#define CRUNCH_INSTR_PRESET_BASE  165  // AMY presets 165-169 (133-199 is the free gap, see above)
+#define CRUNCH_INSTR_SAMPLE_COUNT  5
+// CRUNCH is a 4-track live-record tracker (MothOS-style — see structure/ plan history),
+// not a single played instrument: one fixed, monophonic oscillator per track (no
+// round-robin voice stealing needed, mirrors MothOS's own Voice[4] model).
+#define CRUNCH_OSC_BASE     214  // AMY oscillators 214-217
+#define CRUNCH_TRACKS         4
+#define CRUNCH_PATTERNS       4
+#define CRUNCH_STEPS         32
+// Instrument SLOTS (matches MothOS's own 'I' command range, 0-11): slot 0 = "DRUM" bank
+// (12 fixed drum hits — the 12 note keys select WHICH drum, at native pitch, not a pitch
+// shift of one sample), slot 1 = "SFX" bank (same idea, 12 fixed sfx hits), slots 2-11 =
+// 10 melodic instruments (the 12 note keys pitch the SAME sample chromatically). This is
+// the actual original structure (see Voice::ReadDrumWaveform/ReadSfxWaveform vs.
+// ReadWaveform in MothOS's own source) — the first CRUNCH build collapsed this into "one
+// pitched sample per track" for all 12 slots, which was wrong.
+#define CRUNCH_INSTR_SLOTS   12
+
 // ==================== STONE (sample tone) ====================
 // One SD sample, pitched across the keyboard like a normal synth voice: AMY reads the
 // PCM preset's midinote (always 69, native rate) vs the event's midi_note to compute
@@ -229,25 +281,102 @@ enum {
                                  // database only, never played directly) — mirrors GRAN2_SOURCE_BASE.
 
 // ==================== DJ (MODE_DJ) ====================
-// One mono "deck" for a DJ/remix sample — same 16-bit PSRAM pipeline as STONE
-// (STONE_SOURCE_PRESET), added to the `isGran16` list in audio_engine.cpp's
-// svcLoadWav/svcLoadMp3. An EARLIER version of this used the flash pcmcache partition
-// instead (int8 @ 20kHz, ~8 minutes for ~0 PSRAM cost) — reverted: that partition is
-// real ESP32 hardware (a memory-mapped SPI flash region) with no equivalent on the
-// desktop/Android simulator targets, so `esp_partition_find_first` finds nothing there
-// and the whole mechanism is silently unusable on 2 of this project's 4 build targets,
-// including the one primarily used for development/testing. PSRAM works identically
-// everywhere. The real cost is capacity: 16-bit mono at PCM_TARGET_RATE (20kHz)
-// is ~2.4MB/minute, against a genuinely free PSRAM budget of maybe 5-6MB once AMY's own
-// allocations (~256KB delay lines, etc.) are accounted for — so roughly 2-3 minutes of
-// track, same ballpark as STONE's own budget. Good enough for "a big sample to remix",
-// not "a whole DJ set" — see structure/SOFTWARE.md's DJ section if a flash-backed
-// second attempt is ever worth revisiting specifically for the ESP32 target.
+// One mono "deck" for a DJ/remix track, streamed in bounded RAM from the SD card as a TRUE
+// streaming circular buffer (s_djRing[DJ_RING_FRAMES] in audio_engine.cpp) — registered ONCE
+// as ONE preset (DJ_PRESET) with loopstart=0/loopend=DJ_RING_FRAMES-1/feedback=1 and
+// triggered ONLY on a real reposition (load/seek/resume/true EOF-SOF wrap/scratch-release/
+// stutter-release — AMY's own native PCM looping, lib/AMY Synthesizer/src/pcm.c's
+// render_pcm()). AMY then reads the ring forward, physically, FOREVER after that — a
+// background task's only job is to keep writing the next DJ_STREAM_GRAIN_SEC of audio (in
+// whichever direction is currently selected) into the ring just ahead of wherever AMY is
+// currently reading. This is a generalization of the "silent handoff" this design has always
+// relied on for ordinary chunk-boundary crossings — applied continuously in small grains
+// instead of only at large fixed boundaries — and it's what makes a reverse-direction toggle
+// need NO retrigger at all: it's just "the writer stops adding forward content and starts
+// adding reverse content from here," nothing about how AMY is being read ever changes.
+//
+// DJ_STREAM_GRAIN_SEC only needs to stay well inside DJ_STREAM_LOW_WATERMARK_SEC's margin
+// (the "how far ahead to stay buffered" target the ONGOING top-up loop maintains) — standard
+// multi-buffered streaming. It's a free tuning knob for ordinary playback efficiency — a real,
+// measured mistake early on: an initial 0.1s grain spawns a background FreeRTOS task (its own
+// real stack-alloc/scheduling cost, unlike the desktop simulator's cheap pthread-backed one)
+// roughly every 0.1-0.35s for the ENTIRE duration of playback, versus the old two-half
+// design's much rarer ~every-2s spawn — reported as "un peu saccadée" on real hardware. Sized
+// up ~5x here to cut that spawn frequency by the same factor. The one place its SIZE does
+// matter is immediately after a reposition — see DJ_STREAM_QUICK_GRAIN_SEC below, which
+// exists specifically so this larger size doesn't also make reverse-toggle latency worse.
 #define DJ_OSC            246  // single fixed oscillator (mono deck; 250 max_oscs ceiling)
-#define DJ_SOURCE_PRESET  365  // pristine 16-bit full-length buffer loaded from disk (pointer/length
-                                // database only, never played directly) — mirrors STONE_SOURCE_PRESET.
-#define DJ_PRESET         363  // forward playback, re-windowed live into DJ_SOURCE_PRESET's buffer
-#define DJ_PRESET_REV     364  // reverse playback — lazily built reversed PSRAM copy, see audioDJSetReverse()
+#define DJ_RING_SECONDS   6
+#define DJ_RING_FRAMES    (DJ_RING_SECONDS * 20000u)  // DJ_PLAYBACK_RATE_HZ in audio_engine.cpp
+#define DJ_PRESET         363  // one preset for the whole DJ_RING_FRAMES ring — see above
+#define DJ_STREAM_GRAIN_SEC          0.5f   // decode/write granularity for the ONGOING top-up loop
+// Untouched zone right ahead of the read cursor on a reverse toggle/reposition — audio there
+// may be microseconds from being read by the render callback, so only content BEYOND this
+// margin is safe to overwrite with new content. This is the one honest, minimal, unavoidable
+// latency floor before a toggle CAN take effect — a hardware-timing safety requirement, not a
+// design compromise. What actually determines how long it takes before the effect is
+// AUDIBLE, though, is how long the FIRST grain written past this margin takes to decode — see
+// DJ_STREAM_QUICK_GRAIN_SEC below for why that must be small, not DJ_STREAM_GRAIN_SEC's size.
+#define DJ_STREAM_SAFETY_MARGIN_SEC  0.03f
+// The very first grain written after ANY reposition (reverse toggle, seek, resume, scratch/
+// stutter release) is this small, not DJ_STREAM_GRAIN_SEC — a real, measured bug: with the
+// ongoing loop's larger grain, the content already sitting further ahead in the ring from
+// BEFORE the reposition (not yet overwritten) stays audible for however long that first
+// larger grain takes to decode, which easily exceeds DJ_STREAM_SAFETY_MARGIN_SEC on real SD/
+// mp3 decode — reported as a perceptible delay between pressing reverse and it actually
+// taking effect (both ways), "comme si le buffer gardait en mémoire l'inversion du sample".
+// A small quick grain decodes fast enough to land within that margin far more reliably; the
+// ordinary top-up loop (djStreamTopUp(), next tick) takes over with full-size grains once it
+// lands — this only affects the ONE grain immediately following a reposition.
+#define DJ_STREAM_QUICK_GRAIN_SEC    0.05f
+#define DJ_STREAM_LOW_WATERMARK_SEC  2.0f   // top-up fires once buffered-ahead margin drops below this
+
+// ---- Dynamic/experimental performance controls (scratch, granular spray, stutter) ----
+// Joystick X = scratch, joystick Y = granular spray amount, joystick click (hold) = stutter/
+// glitch — all always-live in the DJ play view (inert at rest), see audioDJScratchNudge()/
+// audioDJSetGrainAmount()/audioDJStutterStart()/audioDJStutterEnd() in audio_engine.cpp. Both
+// scratch and stutter deliberately retrigger on every nudge/hold (unlike ordinary playback
+// and reverse-toggle) — they're glitch effects, not seamless controls — reading their working
+// window straight out of the live ring (handling wraparound via s_djWindowPad) instead of a
+// dedicated snapshot buffer, since the ring already holds audio in correct playback order
+// everywhere (see audioDJSetReverse()'s own comment for why that's always true).
+#define DJ_SCRATCH_DEADZONE       0.12f  // joystick X magnitude below this = no scratch
+#define DJ_SCRATCH_MAX_STEP_SEC   0.12f  // seconds moved per 10ms tick at full deflection
+#define DJ_SCRATCH_WINDOW_SEC     0.15f  // registered/retriggered window per nudge
+#define DJ_GRAIN_OSC_BASE         248    // 248,249 — the only 2 free oscillators below the 250 max_oscs ceiling (STONE=240-245, DJ_OSC=246, SS_OSC=247)
+#define DJ_GRAIN_COUNT            2      // round-robin pool size — capped by the 2 free oscillators above
+#define DJ_GRAIN_PRESET_BASE      367    // 367,368 — free (364 unused/skipped, 365 = SS_PRESET, 366 now free too)
+#define DJ_GRAIN_LEN_MS_MIN       40
+#define DJ_GRAIN_LEN_MS_MAX       120
+#define DJ_GRAIN_PITCH_SCATTER    3.0f   // +/- semitones
+#define DJ_GRAIN_GAP_MS_MAX       400.0f // inter-grain gap at amount=0 (just above the "no grains" threshold)
+#define DJ_GRAIN_GAP_MS_MIN       40.0f  // inter-grain gap at amount=1 (full deflection)
+#define DJ_STUTTER_MIN_SEC        0.03f
+#define DJ_STUTTER_MAX_SEC        0.5f
+#define DJ_STUTTER_MIN_FRAMES     32     // floor so a stutter window is never degenerate/near-zero
+
+// ==================== SS2 large-sample streaming ====================
+// SS2 slots (and, sharing the same underlying key storage, MODE_SAMPLE keys) normally
+// decode a whole file into one PSRAM buffer capped by psramMaxFrames() (free-PSRAM-
+// dependent, audio_engine.cpp) — fine for short one-shots, but silently truncates a long
+// file to however many frames happened to fit at that moment. Files too long for one
+// SS2_CHUNK_SECONDS window instead stream through this single shared mono voice, using the
+// SAME true-streaming-circular-buffer design as DJ_OSC (see the DJ block above for the full
+// rationale) — one small ring, one write cursor continuously topped up in the background,
+// AMY reading it forward forever after a single initial retrigger. SS2_CHUNK_SECONDS is
+// still what decides large-vs-small in audioLoadKey() (unrelated to ring sizing now — the
+// ring only needs enough margin to stay ahead of real-time playback, not the whole file, see
+// SS2_RING_SECONDS below). Only ONE large sample streams at a time (triggering any large slot
+// cuts whatever this voice was doing); small samples are unaffected and keep full polyphony
+// via their own oscillators. Unlike DJ, a streamed key is a one-shot: it plays once and stops
+// at the true end/start of the file, never loops, and never repositions after being
+// triggered (no seek/scratch/stutter) — the DJ constants below are reused as-is since the
+// underlying decode/timing characteristics are identical, no SS-specific duplicates needed.
+#define SS_OSC            247  // single fixed oscillator (250 max_oscs ceiling; DJ_OSC=246)
+#define SS2_CHUNK_SECONDS  30
+#define SS2_RING_SECONDS   4   // matches DJ_RING_SECONDS — margin-to-stay-ahead, not file length
+#define SS2_RING_FRAMES   (SS2_RING_SECONDS * 20000u)
+#define SS_PRESET         365  // one preset for the whole ring (was SS_PRESET_A/B, two 30s buffers)
 
 // ==================== GRANULAR ====================
 // Row layout (8-slice mode): R0=one-shot px, R1=px+px+1, R2=sx→end, R3=px reversed

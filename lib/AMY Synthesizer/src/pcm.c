@@ -555,12 +555,31 @@ void pcm_register_extern16(uint16_t preset_number, const int16_t* data, uint32_t
         if (node->preset_number == preset_number &&
             node->preset->type == AMY_PCM_TYPE_MEMORY) {
             memorypcm_preset_t *m = node->preset;
-            // Update loopend first: if it grows, the new larger range is safe with either buffer.
-            // If it shrinks, the audio thread wraps the playhead on the next tick (desired).
-            m->loopend     = le;
-            m->loopstart   = loopstart;
-            m->length      = length;
-            m->sample_ram  = (int16_t*)data;  // last: the null-check sentinel in pcm_render
+            // render_pcm() (audio thread, other core) reads m->length and m->sample_ram as two
+            // SEPARATE, non-atomic loads with no lock — any interleaving of this update must
+            // never let the reader see a `length` bigger than what the `sample_ram` it also
+            // sees can actually back, or the per-sample loop indexes past the real buffer
+            // (e.g. DJ's scratch feature swaps this preset between the big ring and a small
+            // scratch window many times a second — a torn read here is a genuine, frequently
+            // hit out-of-bounds read, not a theoretical one). So the update order must depend
+            // on whether length is growing or shrinking:
+            if (length <= m->length) {
+                // Shrinking (or equal): tighten the bound first — the OLD, still-valid buffer
+                // is guaranteed big enough for the new, smaller length, so a reader can never
+                // see (new small length + old buffer) go out of bounds. Swap the buffer last.
+                m->loopend     = le;
+                m->loopstart   = loopstart;
+                m->length      = length;
+                m->sample_ram  = (int16_t*)data;  // last: the null-check sentinel in pcm_render
+            } else {
+                // Growing: the OLD buffer is too small for the NEW length, so the buffer must
+                // be swapped in FIRST — a reader can then see (old small length + new buffer)
+                // safely (under-reads a bigger buffer) but never (new big length + old buffer).
+                m->sample_ram  = (int16_t*)data;
+                m->loopstart   = loopstart;
+                m->loopend     = le;
+                m->length      = length;
+            }
             return;
         }
         node = node->next;

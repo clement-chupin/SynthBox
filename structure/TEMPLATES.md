@@ -202,6 +202,44 @@ pattern affiché — pas de vue à 2 lignes.
 
 ---
 
+## 2c. EUCLI — Séquenceur euclidien (variante du template SEQUENCER)
+
+EUCLI suit la philosophie SEQUENCER (BPM partagé, B1=Play/Stop) mais la grille clavier n'y
+édite pas des pas — une touche choisit d'un coup le nombre de pas d'une piste dans une
+palette fixe (`{4,6,8,12,16,20,26,32}`, une valeur par colonne), le nombre de coups étant
+réparti automatiquement par un algorithme euclidien (accumulateur à la Bjorklund). Voir
+`structure/SOFTWARE.md`'s section MODE_EUCLI pour l'architecture complète.
+
+### Pots
+
+| Pot | Rôle |
+|-----|------|
+| P1 | Volume global. |
+| P3 | BPM. |
+| P4-P7 | Nombre de coups (une piste par potard) **ou**, si un FX est actif, paramètres de cet FX. |
+
+### Boutons (B1–B4)
+
+| Bouton | Action |
+|--------|--------|
+| B1 | Play/Stop |
+| B2 | `OVERLAY_FX` |
+| B3 | Cycle banque de sons (4 kits curés parmi les 32 pads partagés) |
+| B4 | Reset toutes les têtes de lecture à 0 (sans toucher aux pas/coups) |
+
+### Clavier — palette, pas placement de pas
+
+Une ligne = une piste, une colonne = un choix dans la palette de pas (pas un instant
+temporel comme dans DRUM2/GROOVE). Appuyer sur une case sélectionne directement le nombre
+de pas de cette piste et reconstruit son pattern.
+
+### LEDs / OLED
+
+Anneaux concentriques (un par piste, tête de lecture = pleine luminosité) en haut de
+l'écran, barre + `X/S` + nom du pad par piste en bas.
+
+---
+
 ## 3. Template STANDALONE / PERFORMANCE
 
 > Modes : `EXP`, `EXP2`, `EXP3`, `LIFE`, `SWARM`
@@ -289,6 +327,54 @@ Moteur LFO background (10ms tick) indépendant des pots.
 
 ---
 
+## 4. Template MOTHOS TRACKER
+
+> Mode : `CRUNCH` (le seul pour l'instant)
+
+Gabarit importé tel quel du firmware [MothOS](https://github.com/MothSynths/MothOS), pas
+une convention GrvEP native — à utiliser pour tout futur mode qui voudrait porter un autre
+firmware/contrôleur externe plutôt que d'inventer sa propre UI. Contrairement aux templates
+SYNTH/SEQUENCER, ce n'est pas B1-B4 + pots qui portent l'essentiel du contrôle : c'est la
+**grille clavier elle-même**, qui simule le clavier 4×4 (4 touches shift + 12 touches
+note/commande) du firmware d'origine. Voir `structure/SOFTWARE.md`'s section MODE_CRUNCH
+pour l'architecture complète et ce qui n'a pas été porté (effets par voix sans équivalent
+DSP dans GrvEP).
+
+### Grille clavier = clavier 4×4 + 4 shifts d'origine
+
+- Ligne physique du haut = les 4 touches shift (collantes : un appui arme, l'appui suivant
+  — n'importe lequel, y compris une autre touche shift — consomme l'armement et exécute la
+  commande). Les 3 lignes du dessous = les 12 touches note/commande.
+- Colonnes dupliquées par moitié (`3-(col%4)` dans ce codebase — voir la note sur la
+  convention colonne dans `structure/SOFTWARE.md`) pour occuper les 8 colonnes physiques
+  avec les 4 colonnes logiques d'origine.
+- Overlay légende (grille 4×4 statique, un texte par cellule) affiché à la place de l'écran
+  principal tant qu'une touche shift est armée — remplace le manuel/l'étiquetage physique
+  du clavier d'origine.
+
+### Boutons/pots — rôle réduit, pas la convention SEQUENCER standard
+
+B1 (Play/Stop) et B4 (browser d'instrument) restent câblés comme un bonus de confort — pas
+strictement nécessaires, tout est aussi joignable au clavier. B2 fait exception : il ouvre
+le bus FX partagé standard de GrvEP (`OVERLAY_FX`), qui **remplace** les effets par voix de
+l'original plutôt que de les porter (aucun équivalent DSP disponible). P2/P4/P5 dupliquent
+en continu ce que certaines commandes clavier ne font qu'en discret (octave, volume, durée
+de relâchement) — les deux chemins écrivent le même état, aucun conflit.
+
+### Créer un nouveau mode MOTHOS TRACKER
+
+1. Définir la table de résolution touche→(banque de bits fixes / instrument mélodique
+   pitché) — ne pas supposer que toutes les touches d'un même slot jouent le même
+   échantillon à des hauteurs différentes, vérifier dans la source d'origine.
+2. Porter la logique d'armement/consommation des touches shift (`crunchFnc[]`/
+   `crunchDispatchCommand()` dans `main.cpp` comme patron direct).
+3. Écrire l'overlay légende (texte statique par cellule, un jeu de 4 grilles — une par
+   touche shift armée).
+4. Identifier les effets/paramètres du firmware d'origine sans équivalent DSP GrvEP et les
+   documenter explicitement comme non portés plutôt que de deviner un mapping approximatif.
+
+---
+
 ## Résumé des templates par mode
 
 | Mode | Template | B3 overlay instrument | B4 |
@@ -304,6 +390,8 @@ Moteur LFO background (10ms tick) indépendant des pots.
 | SS2 | SEQUENCER | — | Mode play |
 | GRANULAR2 | SEQUENCER | — | Granular opts |
 | GROOVE | SEQUENCER (variante 2b) | — | Cycle banque pattern / copier-coller |
+| EUCLI | SEQUENCER (variante 2c) | — | Reset têtes de lecture |
+| CRUNCH | MOTHOS TRACKER | `OVERLAY_CRUNCH` (12 slots) | Browser d'instrument (bonus) |
 | EXP | STANDALONE | libre | libre |
 | EXP2 | STANDALONE | libre | libre |
 | EXP3 | STANDALONE | libre | libre |

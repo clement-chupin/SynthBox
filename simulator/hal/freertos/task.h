@@ -51,8 +51,19 @@ static inline uint32_t xTaskGetTickCount() {
     return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 static inline void taskYIELD() { sched_yield(); }
-static inline void taskENTER_CRITICAL() {}
-static inline void taskEXIT_CRITICAL() {}
+// portMUX_TYPE/taskENTER_CRITICAL(&mux)/taskEXIT_CRITICAL(&mux) — real ESP-IDF (this project's
+// actual hardware target) requires the pointer-to-mutex form (the no-arg legacy macros aren't
+// available in the framework version this builds against), so the simulator matches that same
+// signature rather than the simpler no-arg one, keeping call sites identical for both targets.
+// Backed by a REAL pthread mutex (not a no-op) — pthreads on the desktop can genuinely run in
+// parallel across real CPU cores, unlike a single-core cooperative scheduler, so code relying
+// on this for actual mutual exclusion (e.g. audio_engine.cpp's DJ background-job dispatch,
+// guarding state shared between the main thread and a decode task) needs it to actually
+// exclude here too, not just on real hardware.
+typedef pthread_mutex_t portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED PTHREAD_MUTEX_INITIALIZER
+static inline void taskENTER_CRITICAL(portMUX_TYPE* mux) { pthread_mutex_lock(mux); }
+static inline void taskEXIT_CRITICAL(portMUX_TYPE* mux) { pthread_mutex_unlock(mux); }
 
 // Task notification stubs (no-op in simulator)
 static inline void xTaskNotifyGive(TaskHandle_t) {}

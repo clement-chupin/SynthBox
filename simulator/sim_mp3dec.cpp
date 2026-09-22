@@ -118,20 +118,33 @@ static pfn_getformat g_getformat;
 static pfn_delete    g_delete;
 static bool          g_loaded;
 
+// DJ/SS2 streaming and the background .pcm16 cache builder can now call this concurrently
+// from separate threads on the very first mp3 a session ever streams (previously only DJ+SS2
+// running at the same time could race here at all, and rarely) — the original bare
+// "if (g_loaded) ...; g_loaded = true; ..." was a genuine unsynchronized check-then-act race:
+// two threads could both see g_loaded==false and both populate the g_* function pointers
+// concurrently, with no guarantee a reader on one thread sees a fully-published write from
+// the other (confirmed as an intermittent bogus-decode/false MP3 failure under this session's
+// own cache-builder-vs-live-decode concurrency test). std::call_once gives the one-time
+// init the memory-visibility guarantee a plain bool never did.
+#include <mutex>
+static std::once_flag g_mpg123InitOnce;
+
 static bool ensureMpg123() {
-    if (g_loaded) return g_new != nullptr;
-    g_loaded = true;
-    void* lib = dlopen("libmpg123.so.0", RTLD_LAZY | RTLD_GLOBAL);
-    if (!lib) { fprintf(stderr, "[sim] MP3: dlopen libmpg123.so.0 failed: %s\n", dlerror()); return false; }
-    g_new       = (pfn_new)      dlsym(lib, "mpg123_new");
-    g_open_feed = (pfn_open_feed)dlsym(lib, "mpg123_open_feed");
-    g_feed      = (pfn_feed)     dlsym(lib, "mpg123_feed");
-    g_read      = (pfn_read)     dlsym(lib, "mpg123_read");
-    g_getformat = (pfn_getformat)dlsym(lib, "mpg123_getformat");
-    g_delete    = (pfn_delete)   dlsym(lib, "mpg123_delete");
-    // mpg123_init is deprecated in libmpg123 >= 1.27 but harmless to call
-    auto init_fn = (pfn_init)dlsym(lib, "mpg123_init");
-    if (init_fn) init_fn();
+    std::call_once(g_mpg123InitOnce, []() {
+        g_loaded = true;
+        void* lib = dlopen("libmpg123.so.0", RTLD_LAZY | RTLD_GLOBAL);
+        if (!lib) { fprintf(stderr, "[sim] MP3: dlopen libmpg123.so.0 failed: %s\n", dlerror()); return; }
+        g_new       = (pfn_new)      dlsym(lib, "mpg123_new");
+        g_open_feed = (pfn_open_feed)dlsym(lib, "mpg123_open_feed");
+        g_feed      = (pfn_feed)     dlsym(lib, "mpg123_feed");
+        g_read      = (pfn_read)     dlsym(lib, "mpg123_read");
+        g_getformat = (pfn_getformat)dlsym(lib, "mpg123_getformat");
+        g_delete    = (pfn_delete)   dlsym(lib, "mpg123_delete");
+        // mpg123_init is deprecated in libmpg123 >= 1.27 but harmless to call
+        auto init_fn = (pfn_init)dlsym(lib, "mpg123_init");
+        if (init_fn) init_fn();
+    });
     return g_new != nullptr;
 }
 

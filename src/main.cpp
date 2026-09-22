@@ -13,8 +13,16 @@
 #include "config.h"
 #include "audio_engine.h"
 #include "midi_usb.h"
+#if CONFIG_TINYUSB_MSC_ENABLED
+#include "USBMSC.h"
+#endif
 #include "jpegdec.h"
 #include "sprites/pokemon_sprites.h"
+
+// SD SPI clock. 20MHz proved marginal on this hardware: raw SD writes failed ("[CACHE] SD write
+// failed"), USB mass-storage reads returned I/O errors, and DJ grain reads stalled for seconds.
+// 10MHz is still ~1MB/s — far above what streaming an mp3 needs (~30KB/s) — and far more tolerant.
+#define SD_SPI_HZ 10000000
 
 // ==================== GLOBALS ====================
 CRGB leds[NUM_LEDS];
@@ -101,7 +109,8 @@ enum OverlayType : uint8_t {
     OVERLAY_NONE=0, OVERLAY_FX, OVERLAY_SCALE_ARP, OVERLAY_ENV,
     OVERLAY_INSTR, OVERLAY_SEQ_OPT, OVERLAY_SAMP_OPT, OVERLAY_303, OVERLAY_303_PRESET,
     OVERLAY_SYSEQ, OVERLAY_SEQB2, OVERLAY_PKMN, OVERLAY_I303_WAVE, OVERLAY_MOD2_ALGO,
-    OVERLAY_FX_MOD   // double-click an active FX slot in OVERLAY_FX to automate one of its params
+    OVERLAY_FX_MOD,  // double-click an active FX slot in OVERLAY_FX to automate one of its params
+    OVERLAY_CRUNCH   // instrument browser for MODE_CRUNCH (B4) — flat list, joystick Y=item
 };
 static OverlayType    s_overlay        = OVERLAY_NONE;
 static unsigned long  s_overlayCloseAt = 0;   // millis() when overlay auto-closes (0=no pending close)
@@ -767,6 +776,87 @@ static uint32_t pcmCleanDeleted = 0;   // files deleted this run
 static uint32_t pcmCleanScanned = 0;   // files scanned this run
 static bool     pcmCleanRunning = false;
 
+// ==================== USB MASS STORAGE STATE (MODE_USB) ====================
+// Exposes the SD card as a normal USB drive on the PC — see USBMSC's own setup in setup()
+// and usbMscTryEnter()/the MODE_USB switchMode() hooks below for the full design. While
+// usbMscActive, NOTHING in this app may touch SD (the PC's own FAT driver is the only thing
+// allowed to interpret the filesystem) — gated at every call site that could otherwise fire:
+// loop()'s audioDJTick()/audioSSTick() (background grain-decode/pcm16-cache-build) and the SD
+// hot-swap poll.
+#if CONFIG_TINYUSB_MSC_ENABLED
+USBMSC msc;
+#endif
+static bool usbMscActive       = false;  // true only between a successful quiesce and mode-exit
+static bool usbMscQuiesceFailed = false; // true if entry timed out waiting for SD activity to stop — shown on the mode's own screen instead of silently exposing a card mid-write
+
+#if CONFIG_TINYUSB_MSC_ENABLED
+// Raw sector I/O straight through the SAME SD handle this app already mounts via
+// SD.begin() — SD.readRAW()/writeRAW() bypass FatFs entirely (see SD.cpp), so these never
+// touch the app's own filesystem-level state; only tud_msc_test_unit_ready_cb (gated on
+// msc.mediaPresent()) decides whether the host is allowed to call these at all.
+// TinyUSB may hand over a buffer that is NOT a whole number of sectors and/or starts at a
+// non-zero `offset` inside the sector (endpoint buffer smaller than a block) — the stock
+// SD2USBMSC example ignores that, which silently returns garbage/short data. Go through a
+// one-sector bounce buffer so any (lba, offset, bufsize) combination is handled exactly.
+// A single failed raw read is often transient (card busy right after another command — the SD
+// driver gives up after one try when the command itself is refused), so retry before failing the
+// host; and log failures (rate-limited) since the host only ever sees an anonymous I/O error.
+static bool usbMscRawRead(uint8_t* b, uint32_t sec) {
+    for (int t = 0; t < 4; t++) { if (SD.readRAW(b, sec)) return true; vTaskDelay(2); }
+    return false;
+}
+static void usbMscLogFail(const char* op, uint32_t lba, uint32_t off, uint32_t len, uint32_t sec) {
+    static uint32_t last = 0;
+    if (millis() - last < 500) return;
+    last = millis();
+    Serial.printf("[USB] %s FAILED lba=%u off=%u len=%u sec=%u secSize=%u\n", op, (unsigned)lba, (unsigned)off, (unsigned)len, (unsigned)sec, (unsigned)SD.sectorSize());
+}
+static int32_t usbMscRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
+    uint32_t secSize = SD.sectorSize();
+    if (secSize != 512) return -1;
+    // These run in TinyUSB's high-priority task; a host streaming continuously (copying, or just
+    // indexing thumbnails) would otherwise starve loop() — B1 and the power button stop working.
+    vTaskDelay(1);
+    uint8_t bounce[512];
+    uint8_t* out = (uint8_t*)buffer;
+    uint32_t done = 0;
+    while (done < bufsize) {
+        uint32_t pos = offset + done;
+        uint32_t sec = lba + pos / 512, inSec = pos % 512;
+        uint32_t n = min(512u - inSec, bufsize - done);
+        if (!usbMscRawRead(bounce, sec)) {
+            // The very last sectors sometimes aren't readable even though the card's CSD counts them
+            // (seen: lba=61439999). The host probes the end of the disk (backup GPT / size check) and
+            // treats an error there as a broken drive — serve zeros for that tail instead.
+            if (sec + 8192 >= SD.numSectors()) memset(bounce, 0, sizeof(bounce));  // widened: a bad read showed up 264 sectors from the end too — backup GPT/reserved area, not just the final few
+            else { usbMscLogFail("read", lba, offset, bufsize, sec); return -1; }
+        }
+        memcpy(out + done, bounce + inSec, n);
+        { static int shown = 0; if (shown < 8) { shown++; Serial.printf("[USB] read ok lba=%u off=%u len=%u first=%02x%02x%02x%02x\n", (unsigned)lba, (unsigned)offset, (unsigned)bufsize, out[0], out[1], out[2], out[3]); } }
+        done += n;
+    }
+    return bufsize;
+}
+static int32_t usbMscWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
+    uint32_t secSize = SD.sectorSize();
+    if (secSize != 512) return -1;
+    vTaskDelay(1);  // see usbMscRead
+    uint8_t bounce[512];
+    uint32_t done = 0;
+    while (done < bufsize) {
+        uint32_t pos = offset + done;
+        uint32_t sec = lba + pos / 512, inSec = pos % 512;
+        uint32_t n = min(512u - inSec, bufsize - done);
+        if (n != 512 && !usbMscRawRead(bounce, sec)) { usbMscLogFail("rmw-read", lba, offset, bufsize, sec); return -1; }  // partial sector: read-modify-write
+        memcpy(bounce + inSec, buffer + done, n);
+        if (!SD.writeRAW(bounce, sec) && !SD.writeRAW(bounce, sec)) { usbMscLogFail("write", lba, offset, bufsize, sec); return -1; }
+        done += n;
+    }
+    return bufsize;
+}
+static bool usbMscStartStop(uint8_t power_condition, bool start, bool load_eject) { return true; }
+#endif
+
 // ==================== IMPORT STATE (MODE_IMPORT, Android only) ====================
 // SAF folder picker + import copy. B1 triggers the Java picker (GrvActivity.
 // pickImportFolder(), via the one-off JNI bridge below); progress comes back not
@@ -827,6 +917,10 @@ static bool stoneLoopMode = false;
 // without needing continuous joystick scrubbing (see audioDJSeek() for why continuous
 // scrub isn't smooth on this engine — every seek is a real retrigger).
 static bool  djBrowsing = true;   // true = SD browser showing; false = play/transport screen
+// Set right after picking a track from the browser — audioLoadDJTrack() is async (the first
+// chunk decodes in the background), so play can't start immediately; checked once per loop()
+// tick (alongside audioDJTick()) and cleared the instant the load actually finishes.
+static bool  djAutoPlayPending = false;
 static float djLastP1   = -1.0f;  // pot-pickup baseline for speed (P1)
 
 enum PokemonType : uint8_t {
@@ -1118,6 +1212,417 @@ static const GenVoiceDef kGenVoices[] = {
 #define GEN_VOICE_COUNT (sizeof(kGenVoices)/sizeof(kGenVoices[0]))
 static const char* kGenNames[] = { "Walk", "Eucl", "Drift" };
 #define GEN_GENERATOR_COUNT (sizeof(kGenNames)/sizeof(kGenNames[0]))
+
+// ==================== EUCLI STATE (MODE_EUCLI) ====================
+// 4-lane euclidean drum sequencer: each lane independently picks its own step count (from a
+// fixed 8-value palette, one per key-grid column — see the key handler) and its own pulse
+// (hit) count via P4-P7. Lanes with different step counts run as genuine polymeter — they
+// drift in and out of phase with each other, which is the point of the mode — so each lane
+// keeps its OWN playhead, not a single shared step index like DRUM2/GROOVE/SYSEQ.
+#define EUCLI_LANES 4
+#define EUCLI_MAX_STEPS 32
+// One per key-grid column. col0 is physically the RIGHTmost key (see OMNI's own
+// "col0(right)..col7(left)" comment for this codebase's row/col convention) — reversed
+// (32 on the right, 4 on the left) per the user's request so reading the row left-to-
+// right shows the palette ascending (4...32) instead of descending.
+static const uint8_t kEucliStepOptions[8] = {32,26,20,16,12,8,6,4};
+static uint8_t  euSteps[EUCLI_LANES]   = {16,16,16,16};
+static uint8_t  euPulses[EUCLI_LANES]  = {4,4,4,4};
+static bool     euPattern[EUCLI_LANES][EUCLI_MAX_STEPS];
+static uint8_t  euPlayhead[EUCLI_LANES] = {0,0,0,0};
+static bool     euPlaying = false;
+static uint32_t euLastStepMs[EUCLI_LANES] = {0,0,0,0};  // independent per-lane accumulators (polymeter)
+static float    euDecayMod = 1.0f;  // P2: global decay-length multiplier applied to every hit
+static uint8_t  euBank = 0;         // B3 cycles through kEucliBanks[]
+static float    euLastP2 = -1.0f, euLastP4 = -1.0f, euLastP5 = -1.0f, euLastP6 = -1.0f, euLastP7 = -1.0f;  // pot-pickup baselines
+
+// Curated 4-sound "drum kit" picks from the shared 32-entry kDrumPads[] table
+// (audio_engine.cpp) — reusing DRUM2/GROOVE's own sample bank rather than inventing a new
+// one, just a different (drum-shaped, not SFX/guitar/synth) subset per bank so all 4 lanes
+// always land on something percussive. Indices are kDrumPads[] positions.
+#define EUCLI_BANK_COUNT 4
+static const uint8_t kEucliBanks[EUCLI_BANK_COUNT][EUCLI_LANES] = {
+    { 0,  2,  5, 10 },  // Kit 1: KK1, SN1, HH1, CLP
+    { 1,  3,  9,  7 },  // Kit 2: KK2, SN2, HH2, SNB
+    { 8,  4,  6, 12 },  // Percussive: KK3, SN3, BNG, RDE
+    {11, 13, 14, 15 },  // FX/perc: CRS, SB1, SB2, BS1
+};
+
+// Bjorklund-style accumulator distribution, generalized from MODE_GEN's own hard-coded
+// 8-step "EUCL" generator (genRebuildEuclid() above) to any (steps, pulses) pair — same
+// 3-line accumulator body, just parameterized instead of a fixed /8.0f.
+static void eucliRebuildPattern(bool* out, uint8_t steps, uint8_t pulses) {
+    if (steps > EUCLI_MAX_STEPS) steps = EUCLI_MAX_STEPS;
+    pulses = (uint8_t)constrain((int)pulses, 0, (int)steps);
+    for (uint8_t i = 0; i < steps; i++) out[i] = false;
+    float acc = 0.0f;
+    for (uint8_t i = 0; i < steps; i++) {
+        acc += (float)pulses / (float)steps;
+        if (acc >= 1.0f) { acc -= 1.0f; out[i] = true; }
+    }
+}
+
+// Advances all 4 lanes' independent playheads and fires any due hits — called from loop()'s
+// 10ms tick (see its own call site). Deliberately its own function (not inlined at the call
+// site) so it can also be driven manually/headlessly in a test harness — see this repo's own
+// testing methodology (setup() completes before loop() ever runs, so a test that needs the
+// clock to tick must call this directly, per CLAUDE.md).
+static void eucliTick() {
+    if (!euPlaying || !audioReady) return;
+    uint32_t nowEu = millis();
+    for (uint8_t l = 0; l < EUCLI_LANES; l++) {
+        float stepMs = fmaxf(10.0f, 60000.0f / bpm / 4.0f);
+        if ((int32_t)(nowEu - euLastStepMs[l]) < (int32_t)stepMs) continue;
+        euLastStepMs[l] += (uint32_t)stepMs;
+        if ((int32_t)(nowEu - euLastStepMs[l]) > (int32_t)stepMs) euLastStepMs[l] = nowEu;  // catch-up guard
+        euPlayhead[l] = (uint8_t)((euPlayhead[l] + 1) % euSteps[l]);
+        if (euPattern[l][euPlayhead[l]]) {
+            uint8_t padIdx = kEucliBanks[euBank][l];
+            audioDrum2Hit(padIdx, 1.0f, 69, 60.0f * euDecayMod);
+        }
+    }
+}
+
+// ==================== CRUNCH STATE (MODE_CRUNCH) ====================
+// MothOS-style 4-track live-record tracker. No step-grid editing: while crunchPlaying,
+// whatever you play is captured live into the selected track's pattern at the current
+// step (mirrors MothOS's Tracker::SetNote() — "playing IS recording", no separate arm
+// step). The key-grid input scheme is ALSO a literal port of MothOS's own InputManager:
+// the user already adapted MothOS's original 4x4 (4 shift keys + 12 note keys) layout
+// onto an 8-wide physical grid in their own /home/cchupin/projects/MothOS_GroovePadBox
+// fork (columns mirrored in halves, physical top row = the 4 shift keys) — this mirrors
+// that exact technique instead of a bespoke GrvEP-native scheme, per their explicit
+// request to stay as close to the original control surface as possible. See
+// handleNoteKeyAudio's MODE_CRUNCH case (key resolution) and crunchDispatchCommand()
+// (mirrors Tracker::SetCommand) for the full mapping.
+static uint8_t  crunchTrackInstrument[CRUNCH_TRACKS] = {0,1,2,3}; // mirrored into audio_engine
+static int8_t   crunchTrackOctave[CRUNCH_TRACKS]     = {0,0,0,0};
+static bool     crunchTrackMute[CRUNCH_TRACKS]       = {false,false,false,false};
+static float    crunchTrackVolume[CRUNCH_TRACKS]     = {0.9f,0.9f,0.9f,0.9f};  // P4 / 'V' key, per-track velocity scale
+static uint8_t  crunchVolStep[CRUNCH_TRACKS]         = {3,3,3,3};  // 'V'+val1 cycles through a 4-step volume preset table
+static uint8_t  crunchNote[CRUNCH_PATTERNS][CRUNCH_TRACKS][CRUNCH_STEPS] = {}; // 0=empty, else midi+1
+static uint8_t  crunchSelectedTrack = 0;
+static uint8_t  crunchPattern       = 0;
+static bool     crunchPlaying       = false;
+static bool     crunchPressedOnce   = false;  // gates transport start, mirrors MothOS
+static uint8_t  crunchStep          = 0;
+static uint32_t crunchLastStepMs    = 0;
+static uint8_t  crunchBrItem        = 0;      // OVERLAY_CRUNCH browse cursor (selected track's)
+static uint8_t  crunchVuLevel[CRUNCH_TRACKS]  = {};  // peak-decay VU meter (UI only)
+static int8_t   crunchLastNote[CRUNCH_TRACKS] = {-1,-1,-1,-1};  // for the note-name readout
+static float    crunchLastP2 = -1.0f, crunchLastP4 = -1.0f, crunchLastP5 = -1.0f; // pot-pickup baselines
+static bool     crunchFnc[4]        = {false,false,false,false};  // M,N,O,P shift-key arm state
+static uint8_t  crunchTrackEnv[CRUNCH_TRACKS] = {0,0,0,0};  // mirrors audio_engine's own copy, for display
+static int8_t   crunchSolo          = -1;     // which track is soloed, -1 = none
+static bool     crunchSongMode      = false;  // 'C': chain all 4 patterns instead of looping one
+static uint8_t  crunchPatternCopy[CRUNCH_TRACKS][CRUNCH_STEPS] = {};
+static bool     crunchPatternCopyValid = false;
+
+
+// Playback-only: fires whatever's recorded at the new step for every unmuted track.
+// Live capture (writing INTO crunchNote[] while a key is pressed) happens in
+// handleNoteKeyAudio() instead, not here — mirrors MothOS's own split (Tracker::
+// UpdateTracker() plays back; Tracker::SetNote() is where capture happens).
+// Standalone (not inlined into loop()) for the same reason eucliTick() is: must be
+// directly callable outside loop()'s own cadence for headless testing (see CLAUDE.md's
+// documented testing methodology — setup() never sees loop()-driven ticks).
+static void crunchTick() {
+    if (!crunchPlaying || !crunchPressedOnce || !audioReady) return;
+    uint32_t now = millis();
+    float stepMs = fmaxf(10.0f, 60000.0f / bpm / 4.0f);
+    if ((int32_t)(now - crunchLastStepMs) < (int32_t)stepMs) return;
+    crunchLastStepMs += (uint32_t)stepMs;
+    if ((int32_t)(now - crunchLastStepMs) > (int32_t)stepMs) crunchLastStepMs = now;
+    crunchStep++;
+    if (crunchStep >= CRUNCH_STEPS) {
+        crunchStep = 0;
+        // Song mode ('C'): chain all 4 patterns instead of looping the current one —
+        // mirrors Tracker::UpdateTracker()'s own allPatternPlay wrap.
+        if (crunchSongMode) crunchPattern = (uint8_t)((crunchPattern + 1) % CRUNCH_PATTERNS);
+    }
+    for (uint8_t t = 0; t < CRUNCH_TRACKS; t++) {
+        if (crunchTrackMute[t]) continue;
+        uint8_t stored = crunchNote[crunchPattern][t][crunchStep];
+        if (!stored) continue;
+        uint8_t val = (uint8_t)(stored - 1);  // 0-11: WHICH drum/sfx (bank slots) or WHICH pitch (melodic slots)
+        audioCrunchNoteOn(t, val, crunchTrackOctave[t], crunchTrackVolume[t]);
+        crunchLastNote[t] = (int8_t)val;
+        crunchVuLevel[t] = 23;  // peak; decayed once per redraw in drawScreen (MothOS's own shape)
+    }
+}
+
+// Mirrors MothOS's own Tracker::SetCommand() — one command letter + a 0-3 or 0-11
+// argument, exactly as InputManager.cpp's ProcessClick/ProcessFunctionClick produce (see
+// handleNoteKeyAudio's MODE_CRUNCH case, which resolves key presses into these same
+// command/value pairs). Commands with no GrvEP-side equivalent DSP yet (arp/chord,
+// whoosh, pitchbend, echo depth, retrig, wobble/phaser, overdrive, master headphone
+// level, pattern-length change, sampler-mode) are acknowledged (so the sticky-shift
+// state still resets correctly) but are no-ops — flagged to the user rather than silently
+// guessed at with unrelated GrvEP DSP.
+static void crunchDispatchCommand(char command, uint8_t val) {
+    uint8_t t = crunchSelectedTrack;
+    switch (command) {
+        case 'N': {  // play / live-record a key (val = 0-11: WHICH drum/sfx on bank slots,
+                     // WHICH chromatic pitch on melodic slots — see audioCrunchNoteOn)
+            if (crunchPlaying) {
+                if (!crunchPressedOnce) {
+                    crunchPressedOnce = true;
+                    crunchStep = 0;
+                    crunchLastStepMs = millis();
+                }
+                crunchNote[crunchPattern][t][crunchStep] = (uint8_t)(val + 1);
+            }
+            audioCrunchNoteOn(t, val, crunchTrackOctave[t], crunchTrackVolume[t]);
+            crunchLastNote[t] = (int8_t)val;
+            crunchVuLevel[t] = 23;
+            break;
+        }
+        case 'O':  // octave (0-3) — only affects melodic slots (2-11); bank slots (DRUM/SFX)
+                   // always play at native pitch, matching the original.
+            crunchTrackOctave[t] = (int8_t)val;
+            break;
+        case 'I':  // instrument SLOT select (0-11: 0=DRUM bank, 1=SFX bank, 2-11=melodic)
+            crunchTrackInstrument[t] = val;
+            audioCrunchSetTrackInstrument(t, val);
+            crunchBrItem = val;
+            break;
+        case 'T':  // select track (0-3)
+            crunchSelectedTrack = val;
+            break;
+        case 'V':
+            if (val == 3) {  // solo toggle
+                if (crunchSolo == (int8_t)t) {
+                    crunchSolo = -1;
+                    for (uint8_t i = 0; i < CRUNCH_TRACKS; i++) crunchTrackMute[i] = false;
+                } else {
+                    crunchSolo = (int8_t)t;
+                    for (uint8_t i = 0; i < CRUNCH_TRACKS; i++) crunchTrackMute[i] = (i != t);
+                }
+            } else if (val == 0) {  // mute toggle
+                crunchTrackMute[t] = !crunchTrackMute[t];
+            } else if (val == 1) {  // cycle a 4-step volume preset
+                static const float kVolSteps[4] = {0.3f, 0.55f, 0.8f, 1.0f};
+                crunchVolStep[t] = (uint8_t)((crunchVolStep[t] + 1) % 4);
+                crunchTrackVolume[t] = kVolSteps[crunchVolStep[t]];
+            }
+            // val==2 (overdrive toggle): no per-track equivalent in GrvEP — unported, no-op.
+            break;
+        case 'E':  // envelope shape: 0=FadeOut 1=FadeIn 2=NoFade 3=Loop
+            crunchTrackEnv[t] = val;
+            audioCrunchSetTrackEnvelope(t, val);
+            break;
+        case 'L': {  // note/release length, 3 discrete presets (only val 0-2 reachable)
+            static const float kLenMult[3] = {0.5f, 1.0f, 2.5f};
+            audioCrunchSetTrackDecayMod(t, kLenMult[val < 3 ? val : 2]);
+            break;
+        }
+        case '^':  // clear one track's current pattern (val = track 0-3)
+            if (val < CRUNCH_TRACKS) memset(crunchNote[crunchPattern][val], 0, CRUNCH_STEPS);
+            break;
+        case '$':  // select pattern (0-3)
+            crunchPattern = val;
+            break;
+        case '#':  // clear the current pattern, all tracks
+            memset(crunchNote[crunchPattern], 0, sizeof(crunchNote[crunchPattern]));
+            break;
+        case 'C':  // song mode toggle (chain all 4 patterns)
+            crunchSongMode = !crunchSongMode;
+            break;
+        case '*':
+            if (val == 0) {  // copy current pattern
+                for (uint8_t j = 0; j < CRUNCH_TRACKS; j++)
+                    memcpy(crunchPatternCopy[j], crunchNote[crunchPattern][j], CRUNCH_STEPS);
+                crunchPatternCopyValid = true;
+            } else if (val == 1 && crunchPatternCopyValid) {  // paste into current pattern
+                for (uint8_t j = 0; j < CRUNCH_TRACKS; j++)
+                    memcpy(crunchNote[crunchPattern][j], crunchPatternCopy[j], CRUNCH_STEPS);
+            } else if (val == 2 && crunchPatternCopyValid) {  // paste into all 4 patterns
+                for (uint8_t p = 0; p < CRUNCH_PATTERNS; p++)
+                    for (uint8_t j = 0; j < CRUNCH_TRACKS; j++)
+                        memcpy(crunchNote[p][j], crunchPatternCopy[j], CRUNCH_STEPS);
+            }
+            // val==3 (sampler mode toggle): no equivalent — unported, no-op.
+            break;
+        case 'B': {  // BPM preset (0-3)
+            static const uint16_t kBpmPresets[4] = {120, 140, 95, 180};
+            bpm = kBpmPresets[val < 4 ? val : 0];
+            break;
+        }
+        case 'P':  // play/stop
+            crunchPlaying = !crunchPlaying;
+            if (!crunchPlaying) audioCrunchAllNotesOff();
+            break;
+        // 'D' (echo/arpchord/whoosh/pitchbend), 'A' (lowpass/retrig/wobble), 'X' (pattern
+        // length), 'H' (master/headphone volume): acknowledged, no GrvEP-side effect yet.
+        default: break;
+    }
+}
+
+// ==================== NOOB STATE (MODE_NOOB) ====================
+// Generative melody: a free-running event stream (NOT a fixed step grid — see
+// nooHistory[]'s own comment) whose events are re-rolled one at a time, AND immediately in
+// full whenever any of the 4 pots or the scale mask is touched (nooReseed(), called from
+// the pot handler and the key-grid handler below) — four pots shape the roll: density (how
+// many events get a note), rhythm (note DURATION via gate length AND PLACEMENT via how
+// irregular the gap until the next event is — see the 10ms tick block), shape (how far the
+// melodic random walk can jump per re-rolled event, and how likely an event thickens into a
+// stacked chord), variation (probability any given event re-rolls vs. repeats whatever was
+// in that same rolling-history slot 8 events ago, i.e. how much the pattern evolves).
+// Scale is a NOOB-local key-per-scale picker (nooScaleRootSemi/nooScaleVariation, selected
+// by pressing a key on the grid — row=mood, column=root — see the key-grid handler) —
+// deliberately NOT the shared global NoteMap used by every other mode, so selecting here
+// can't affect SYNTH/POKEMON/I303/STONE/etc. Octave still comes from the shared noteMap
+// (B2's overlay), since that's a register choice, not a "which notes" choice. Polyphonic:
+// nooVoices[] tracks up to NOO_POLY_MAX simultaneously-sounding notes with independent
+// scheduled note-offs (gate length can exceed the gap until the next event, so a held note
+// naturally overlaps it).
+#define NOO_DEGREE_CENTER 14  // keeps the idx passed to nooMidiNoteForDegree() non-negative
+                              // (idx/sz and idx%sz go wrong for negative idx there) while still
+                              // giving the pitch walk ~2 scale-octaves of room either side
+#define NOO_EVENT_BASE_SUBDIV  0.5f // nominal/average event rate (eighth notes at the
+                              // displayed BPM) — NOT a hard grid: the 10ms tick block scales
+                              // the actual gap per event by a rhythm-driven random multiplier
+#define NOO_POLY_MAX  4       // simultaneous voice pool — a modest slice of SYNTH_CH's own
+                              // 8-voice AMY allocation (already used polyphonically by
+                              // MODE_SYNTH's own key handler), not a new resource
+#define NOO_CHORD_MAX 3       // max notes stacked on one event (see nooGenerateEvent())
+struct NooVoice { uint8_t note = 0xFF; uint32_t offAtMs = 0; };
+static NooVoice nooVoices[NOO_POLY_MAX];
+// Rolling history of the last 8 generated events (NOT 8 fixed timeline positions — there is
+// no bar/loop position anymore, just a continuous stream). nooHistoryPos is a circular
+// write cursor: nooHistory[nooHistoryPos] is always the OLDEST of the 8, about to be reused
+// by the next event (either freshly regenerated, or left as-is to "repeat what played 8
+// events ago" — see the 10ms tick block and nooVariation's own comment). The OLED piano
+// roll and LED grid both read this same buffer oldest-to-newest for a scrolling "recent
+// history" visualization (rightmost = just-played), instead of a fixed loop-position readout.
+// gapMult: the rhythm-driven multiplier that was used to schedule THIS event's own arrival
+// (1.0 = exactly the nominal gap, further from 1.0 = arrived earlier/later than nominal) —
+// recorded purely so the OLED piano roll can visualize rhythm's effect on placement (wider/
+// narrower column = arrived later/earlier than nominal), since otherwise the roll's fixed,
+// evenly-spaced columns show no visual trace of it at all (reported as "on ne voit pas
+// l'impact de rythm").
+struct NooEvent { bool active = false; int8_t degree[NOO_CHORD_MAX] = {}; uint8_t noteCount = 0; float gapMult = 1.0f; };
+static NooEvent nooHistory[8];
+static uint8_t  nooHistoryPos    = 0;
+static uint32_t nooNextEventAtMs = 0;  // absolute timestamp the NEXT event should fire
+static float    nooPendingGapMult = 1.0f;  // the mult just computed for whichever event nooNextEventAtMs refers to — stashed into that event's own gapMult once it actually fires
+static bool     nooPaused        = false;
+static uint8_t  nooVoice         = 0;
+static int      nooWalkPos       = NOO_DEGREE_CENTER;  // running pitch-walk position, carried across re-rolls
+static float    nooRhythm        = 0.4f; // P5: note gate length (duration) + how irregular the inter-event gap is (placement) — see the 10ms tick block
+static float    nooDensity       = 0.5f; // P4: proportion of re-rolled events that get a note
+static float    nooShape         = 0.4f; // P6: melodic random-walk step size AND chord-thickening chance, 0=same note/never..1=wide range/often
+static float    nooVariation     = 0.3f; // P7: probability each event re-rolls fresh vs. repeats the one 8 events ago
+static const float nooVoiceParam = 0.5f; // fixed voice tone/brightness — P7 is needed for
+                                          // "variation" now that P2 picks the voice instead
+                                          // of a button, so this is no longer pot-tunable
+// Pot-pickup baselines (file-scope, NOT local statics — see the mode-entry reset comment
+// for why: a local static never resets across mode re-entries, silently overwriting a
+// freshly-applied default with whatever the physical pot happens to be at). Armed to the
+// CURRENT pot position at mode-entry, same pattern as MODE_DJ's own djLastP1.
+static float nooLastP2 = -1, nooLastP4 = -1, nooLastP5 = -1, nooLastP6 = -1, nooLastP7 = -1;
+// NOOB's own scale-variation intervals — a small, independent copy of the same well-known
+// interval sets NoteMap.cpp uses, kept local per the user's own choice that NOOB's scale
+// system stays fully independent of the shared NoteMap/other modes. Row on the key grid
+// picks the mood (kNooVariationIntervals index), column picks the root note (0-7, C..G) —
+// see the key-grid handler. A (root, mood) pair is always validly selected (no "empty
+// scale" state to guard against, unlike the toggle-mask this replaced).
+static const uint8_t kNooVariationIntervals[4][7] = {
+    {0,2,4,5,7,9,11},    // Major (7)
+    {0,2,3,5,7,8,10},    // Minor (7)
+    {0,3,5,7,10,0,0},    // Pentatonic (5, last 2 unused — see kNooVariationSize)
+    {0,3,5,6,7,10,0},    // Blues (6, last 1 unused)
+};
+static const uint8_t kNooVariationSize[4]   = {7,7,5,6};
+static const char*   kNooVariationNames[4]  = {"Maj","Min","Pent","Blue"};
+static const char*   kNooNoteNames[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
+static uint8_t nooScaleRootSemi  = 0;  // 0-7 (column) — one of 8 chromatic roots, C..G
+static uint8_t nooScaleVariation = 0;  // 0-3 (row) — index into kNooVariationIntervals
+
+// P2 now sweeps the FULL SYNTH instrument list (all SHAPE_COUNT shapes, same shapeNames[]
+// used by MODE_SYNTH's own OVERLAY_INSTR browser) instead of a small curated 4-voice
+// table — per the user's own framing: "NOOB is just an automated way to play SYNTH." A
+// single fixed envelope (matching the original "Pluck" voice) applies to every shape, since
+// NOOB doesn't expose its own envelope control.
+static void nooApplyVoice() {
+    audioSetShape((SynthShape)(nooVoice % SHAPE_COUNT));
+    audioSetEnvelope(envTable[ENV_PLUCK]);
+    float cutoff = 300.0f * powf(40.0f, nooVoiceParam); // 300Hz..12kHz exp, same curve as GEN's P7
+    audioSetFilter(cutoff, 1.4f);
+}
+
+// Degree -> MIDI note through the NOOB-local scale picker (nooScaleRootSemi/
+// nooScaleVariation), NOT the shared noteMap's own scale (only its octave is reused, since
+// that's a register choice rather than a "which notes" choice). idx is always >= 0 by
+// construction (see NOO_DEGREE_CENTER).
+static uint8_t nooMidiNoteForDegree(int idx) {
+    uint8_t sz = kNooVariationSize[nooScaleVariation];
+    const uint8_t* intervals = kNooVariationIntervals[nooScaleVariation];
+    uint8_t baseNote = 48 + noteMap.getOctave() * 12 + nooScaleRootSemi;
+    int midiNote = baseNote + (idx / sz) * 12 + intervals[idx % sz];
+    return (uint8_t)constrain(midiNote, 0, 127);
+}
+
+// Note-offs every currently-sounding NOOB voice and frees the pool — used whenever
+// something needs to fully silence NOOB (pause, mode exit), not just let gates expire
+// naturally.
+static void nooAllNotesOff() {
+    if (!audioReady) return;
+    for (uint8_t v = 0; v < NOO_POLY_MAX; v++) {
+        if (nooVoices[v].note != 0xFF) { audioNoteOff(nooVoices[v].note); nooVoices[v].note = 0xFF; }
+    }
+}
+
+// Assigns `note` to a free voice slot, or steals whichever is closest to expiring if the
+// pool is full (NOO_POLY_MAX is a deliberately small slice of SYNTH_CH's own voice count,
+// not a hard ceiling the generator is expected to respect on its own).
+static void nooTriggerVoice(uint8_t note, uint32_t offAtMs) {
+    if (!audioReady) return;
+    int slot = -1;
+    for (uint8_t v = 0; v < NOO_POLY_MAX; v++) if (nooVoices[v].note == 0xFF) { slot = v; break; }
+    if (slot < 0) {
+        slot = 0;
+        for (uint8_t v = 1; v < NOO_POLY_MAX; v++) if (nooVoices[v].offAtMs < nooVoices[slot].offAtMs) slot = v;
+        audioNoteOff(nooVoices[slot].note);
+    }
+    audioNoteOn(note, 0.75f * volume);
+    nooVoices[slot].note = note;
+    nooVoices[slot].offAtMs = offAtMs;
+}
+
+// Re-rolls one event in place: with probability nooDensity it becomes active. Its primary
+// pitch is the running random walk advanced by up to +/-span degrees (span grows with
+// nooShape) and clamped to +/-14 degrees from center (~2 scale-octaves) so it can't wander
+// off forever. It can also stack up to NOO_CHORD_MAX-1 extra notes (a 3rd/5th-ish interval
+// away) — each extra note's own chance is nooShape*0.35, reusing "shape" (melodic freedom)
+// as the same knob for "how likely to thicken into a chord" rather than adding a 5th control.
+static void nooGenerateEvent(NooEvent& e) {
+    e.active = ((float)random(0, 1000) / 1000.0f) < nooDensity;
+    if (!e.active) { e.noteCount = 0; return; }
+    int span = 1 + (int)(nooShape * 6.0f);
+    int step = random(-span, span + 1);
+    nooWalkPos = constrain(nooWalkPos + step, NOO_DEGREE_CENTER - 14, NOO_DEGREE_CENTER + 14);
+    e.degree[0] = (int8_t)(nooWalkPos - NOO_DEGREE_CENTER);
+    uint8_t count = 1;
+    while (count < NOO_CHORD_MAX && ((float)random(0, 1000) / 1000.0f) < (nooShape * 0.35f)) {
+        int interval = (random(2) == 0) ? 2 : 4;  // roughly a 3rd or a 5th in scale-degree space
+        int extra = constrain(nooWalkPos + interval, NOO_DEGREE_CENTER - 14, NOO_DEGREE_CENTER + 14);
+        e.degree[count] = (int8_t)(extra - NOO_DEGREE_CENTER);
+        count++;
+    }
+    e.noteCount = count;
+}
+
+// Regenerates the whole rolling history fresh — used at mode-entry and whenever any pot or
+// the scale mask is touched, so the effect is heard right away (nooNextEventAtMs = now
+// makes the very next 10ms tick fire immediately) rather than waiting out however long the
+// in-flight gap happened to be.
+static void nooReseed() {
+    nooWalkPos = NOO_DEGREE_CENTER;
+    for (uint8_t i = 0; i < 8; i++) nooGenerateEvent(nooHistory[i]);
+    nooHistoryPos = 0;
+    nooNextEventAtMs = millis();
+}
 
 // ==================== GRANULAR2 STATE ====================
 struct Gran2State {
@@ -1538,16 +2043,19 @@ static const MenuItem kMenuCatInstr[] = {
     MENU_MOD2, MENU_I303, MENU_MODULAR,
     MENU_GRANULAR2, MENU_EXP,
     MENU_EXP2, MENU_EXP3, MENU_POKEMON,
-    MENU_LIFE, MENU_SWARM, MENU_GEN, MENU_DJ
+    MENU_LIFE, MENU_SWARM, MENU_GEN, MENU_DJ, MENU_NOOB
 };
+// CRUNCH moved here from kMenuCatInstr — it's a 4-track pattern recorder now (MothOS-
+// style live-record tracker), not a single played instrument, so it belongs alongside
+// GROOVE/DR2/EUCLI.
 static const MenuItem kMenuCatSeq[] = {
-    MENU_DRUM2, MENU_DR2, MENU_303S2, MENU_SYSEQ, MENU_SS2, MENU_GEST, MENU_GROOVE
+    MENU_DRUM2, MENU_DR2, MENU_303S2, MENU_SYSEQ, MENU_SS2, MENU_GEST, MENU_GROOVE, MENU_EUCLI, MENU_CRUNCH
 };
 static const MenuItem kMenuCatAut[] = {
-    MENU_LIGHT, MENU_LIGHTPLAY, MENU_ABOUT, MENU_SD, MENU_ANIM, MENU_VID, MENU_LANIM, MENU_PCMCLEAN, MENU_IMPORT, MENU_MIDI
+    MENU_LIGHT, MENU_LIGHTPLAY, MENU_ABOUT, MENU_SD, MENU_ANIM, MENU_VID, MENU_LANIM, MENU_PCMCLEAN, MENU_USB, MENU_IMPORT, MENU_MIDI
 };
 static const MenuItem* kMenuCatItems[] = { kMenuCatInstr, kMenuCatSeq, kMenuCatAut };
-static const uint8_t kMenuCatSizes[] = { 16, 7, 10 };
+static const uint8_t kMenuCatSizes[] = { 17, 9, 11 };
 
 // ==================== VID STATE ====================
 struct __attribute__((packed)) BvidHeader {
@@ -2120,6 +2628,7 @@ void applyAllFx() {
 
 // ==================== SAMPLE BROWSER ====================
 bool   sdReady      = false;
+uint32_t sdLostMsgUntil = 0;  // millis() deadline: show the "carte SD retirée" banner until then (0=hidden)
 String sdPath       = "/";
 String sdFiles[32];
 bool   sdFileIsDir[32];
@@ -2458,6 +2967,80 @@ void sdListDir(const String &path, bool(*filter)(const char*) = nullptr) {
     dir.close();
 }
 
+// Stops everything that could touch SD, waits (bounded) for it to actually settle, then
+// exposes the card to the USB host — or refuses to, if something's still stuck, rather than
+// risk exposing a card mid-write. See MODE_USB's own state-block comment for the full list
+// of what must stay quiet for the whole session (this call only guarantees the START of it —
+// loop()'s own gating on usbMscActive is what keeps it quiet for the DURATION).
+static bool        usbMscPending = false;  // entered MODE_USB, still waiting for SD activity to settle
+static uint32_t    usbMscEnterMs = 0;
+static const char* usbMscReason  = "";     // what we're still waiting on — shown on the mode's screen
+
+// NON-blocking: this used to sit in a delay() loop (and be retried from loop()), which froze
+// the UI — B1 was never read — whenever something stayed busy. Now it only stops things once
+// and usbMscPoll() checks the conditions one loop() iteration at a time.
+static void usbMscBeginEnter() {
+    audioDJPlayPause(false);
+    audioStopAllSamples();
+    audioDJForceQuiesce();
+    audioSSForceQuiesce();
+    usbMscActive = false; usbMscQuiesceFailed = false;
+    usbMscPending = true; usbMscEnterMs = millis(); usbMscReason = "attente";
+}
+
+static void usbMscPoll() {
+    if (!usbMscPending || usbMscActive) return;
+    const char* why = nullptr;
+    static uint32_t lastSdTry = 0;
+    if (!sdReady) {
+        if (millis() - lastSdTry > 2000) { lastSdTry = millis(); if (SD.begin(SD_CS, SPI, SD_SPI_HZ)) sdReady = true; }
+        if (!sdReady) why = "pas de carte SD";
+    }
+    if (!why && audioDJJobBusy())          why = "DJ occupe";
+    if (!why && audioSSJobBusy())          why = "SS2 occupe";
+    if (!why && !audioIsStreamingDone())   why = "chargement sample";
+    if (why) {
+        if (why != usbMscReason) Serial.printf("[USB] waiting: %s\n", why);
+        usbMscReason = why;
+        if (millis() - usbMscEnterMs > 3000) usbMscQuiesceFailed = true;
+        return;
+    }
+    audioDJCloseFiles(); audioSSCloseFiles();  // no open SD files may outlive the FatFs mount
+#if CONFIG_TINYUSB_MSC_ENABLED
+    if (SD.numSectors() == 0) { usbMscReason = "carte illisible"; usbMscQuiesceFailed = true; return; }
+    {   // Self-test independent of USB: can the card's sector 0 be read, and is it a partitioned disk?
+        uint8_t b[512]; bool ok = SD.readRAW(b, 0);
+        Serial.printf("[USB] selftest LBA0 read=%d sig=%02x%02x part1type=%02x secSize=%u\n", (int)ok, b[510], b[511], b[450], (unsigned)SD.sectorSize());
+    }
+    // Geometry is (re)read here, not only at boot (boot only had it if a card was mounted then).
+    msc.begin(SD.numSectors(), SD.sectorSize());
+    usbMscActive = true;
+    msc.mediaPresent(true);
+    usbMscQuiesceFailed = false;
+    usbMscPending = false;
+    Serial.printf("[USB] media exposed: %u sectors\n", (unsigned)SD.numSectors());
+#endif
+}
+
+// Hides the card from the USB host again, then forces a fresh SD remount so the app's own
+// FatFs view picks up whatever the PC changed (new/deleted/renamed files, a rebuilt .pcm16,
+// etc.) instead of trusting a now-stale mount — the exact same remount the SD hot-swap poll's
+// own "card detected" branch already does on reinsertion, reused here rather than duplicated.
+static void usbMscExit() {
+#if CONFIG_TINYUSB_MSC_ENABLED
+    msc.mediaPresent(false);
+    delay(200);  // let any callback already running in the USB task finish before the card handle is torn down
+#endif
+    usbMscActive = false; usbMscPending = false;
+    SD.end();
+    if (SD.begin(SD_CS, SPI, SD_SPI_HZ)) {
+        sdReady = true;
+        sdListDir(sdPath.length() > 1 ? sdPath.c_str() : "/");
+    } else {
+        sdReady = false;
+    }
+}
+
 String buildSdFilePath() {
     if (sdCursor >= sdFileCount) return "";
     String fp = sdPath;
@@ -2644,6 +3227,16 @@ static CtrlLabels ctrlLabelsFor(AppMode m) {
             return {"SHAPE", "FLOCK", "SPEED", "ATTRACT", "ZONE", "-", "-", "-", "-"};
         case MODE_GEN:
             return {"TEXTURE PARAM", "TICKRATE", "SCALE", "OCTAVE", "VOICE PARAM", "PAUSE", "-", "-", "-"};
+        case MODE_NOOB:
+            return {"VOICE", "DENSITY", "RHYTHM", "SHAPE", "VARIATION", "PLAY/PAUSE", "OCTAVE", "FX", "-"};
+        case MODE_EUCLI:
+            if (anyFxActive())
+                return {"DECAY", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", "BANK", "RESET"};
+            return {"DECAY", "LANE1 HITS", "LANE2 HITS", "LANE3 HITS", "LANE4 HITS", "PLAY", "FX", "BANK", "RESET"};
+        case MODE_CRUNCH:
+            if (anyFxActive())
+                return {"OCTAVE", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", "-", "INSTR"};
+            return {"OCTAVE", "VOL", "DECAY", "-", "-", "PLAY", "FX", "-", "INSTR"};
         case MODE_GROOVE:
             if (anyFxActive())
                 return {"-", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX/SCALE", "MUTE/SOLO", "BANK"};
@@ -2698,9 +3291,26 @@ void drawScreen(bool blockWait = false);  // forward-decl
 static void mod2AlgoApply();              // forward-decl
 
 void switchMode(AppMode newMode) {
+    if (currentMode==MODE_USB) usbMscExit();
+
     // Stop sample oscillators when leaving any mode that uses them
     if (currentMode==MODE_SAMPLE)
         audioStopAllSamples();
+
+    if (currentMode==MODE_DJ) {
+        // Grain spray/scratch are joystick-driven performance controls for the DJ play view
+        // specifically — audioDJTick() advances the deck unconditionally regardless of which
+        // mode is on-screen (by design, so the deck keeps playing in the background), but
+        // grains/scratch should NOT silently keep running once the user has left MODE_DJ.
+        audioDJSetGrainAmount(0.0f);
+        audioDJScratchEnd();
+        // Defensive: if the user switched mode via some other control while still physically
+        // holding the joystick click mid-stutter, the click-release edge that would normally
+        // call this (gated on currentMode==MODE_DJ) never fires — without this, the deck
+        // would stay frozen and the job slot claimed forever, blocking all future DJ
+        // repositioning.
+        if (audioDJIsStuttering()) audioDJStutterEnd();
+    }
 
     if (currentMode==MODE_MOD2){
         audioSetFilter(0.0f, 1.5f);
@@ -2777,6 +3387,11 @@ void switchMode(AppMode newMode) {
     if (currentMode==MODE_STONE) {
         audioStoneAllNotesOff();
     }
+    if (currentMode==MODE_CRUNCH) {
+        audioCrunchAllNotesOff();
+        crunchPlaying = false;
+        crunchPressedOnce = false;
+    }
     if (currentMode==MODE_DR2) {
         dr2Playing = false;
         dr2RecArmed = false;
@@ -2834,6 +3449,10 @@ void switchMode(AppMode newMode) {
             audioSetFilter(0.0f,1.5f);
         }
     }
+    if (currentMode==MODE_NOOB) {
+        nooAllNotesOff();
+        if (audioReady) audioSetFilter(0.0f,1.5f);
+    }
     if (currentMode==MODE_MODULAR) {
         gModSlots[4].active = false;
         gModSlots[4].destKind = MODDEST_NONE;
@@ -2861,11 +3480,15 @@ void switchMode(AppMode newMode) {
                 false,false,false,false,false, // ANIM,I103,VID,LANIM,EXP
                 false,false,true, false,false, // EXP2,EXP3,303S2,POKEMON,MODULAR
                 true,                          // GEST
-                false,false,true, false,       // PCMCLEAN,STONE,DR2,IMPORT
+                false,false,                   // PCMCLEAN,USB
+                false,true, false,             // STONE,DR2,IMPORT
                 false,false,                   // LIFE,SWARM
                 false,                          // GEN
                 false,                           // DJ
-                true                             // GROOVE
+                true,                            // GROOVE
+                false,                           // NOOB
+                true,                            // EUCLI
+                true                             // CRUNCH (now a real sequencer, MothOS-style tracker)
             };
             if (!kIsSeq[currentMode]) {
                 audioSetFilter(0.0f, 1.5f);
@@ -2883,7 +3506,7 @@ void switchMode(AppMode newMode) {
           "BATT","DIAG","MOD2","GRANU",
           "MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303","MEDIA","LANIM",
           "EXP","EXP2","EXP3","303S","PKMN","SERUM","GEST",
-          "PURGPCM","STONE","GEST2","IMPORT","LIFE","SWARM","GEN","DJ","GRV"};
+          "PURGPCM","USB","STONE","GEST2","IMPORT","LIFE","SWARM","GEN","DJ","GRV","NOOB","EUCLI","CRUNCH"};
       // This array must have exactly MODE_COUNT entries in AppMode order — the
       // compiler silently pads any missing trailing ones with nullptr (no size
       // mismatch warning), and printf("%s", nullptr) crashes (LoadProhibited).
@@ -2899,6 +3522,7 @@ void switchMode(AppMode newMode) {
     }
     if (newMode==MODE_VID   && sdReady) sdListDir("/", isMediaFile);
     if (newMode==MODE_PCMCLEAN) { pcmCleanPhase=0; pcmCleanDeleted=0; pcmCleanScanned=0; pcmCleanRunning=false; }
+    if (newMode==MODE_USB) usbMscBeginEnter();
     if (newMode==MODE_IMPORT)   { importPhase=0; importDone=0; importTotal=0; }
     if (newMode==MODE_STONE) {
         if (sdReady) { sdListDir("/"); stoneRebuildAudioIdx(); }
@@ -3162,6 +3786,46 @@ void switchMode(AppMode newMode) {
         genApplyVoice();
         audioSetReverb(0.2f, 0.78f, 0.45f, 2000.0f);
     }
+    if (newMode==MODE_NOOB && audioReady) {
+        nooVoice = 0; nooPaused = false;
+        nooDensity = 0.5f; nooRhythm = 0.4f; nooShape = 0.4f; nooVariation = 0.3f;
+        nooScaleRootSemi = 0; nooScaleVariation = 0;  // C Major, same default as its own declaration
+        // Arm the pot-pickup baselines to whatever the physical pots are AT RIGHT NOW —
+        // without this, the pot handler's own "has this pot moved?" check (comparing
+        // against a baseline that's never been synced since app boot) fires almost
+        // immediately and silently overwrites the defaults just set above with wherever
+        // the pots physically happen to sit (same fix already applied to MODE_DJ's speed
+        // pot — see djLastP1's own comment).
+        nooLastP2 = pots[1].value; nooLastP4 = pots[3].value; nooLastP5 = pots[4].value;
+        nooLastP6 = pots[5].value; nooLastP7 = pots[6].value;
+        for (uint8_t v = 0; v < NOO_POLY_MAX; v++) nooVoices[v] = {};
+        nooReseed();
+        nooApplyVoice();
+        audioSetReverb(0.2f, 0.78f, 0.45f, 2000.0f);
+    }
+    if (newMode==MODE_EUCLI) {
+        euPlaying = false;
+        uint32_t nowEu = millis();
+        for (uint8_t l = 0; l < EUCLI_LANES; l++) {
+            euPlayhead[l] = 0;
+            euLastStepMs[l] = nowEu;
+            eucliRebuildPattern(euPattern[l], euSteps[l], euPulses[l]);
+        }
+        // Pot-pickup baselines (see MODE_NOOB's own comment above for why this is needed).
+        euLastP2 = pots[1].value;
+        euLastP4 = pots[3].value; euLastP5 = pots[4].value; euLastP6 = pots[5].value; euLastP7 = pots[6].value;
+    }
+    if (newMode==MODE_CRUNCH) {
+        crunchPlaying = false; crunchPressedOnce = false; crunchStep = 0;
+        for (uint8_t t = 0; t < CRUNCH_TRACKS; t++) {
+            audioCrunchSetTrackInstrument(t, crunchTrackInstrument[t]);
+            audioCrunchSetTrackDecayMod(t, 1.0f);
+            crunchVuLevel[t] = 0; crunchLastNote[t] = -1;
+        }
+        crunchBrItem = crunchTrackInstrument[crunchSelectedTrack];
+        // Pot-pickup baselines (see MODE_NOOB's own comment above for why this is needed).
+        crunchLastP2 = pots[1].value; crunchLastP4 = pots[3].value; crunchLastP5 = pots[4].value;
+    }
     if (newMode==MODE_GEST) {
         // Pickup: don't apply pot values immediately — wait for the pot to actually move
         for(int _p=0;_p<4;_p++) lpGestPots[_p] = pots[3+_p].value;
@@ -3238,6 +3902,7 @@ static void dispatchMenuItem(MenuItem item) {
         case MENU_POKEMON:   switchMode(MODE_POKEMON); break;
         case MENU_GEST:      switchMode(MODE_GEST);      break;
         case MENU_PCMCLEAN:  switchMode(MODE_PCMCLEAN);  break;
+        case MENU_USB:       switchMode(MODE_USB);       break;
         case MENU_IMPORT:    switchMode(MODE_IMPORT);    break;
         case MENU_STONE:     switchMode(MODE_STONE);     break;
         case MENU_DR2:       switchMode(MODE_DR2);       break;
@@ -3246,6 +3911,9 @@ static void dispatchMenuItem(MenuItem item) {
         case MENU_GEN:       switchMode(MODE_GEN);       break;
         case MENU_DJ:        switchMode(MODE_DJ);        break;
         case MENU_GROOVE:    switchMode(MODE_GROOVE);    break;
+        case MENU_NOOB:      switchMode(MODE_NOOB);      break;
+        case MENU_EUCLI:     switchMode(MODE_EUCLI);     break;
+        case MENU_CRUNCH:    switchMode(MODE_CRUNCH);    break;
         default: break;
     }
 }
@@ -3437,9 +4105,9 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
         return;
     }
 
-    // INSTR browser: note rows play normally (handled by handleNoteKeyAudio).
+    // INSTR/CRUNCH browser: note rows play normally (handled by handleNoteKeyAudio).
     // BTN row closes the browser and applies the selected instrument.
-    if (s_overlay == OVERLAY_INSTR) {
+    if (s_overlay == OVERLAY_INSTR || s_overlay == OVERLAY_CRUNCH) {
         if (row >= KBD_NOTE_ROWS) { s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0; return; }
         return;  // note rows: audio handled separately, no overlay selection logic
     }
@@ -3719,12 +4387,17 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                     case MODE_I303:
                     case MODE_STONE:
                     case MODE_OMNI:
-                    case MODE_MODULAR:  // newly wired in — was unreachable from this mode before
-                    case MODE_DJ: {
+                    case MODE_MODULAR: {  // newly wired in — was unreachable from this mode before
                         OverlayType old = s_overlay; s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
                         if (old != OVERLAY_FX) s_overlay = OVERLAY_FX;
                         break;
                     }
+                    case MODE_USB:
+                        // This is where B1's short press is dispatched (on release, per mode).
+                        // switchMode()'s MODE_USB-leaving hook does the eject + SD remount.
+                        switchMode(MODE_SYNTH);
+                        menuOpen = true; menuRow = 0; menuCol = 0; menuOnTabBar = true;
+                        break;
                     case MODE_VID: {
                         if (mediaAudioPlaying) {
                             audioStopSamplePreset(PCM_PREVIEW_PRESET); mediaAudioPlaying=false;
@@ -3860,6 +4533,17 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                             memset(grvDblPendingAt, 0, sizeof(grvDblPendingAt));
                         }
                         break;
+                    case MODE_EUCLI: {
+                        euPlaying = !euPlaying;
+                        uint32_t nowEu = millis();
+                        for (uint8_t l = 0; l < EUCLI_LANES; l++) euLastStepMs[l] = nowEu;
+                        break;
+                    }
+                    case MODE_CRUNCH: {
+                        crunchPlaying = !crunchPlaying;
+                        if (!crunchPlaying) audioCrunchAllNotesOff();
+                        break;
+                    }
                     case MODE_303S:
                         drum2Playing = !drum2Playing;
                         if (drum2Playing) { drum2Step=0; drum2LastStepMs=millis(); }
@@ -3912,6 +4596,23 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                     case MODE_GEN:
                         genPaused = !genPaused;
                         break;
+                    case MODE_NOOB:
+                        nooPaused = !nooPaused;
+                        // Unlike LIFE (whose own pause deliberately leaves a currently-
+                        // sounding note held, per its own comment), NOOB's step sequencer has
+                        // no birth/death logic to eventually release a held note on its
+                        // own — pausing just stops calling the tick function entirely, so
+                        // whatever was sounding would otherwise sustain indefinitely.
+                        if (nooPaused) nooAllNotesOff();
+                        break;
+                    case MODE_DJ:
+                        // Moved here from B2 per the user's report that B1 is where they
+                        // expect play/pause (matching every other paused-transport mode
+                        // above) — B2 now opens the FX overlay instead (see the switch
+                        // below). Only act once a track is loaded and playing, same guard
+                        // as the old B2 binding had.
+                        if (!djBrowsing) audioDJPlayPause(!audioDJIsPlaying());
+                        break;
                     default: break;
                 }
             }
@@ -3923,7 +4624,7 @@ void handleButton(uint8_t rawBtn, bool pressed) {
 
     // B2 (btn==1): scale/arp overlay — template default for all synth-like modes
     if (btn == 1 && pressed) {
-        if (currentMode==MODE_SYNTH || currentMode==MODE_POKEMON || currentMode==MODE_I303 || currentMode==MODE_STONE) {
+        if (currentMode==MODE_SYNTH || currentMode==MODE_POKEMON || currentMode==MODE_I303 || currentMode==MODE_STONE || currentMode==MODE_NOOB) {
             OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0;
             if (old!=OVERLAY_SCALE_ARP) s_overlay=OVERLAY_SCALE_ARP;
             return;
@@ -3956,6 +4657,28 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             }
             if (btn==3) noteMap.nextOctave();
             break;
+        case MODE_CRUNCH:
+            // B3 intentionally unbound — most of MothOS's own command set (instrument/
+            // octave/track/mute/envelope/pattern select-clear, etc.) lives on the key grid
+            // itself (crunchDispatchCommand(), a literal port of Tracker::SetCommand).
+            // B2/P4-P7 DO use GrvEP's usual FX-overlay convention though (per the user's
+            // own request) — CRUNCH's key-grid 'A'/'D' commands (lowpass/retrig/wobble/
+            // echo/etc.) have no GrvEP DSP behind them, so the shared FX bus is the real
+            // way to shape CRUNCH's sound, same as every other mode.
+            if (btn==1) {
+                OverlayType old = s_overlay; s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
+                if (old != OVERLAY_FX) s_overlay = OVERLAY_FX;
+            }
+            // B4 stays bound to OVERLAY_CRUNCH as a browsing convenience for the 12
+            // instrument slots (same list the key grid's 'I' command reaches).
+            if (btn==3) {
+                OverlayType old = s_overlay; s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
+                if (old != OVERLAY_CRUNCH) {
+                    s_overlay = OVERLAY_CRUNCH;
+                    crunchBrItem = crunchTrackInstrument[crunchSelectedTrack];
+                }
+            }
+            break;
         case MODE_DJ:
             if (btn==3) {
                 // B4: browsing -> back to the play view (only if something's already
@@ -3966,7 +4689,8 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                 break;
             }
             if (djBrowsing) break;  // B2/B3 only act once a track is loaded and playing
-            if (btn==1) audioDJPlayPause(!audioDJIsPlaying());    // B2: play/pause
+            // B1: play/pause (handled above, alongside LIFE/GEN/NOOB's own pause toggle).
+            if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_FX) s_overlay=OVERLAY_FX; }  // B2: FX
             if (btn==2) audioDJSetReverse(!audioDJGetReverse());  // B3: reverse toggle
             break;
         case MODE_POKEMON:
@@ -3975,6 +4699,14 @@ void handleButton(uint8_t rawBtn, bool pressed) {
         case MODE_OMNI:
             if (btn==1) fxSelected=(fxSelected+1)%FX_COUNT;
             if (btn==3) noteMap.nextOctave();
+            break;
+        case MODE_NOOB:
+            // B1=play/pause (handled above, alongside LIFE/GEN's own pause toggle).
+            // B2=Octave overlay (handled above too — its scale-picker buttons no longer
+            // affect NOOB, which now has its own local scale mask edited directly via the
+            // key grid — see the key-grid handler). B3=FX. Voice/instrument is now a direct
+            // P2 sweep, not a button (see the pot handler), so B4 is free/unused here.
+            if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_FX) s_overlay=OVERLAY_FX; }
             break;
         case MODE_SAMPLE:
             if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_FX) s_overlay=OVERLAY_FX; }
@@ -4140,6 +4872,20 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                     }
                     grvRecomputeActivePatFilled();
                 }
+            }
+            break;
+        case MODE_EUCLI:
+            // B1 (start/stop) handled in the btn==0 block above.
+            if (btn==1) {  // B2: FX overlay
+                OverlayType old = s_overlay; s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
+                if (old != OVERLAY_FX) s_overlay = OVERLAY_FX;
+            }
+            if (btn==2) {  // B3: cycle drum bank
+                euBank = (uint8_t)((euBank + 1) % EUCLI_BANK_COUNT);
+            }
+            if (btn==3) {  // B4: reset — resync all lanes' playheads to 0 (keeps step/pulse settings)
+                uint32_t nowEu = millis();
+                for (uint8_t l = 0; l < EUCLI_LANES; l++) { euPlayhead[l] = 0; euLastStepMs[l] = nowEu; }
             }
             break;
         case MODE_I303:
@@ -4430,6 +5176,16 @@ void handleButton(uint8_t rawBtn, bool pressed) {
         case MODE_PCMCLEAN:
             if (btn==0 && pcmCleanPhase==0 && sdReady) {
                 pcmCleanPhase=1; pcmCleanDeleted=0; pcmCleanScanned=0; pcmCleanRunning=true;
+            }
+            break;
+        case MODE_USB:
+            // Any button exits back to the menu — switchMode()'s own MODE_USB-leaving hook
+            // (usbMscExit()) does the actual eject + SD remount.
+            // B1's short press is dispatched on RELEASE (see the btn==0 branch above), where
+            // `pressed` is false — the old `&& pressed` made this exit unreachable.
+            if (btn==0) {
+                switchMode(MODE_SYNTH);
+                menuOpen = true; menuRow = 0; menuCol = 0; menuOnTabBar = true;
             }
             break;
         case MODE_IMPORT:
@@ -4771,6 +5527,28 @@ void drawScreen(bool blockWait) {
         return;
     }
 
+    // CRUNCH instrument browser: flat list of the 12 instrument SLOTS (DRUM bank, SFX
+    // bank, 10 melodic), same shape as OVERLAY_I303_WAVE above (live-applied on joystick Y
+    // nav, see loop()).
+    if (s_overlay == OVERLAY_CRUNCH) {
+        oled.setFont(u8g2_font_6x10_tf);
+        const uint8_t rowH = 10;
+        char hdr[20]; snprintf(hdr, sizeof(hdr), "Track %u instr:", crunchSelectedTrack + 1);
+        oled.drawStr(1, 9, hdr);
+        oled.drawHLine(0, 10, 128);
+        for (uint8_t i = 0; i < CRUNCH_INSTR_SLOTS; i++) {
+            int y = (int)i * rowH + 11;
+            bool sel = (i == crunchBrItem);
+            bool cur = (i == crunchTrackInstrument[crunchSelectedTrack]);
+            if (sel) { oled.drawBox(0, y, 128, rowH-1); oled.setDrawColor(0); }
+            else if (cur) { oled.drawFrame(0, y, 128, rowH-1); }
+            oled.drawStr(4, y + rowH - 2, audioCrunchSlotName(i));
+            if (sel) oled.setDrawColor(1);
+        }
+        if (s_displayTaskHandle) xTaskNotifyGive(s_displayTaskHandle);
+        return;
+    }
+
     // PKMN browser: left = types, right = Pokémon of selected type
     if (s_overlay == OVERLAY_PKMN) {
         oled.setFont(u8g2_font_4x6_tf);
@@ -5099,7 +5877,19 @@ void drawScreen(bool blockWait) {
     oled.setFont(u8g2_font_5x7_tf);
     char buf[40];
 
-    if (menuOpen) {
+    if (menuOpen && sdLostMsgUntil && millis() < sdLostMsgUntil) {
+        // Transient full-screen banner: shown for a couple seconds right after the SD-card
+        // hot-swap check (loop(), main.cpp) detects the card is gone and force-returns here.
+        oled.setFont(u8g2_font_6x10_tf);
+        const char* l1 = "Carte SD retiree";
+        int w1 = oled.getStrWidth(l1);
+        oled.drawStr((128-w1)/2, 54, l1);
+        oled.setFont(u8g2_font_4x6_tf);
+        const char* l2 = "Reinserez la carte";
+        int w2 = oled.getStrWidth(l2);
+        oled.drawStr((128-w2)/2, 70, l2);
+    } else if (menuOpen) {
+        sdLostMsgUntil = 0;  // any other menu content drawn = banner window has passed
         // ---- Tab bar (always visible) ----
         const uint8_t TW=42, TH=10;
         for (uint8_t t=0;t<3;t++) {
@@ -5525,14 +6315,16 @@ void drawScreen(bool blockWait) {
                 oled.drawStr(0, 7, buf); oled.drawHLine(0, 9, 128);
 
                 // Waveform (y=11..40) + playhead — same geometry family as STONE's window view.
-                // Cached against the load-generation counter: audioDJComputeWaveform()
-                // scans the WHOLE track (can be millions of samples), far too expensive
-                // to call every drawScreen() frame — only recompute when the loaded track
-                // actually changed.
+                // Shows the CURRENTLY ACTIVE ~30s chunk, not the whole track (this mode
+                // streams in bounded chunks now — see config.h's DJ_* block — so it never
+                // holds the whole file in RAM to draw from). Cached against the chunk
+                // generation counter (bumps on every chunk swap/seek/reverse-toggle, not
+                // just a brand new track load): audioDJComputeWaveform() scans a whole
+                // chunk, too expensive to call every drawScreen() frame.
                 static uint8_t djWave[128]; static bool djWaveComputed = false; static uint32_t djWaveGen = 0xFFFFFFFF;
-                if (djWaveGen != audioDJGetLoadGen()) {
+                if (djWaveGen != audioDJGetChunkGen()) {
                     djWaveComputed = audioDJComputeWaveform(djWave);
-                    djWaveGen = audioDJGetLoadGen();
+                    djWaveGen = audioDJGetChunkGen();
                 }
                 if (djWaveComputed) {
                     for (int x = 0; x < 128; x++) {
@@ -5540,15 +6332,53 @@ void drawScreen(bool blockWait) {
                         if (h < 1) h = 1;
                         oled.drawVLine(x, 40 - h, h);
                     }
-                    int px = (int)(audioDJGetPosFrac() * 127.f);
+                    // audioDJGetChunkProgressFrac() tracks buffer-index progress through
+                    // THIS half in that half's OWN reading order — for a reverse-stored half
+                    // that's latest-time-first, so converting to chronoFrac (0=this chunk's
+                    // own earliest point in time, 1=its own latest, regardless of direction)
+                    // up front means the rest of this math never needs a separate mirror step:
+                    // higher chronoFrac always means later in the track, matching a normal
+                    // timeline reading either direction.
+                    float t = audioDJGetChunkProgressFrac();
+                    float chronoFrac = audioDJGetReverse() ? (1.0f - t) : t;
+                    // Mapped to the middle 20%-80% of the frame (not edge-to-edge): the
+                    // waveform picture swaps to the next chunk exactly when progress hits
+                    // 1.0, so confining the cursor's travel to 20-80% means it never
+                    // visibly reaches either edge before that swap — avoiding the "runs
+                    // the whole portion, THEN the next one appears" feel the user reported.
+                    // Exception: the chunk that actually touches the true start/end of the
+                    // whole track gets that edge of the range extended all the way to 0%/100%
+                    // — the user wants the cursor to visibly reach the ends of the track, not
+                    // just of whichever chunk happens to be showing. This only affects the
+                    // one or two chunks per whole-track pass that genuinely touch an edge —
+                    // every ordinary mid-track chunk still uses the same squeezed 20%-80% for
+                    // every chunk (an earlier version special-cased just the first chunk this
+                    // way and it read as "chaotic" — apply it only where it's really true).
+                    float lo = audioDJChunkTouchesStart() ? 0.0f : 0.2f;
+                    float hi = audioDJChunkTouchesEnd()   ? 1.0f : 0.8f;
+                    int px = (int)(127.f * (lo + (hi - lo) * chronoFrac));
                     oled.drawVLine(px, 11, 29);
+                } else if (!djBrowsing) {
+                    // Still decoding the first chunk (bounded to ~DJ_CHUNK_SECONDS now,
+                    // not the whole track — a short, honest wait) — show live progress
+                    // instead of a blank waveform pane so "loading" isn't mistaken for "stuck".
+                    // 20000Hz = DJ_PLAYBACK_RATE_HZ/PCM_TARGET_RATE (audio_engine.cpp's
+                    // real elapsed-seconds rate for this mode, not visible here).
+                    snprintf(buf, sizeof(buf), "Chargement... %.1fs decodees",
+                             (float)audioDJGetDecodedFrames() / 20000.0f);
+                    oled.drawStr(0, 28, buf);
                 }
 
                 // Transport status.
-                snprintf(buf, sizeof(buf), "%s  %s  x%.2f",
+                int tsLen = snprintf(buf, sizeof(buf), "%s  %s  x%.2f",
                          audioDJIsPlaying() ? "> PLAY" : "|| PAUSE",
                          audioDJGetReverse() ? (audioDJIsReverseReady() ? "REV" : "REV(...)") : "FWD",
                          audioDJGetSpeed());
+                // Live indicator for the dynamic/experimental controls (scratch has no state
+                // to show between nudges — only stutter/granular have a visible "is it doing
+                // something" state worth surfacing).
+                if (audioDJIsStuttering()) snprintf(buf + tsLen, sizeof(buf) - tsLen, " STUT");
+                else if (audioDJGetGrainAmount() > 0.01f) snprintf(buf + tsLen, sizeof(buf) - tsLen, " GR%d%%", (int)(audioDJGetGrainAmount() * 100.0f));
                 oled.drawStr(0, 51, buf);
 
                 {
@@ -5579,7 +6409,7 @@ void drawScreen(bool blockWait) {
                         oled.drawStr(0, 111, l1);
                     }
                 }
-                oled.drawStr(0, 122, "B2 Play  B3 Rev  B4 Browse");
+                oled.drawStr(0, 122, "B1 Play  B2 FX  B3 Rev  B4 Browse");
                 break;
             }
             // ---- SEQUENCER ----
@@ -5702,6 +6532,30 @@ void drawScreen(bool blockWait) {
                     oled.drawStr(0,50,buf);
                     oled.drawStr(0,67,"Click = menu");
                 }
+                break;
+            }
+
+            // ---- USB MASS STORAGE ----
+            case MODE_USB: {
+                oled.setFont(u8g2_font_5x7_tf);
+                oled.drawStr(0,7,"CARTE SD PAR USB");
+                oled.drawHLine(0,10,128);
+                oled.setFont(u8g2_font_4x6_tf);
+                if (usbMscQuiesceFailed) {
+                    oled.drawStr(0,26,"En attente (SD occupee) :");
+                    oled.drawStr(0,34,usbMscReason);
+                    oled.drawStr(0,42,"B1 = quitter");
+                } else if (usbMscActive) {
+                    oled.drawStr(0,26,"Carte SD visible sur le PC");
+                    oled.drawStr(0,34,"comme un disque USB.");
+                    oled.drawStr(0,46,"Ejectez le disque cote PC");
+                    oled.drawStr(0,54,"avant de quitter ce mode.");
+                } else {
+                    oled.drawStr(0,26,"Connexion en cours...");
+                }
+                oled.drawHLine(0,62,128);
+                oled.setFont(u8g2_font_5x7_tf);
+                oled.drawStr(0,75,"B1 = quitter");
                 break;
             }
 
@@ -6209,6 +7063,162 @@ void drawScreen(bool blockWait) {
                 snprintf(buf, sizeof(buf), "FX:%s", fxstr);
                 oled.drawStr(0, 116, buf);
                 oled.drawStr(0, 124, "B1 PLAY B2 FX B3 MUTE B4 BANK");
+                break;
+            }
+            // ---- EUCLI — 4-lane euclidean drum sequencer ----
+            case MODE_EUCLI: {
+                oled.setFont(u8g2_font_4x6_tf);
+                snprintf(buf, sizeof(buf), "EUCLI %s BPM:%d Bank:%d",
+                         euPlaying?"[>]":"[ ]", bpm, euBank+1);
+                oled.drawStr(0, 6, buf);
+                oled.drawHLine(0, 8, 128);
+
+                // Top half: 4 concentric rings, one per lane (inner=lane0 .. outer=lane3),
+                // each with steps[lane] points spaced evenly around it (12-o'clock = step 0).
+                // Model: MODE_EXP3's own orbital-ring drawing (drawCircle per radius +
+                // trig-placed markers) — the closest existing pattern in this codebase.
+                // CY/radii sized to fit entirely within the header (y=8) .. separator
+                // (y=68) band, including the +4px playhead ring drawn around the outermost
+                // lane's markers — previously (CY=44, max radius 33) the outer ring's
+                // playhead circle reached y=81, well into the bottom-half bars below.
+                const int CX = 64, CY = 38;
+                static const int kEuRadii[EUCLI_LANES] = {6, 12, 18, 24};
+                for (uint8_t l = 0; l < EUCLI_LANES; l++) {
+                    int r = kEuRadii[l];
+                    uint8_t steps = euSteps[l];
+                    for (uint8_t i = 0; i < steps; i++) {
+                        float a = ((float)i / (float)steps) * 2.0f * (float)M_PI - (float)M_PI/2.0f;
+                        int16_t px = (int16_t)(CX + r*cosf(a));
+                        int16_t py = (int16_t)(CY + r*sinf(a));
+                        if (euPattern[l][i]) oled.drawDisc(px, py, 2);
+                        else oled.drawPixel(px, py);
+                        if (euPlaying && i == euPlayhead[l]) oled.drawCircle(px, py, 4);
+                    }
+                }
+
+                // Bottom half: one row per lane — the actual drum name (so B3's bank
+                // switch is legible instead of just a number), a proportional bar, and
+                // the "X/S" pulse readout.
+                oled.drawHLine(0, 68, 128);
+                for (uint8_t l = 0; l < EUCLI_LANES; l++) {
+                    int y = 74 + l * 13;
+                    float frac = euSteps[l] ? (float)euPulses[l] / (float)euSteps[l] : 0.0f;
+                    oled.drawStr(0, y+7, audioDrumPadLabel(kEucliBanks[euBank][l]));
+                    oled.drawFrame(20, y, 70, 9);
+                    oled.drawBox(21, y+1, (uint16_t)(68 * frac), 7);
+                    snprintf(buf, sizeof(buf), "%u/%u", euPulses[l], euSteps[l]);
+                    oled.drawStr(94, y+7, buf);
+                }
+                oled.drawStr(0, 127, "B1 PLAY B2 FX B3 BANK B4 RESET");
+                break;
+            }
+            // ---- CRUNCH — 32-sample bank replayed pitched across the keyboard ----
+            // ---- CRUNCH — MothOS-style 4-track live-record tracker ----
+            // Adapted from ScreenManager::UpdateMainScreen (MothSynths/MothOS): per-track
+            // VU-meter bars with peak-decay, note name under each, big bold step readout
+            // ("READY" before the first captured note, else "NN/32"), pattern readout.
+            case MODE_CRUNCH: {
+                // Legend screen: shown while a shift key (M/N/O/P) is armed, exactly like
+                // MothOS's own UpdateInstructionsScreen — replaces the whole screen with a
+                // 4x4 grid naming what each physical key now does. Rows top-to-bottom match
+                // the physical layout: shift row's own meaning, then I-L/E-H/A-D.
+                bool anyArmed = false; uint8_t armedIdx = 0;
+                for (uint8_t i = 0; i < 4; i++) if (crunchFnc[i]) { anyArmed = true; armedIdx = i; break; }
+                if (anyArmed) {
+                    static const char* kLegend[4][4][4] = {
+                        { {"OCT0","OCT1","OCT2","OCT3"}, {"INS8","INS9","IN10","IN11"},
+                          {"INS4","INS5","INS6","INS7"}, {"DRUM","SFX", "INS2","INS3"} },
+                        { {"MUTE","VOL","ODRV","SOLO"}, {"ENV1","ENV2","ENV3","LOOP"},
+                          {"ECHO","CHRD","WOOS","PTCH"}, {"NOFX","LOWP","RTRG","WOBB"} },
+                        { {"TRK1","TRK2","TRK3","TRK4"}, {"CLT1","CLT2","CLT3","CLT4"},
+                          {"PAT1","PAT2","PAT3","PAT4"}, {"CLP", "CLP", "CLP", "CLP" } },
+                        { {"LEN0","LEN1","LEN2","PLAY"}, {"BPM1","BPM2","BPM3","BPM4"},
+                          {"CPAT","PPAT","PALL","SAMP"}, {"XLEN","XLEN","HVOL","SONG"} },
+                    };
+                    oled.setFont(u8g2_font_6x10_tf);
+                    const int cellW = 32, cellH = 32, textX = 4, textY = 19;
+                    for (int gy = 0; gy < 4; gy++) for (int gx = 0; gx < 4; gx++) {
+                        oled.drawRFrame(gx * cellW, gy * cellH, cellW - 1, cellH - 1, 3);
+                        oled.drawStr(gx * cellW + textX, gy * cellH + textY, kLegend[armedIdx][gy][gx]);
+                    }
+                    if (s_displayTaskHandle) xTaskNotifyGive(s_displayTaskHandle);
+                    return;
+                }
+
+                // Main screen — ported from the user's own MothOS_GroovePadBox fork
+                // (ScreenManager::UpdateMainScreen, already adapted there for a 128x128
+                // panel): left column = context (instrument/track/octave/status), right
+                // column = a big step readout + pattern number + a blinking beat marker,
+                // bottom = one row per track with a VU meter.
+                const int splitX = 50, topBottomSplitY = 62;
+                oled.drawFrame(0, 0, 128, 128);
+                oled.drawLine(0, topBottomSplitY, 127, topBottomSplitY);
+                oled.drawLine(splitX, 0, splitX, topBottomSplitY);
+
+                oled.setFont(u8g2_font_6x13_tf);
+                oled.drawStr(4, 12, audioCrunchSlotName(crunchTrackInstrument[crunchSelectedTrack]));
+                snprintf(buf, sizeof(buf), "T%u", crunchSelectedTrack + 1);
+                oled.drawStr(4, 27, buf);
+                snprintf(buf, sizeof(buf), "O%d", crunchTrackOctave[crunchSelectedTrack]);
+                oled.drawStr(4, 41, buf);
+                if (crunchTrackMute[crunchSelectedTrack]) oled.drawStr(4, 55, "MUTE");
+                else if (crunchSolo == (int8_t)crunchSelectedTrack) oled.drawStr(4, 55, "SOLO");
+                else if (crunchSongMode) oled.drawStr(4, 55, "SONG");
+
+                if (!crunchPressedOnce) {
+                    snprintf(buf, sizeof(buf), "00/%02u", (unsigned)CRUNCH_STEPS);
+                } else {
+                    snprintf(buf, sizeof(buf), "%02u/%02u", crunchStep, (unsigned)CRUNCH_STEPS);
+                }
+                oled.setFont(u8g2_font_logisoso20_tf);
+                oled.drawStr(splitX + 2, 31, buf);
+                oled.setFont(u8g2_font_6x13_tf);
+                snprintf(buf, sizeof(buf), "P%u", crunchPattern + 1);
+                oled.drawStr(splitX + 2, 48, buf);
+                oled.setFont(u8g2_font_5x7_tf);
+                snprintf(buf, sizeof(buf), "%d BPM", bpm);  // P3 already drives this globally, see main.cpp:3129
+                oled.drawStr(splitX + 2, 59, buf);
+                {
+                    bool anyPeak = false;
+                    for (uint8_t t = 0; t < CRUNCH_TRACKS; t++) if (crunchVuLevel[t] >= 22) anyPeak = true;
+                    if (anyPeak) { oled.drawDisc(121, 10, 3); oled.setDrawColor(0); oled.drawDisc(121, 10, 1); oled.setDrawColor(1); }
+                }
+
+                static const char* kNoteNames[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+                const int rowH = 16;
+                for (uint8_t t = 0; t < CRUNCH_TRACKS; t++) {
+                    if (crunchVuLevel[t] > 0) crunchVuLevel[t]--;  // decay once per redraw (MothOS's own shape)
+                    int x0 = 2, y0 = 66 + t * rowH;
+                    bool selected = (crunchSelectedTrack == t);
+                    if (selected) { oled.drawBox(x0, y0, 124, rowH - 1); oled.setDrawColor(0); }
+                    else oled.drawFrame(x0, y0, 124, rowH - 1);
+
+                    oled.setFont(u8g2_font_6x13_tf);
+                    snprintf(buf, sizeof(buf), "T%u", t + 1);
+                    oled.drawStr(x0 + 4, y0 + 12, buf);
+
+                    oled.setFont(u8g2_font_5x7_tf);
+                    if (crunchLastNote[t] >= 0) {
+                        if (audioCrunchSlotIsBank(crunchTrackInstrument[t])) {
+                            // Bank slot: crunchLastNote[t] picked WHICH drum/sfx, not a pitch.
+                            strncpy(buf, audioDrumPadLabel(audioCrunchResolveSampleIndex(crunchTrackInstrument[t], (uint8_t)crunchLastNote[t])), sizeof(buf)-1);
+                            buf[sizeof(buf)-1] = '\0';
+                        } else {
+                            snprintf(buf, sizeof(buf), "%s%+d", kNoteNames[crunchLastNote[t] % 12], crunchTrackOctave[t]);
+                        }
+                        oled.drawStr(x0 + 24, y0 + 12, buf);
+                    } else {
+                        oled.drawStr(x0 + 24, y0 + 12, "--");
+                    }
+                    if (crunchPressedOnce && crunchNote[crunchPattern][t][crunchStep] > 0) oled.drawDisc(x0 + 52, y0 + 8, 2);
+                    if (crunchTrackMute[t]) oled.drawStr(x0 + 58, y0 + 12, "M");
+
+                    int meterWidth = crunchVuLevel[t] * 3; if (meterWidth > 60) meterWidth = 60;
+                    oled.drawFrame(x0 + 68, y0 + 4, 54, 8);
+                    if (meterWidth > 0) oled.drawBox(x0 + 69, y0 + 5, meterWidth, 6);
+
+                    if (selected) oled.setDrawColor(1);
+                }
                 break;
             }
             // ---- SYSEQ — 16-step polyphonic synth sequencer ----
@@ -7542,6 +8552,100 @@ void drawScreen(bool blockWait) {
                 oled.drawStr(2, 112, bot);
                 break;
             }
+            case MODE_NOOB: {
+                oled.setFont(u8g2_font_4x6_tf);
+                char hdr[32];
+                snprintf(hdr, sizeof(hdr), "%sNOOB > %s", nooPaused?"[||] ":"",
+                         shapeNames[nooVoice % SHAPE_COUNT]);
+                oled.drawStr(0, 6, hdr);
+                char hdr2[32];
+                snprintf(hdr2, sizeof(hdr2), "BPM:%d Oct:%d", bpm, noteMap.getOctave());
+                oled.drawStr(0, 13, hdr2);
+
+                // Scale readout: row=mood, column=root note picked on the key grid (see the
+                // key-grid handler) — one key press selects the whole scale outright.
+                {
+                    char scaleBuf[24];
+                    snprintf(scaleBuf, sizeof(scaleBuf), "Gamme: %s %s",
+                             kNooNoteNames[nooScaleRootSemi], kNooVariationNames[nooScaleVariation]);
+                    oled.drawStr(4, 20, scaleBuf);
+                }
+
+                // Piano roll: reads nooHistory[] oldest-to-newest, LEFT-TO-RIGHT (rightmost
+                // column = the event that just played) — there's no fixed loop position
+                // anymore (see nooHistory's own comment), so this is a scrolling "recent
+                // history" strip, not a playhead sweeping a bar. Height = pitch (higher
+                // degree = higher on screen); an empty column is a rest, a bar is a note —
+                // possibly several stacked bars for a chord event. A light staff frame marks
+                // the boundary (no center-pitch line — removed per the user's own report,
+                // it wasn't useful/pretty against the bars).
+                //
+                // Column WIDTH and bar WIDTH both visualize rhythm's effect (reported as
+                // otherwise invisible on this screen): column width is proportional to that
+                // event's own gapMult (how much later/earlier than nominal it actually
+                // arrived — see gapMult's own comment), so irregular placement reads as
+                // visibly irregular column spacing, collapsing back to 8 equal columns at
+                // rhythm=0 (every gapMult is exactly 1.0 there). Bar width is proportional
+                // to the CURRENT gate length (duration) — longer gate (higher rhythm) reads
+                // as a visibly wider bar, clamped to its own column so it never overflows
+                // the frame even though the underlying gate can audibly outlast one event's
+                // gap (that's the overlap/polyphony the gate length formula intentionally
+                // allows — see the 10ms tick block).
+                const int rollX = 4, rollY = 24, rollW = 120, rollH = 54;
+                oled.drawFrame(rollX, rollY, rollW, rollH);
+                float gapW[8], sumGapW = 0.0f;
+                for (int c = 0; c < KBD_COLS; c++) {
+                    gapW[c] = constrain(nooHistory[(nooHistoryPos + c) % 8].gapMult, 0.15f, 1.85f);
+                    sumGapW += gapW[c];
+                }
+                float gateFrac = 0.15f + 2.35f * nooRhythm;  // same formula the tick block uses for actual note duration
+                int xCursor = rollX;
+                for (int c = 0; c < KBD_COLS; c++) {
+                    const NooEvent& e = nooHistory[(nooHistoryPos + c) % 8];
+                    bool isNewest = (c == KBD_COLS - 1);
+                    int x = xCursor;
+                    int colW = isNewest ? (rollX + rollW - xCursor)  // last column absorbs any rounding remainder
+                                        : (int)(rollW * gapW[c] / sumGapW + 0.5f);
+                    xCursor += colW;
+                    if (colW < 2) continue;  // defensively skip an unusably narrow column
+                    if (isNewest) oled.drawBox(x, rollY, colW, rollH);  // just-played column, inverted
+                    if (isNewest) oled.setDrawColor(0);  // punch through the inverted box
+                    int barMax = colW > 2 ? colW - 1 : colW;
+                    int barW = constrain((int)(colW * gateFrac), 1, barMax);
+                    for (uint8_t k = 0; k < e.noteCount; k++) {
+                        float t = (e.degree[k] + 14.0f) / 28.0f;  // 0..1, higher degree = higher pitch
+                        int barY = rollY + 2 + (int)((1.0f - t) * (rollH - 8));
+                        oled.drawBox(x + 1, barY, barW, 3);
+                    }
+                    if (isNewest) oled.setDrawColor(1);
+                }
+
+                // Parameter sliders — one row per pot (P4-P7): track+fill bar shows each
+                // value at a glance (same drawFrame+drawBox idiom as MODE_LANIM's own 4-pot
+                // rows), pot number kept in the label since the abbreviations alone weren't
+                // clear enough on their own, percentage kept alongside the bar since these
+                // values meaningfully change the generative behavior and are worth reading
+                // precisely, not just at a glance.
+                {
+                    static const char* kNooParamLabel[4] = { "P4 Dens", "P5 Rytm", "P6 Form", "P7 Evol" };
+                    const float nooParamVal[4] = { nooDensity, nooRhythm, nooShape, nooVariation };
+                    const int sx = 34, sw = 64, sh = 6, sy0 = 79, pitch = 7;
+                    for (int i = 0; i < 4; i++) {
+                        int rowY = sy0 + i * pitch;
+                        oled.drawStr(0, rowY + 5, kNooParamLabel[i]);
+                        int fw = (int)(nooParamVal[i] * sw);
+                        if (fw > 0) oled.drawBox(sx, rowY, fw, sh);
+                        oled.drawFrame(sx, rowY, sw, sh);
+                        char pctBuf[6];
+                        snprintf(pctBuf, sizeof(pctBuf), "%d%%", (int)(nooParamVal[i] * 100.0f));
+                        oled.drawStr(sx + sw + 4, rowY + 5, pctBuf);
+                    }
+                }
+
+                oled.drawStr(2, 113, "B1:Play/Pause B2:Oct key=gamme");
+                oled.drawStr(2, 121, "B3:FX");
+                break;
+            }
             case MODE_303S2: {
                 static const char* s2nn[]={"C","c","D","d","E","F","f","G","g","A","a","B"};
                 const char* s2wname = t303WaveName(t303Wave);
@@ -8369,6 +9473,35 @@ static void updateLedsAndShow()
                 }
                 break;
             }
+            case MODE_NOOB: {
+                // Hue varies PER COLUMN by that event's own pitch (degree[0]) — a rainbow
+                // across the 8 recent events — instead of one flat voice-wide hue: at high
+                // density most/all columns are active, and a single constant hue for all of
+                // them read as a uniform, uninformative wash (reported as "not pretty").
+                // Voice is still shown via the OLED header text, so nothing is lost by
+                // dropping the (previously constant, so not very informative anyway)
+                // voice-hue mapping. Each column reads nooHistory[] oldest-to-newest (same
+                // "recent history" reindex as the OLED piano roll, see its own comment —
+                // there's no fixed loop position anymore), rightmost column (most recently
+                // played) brighter still — no manual-held notes here (the grid is a
+                // read-only visualization, see the key-grid handler).
+                for (int r=0;r<KBD_NOTE_ROWS;r++) for (int c=0;c<KBD_COLS;c++) {
+                    // gc=c (NOT the KBD_COLS-1-c flip every other mode's LED case uses) — this
+                    // grid is a read-only step-time visualization, not a physical key layout,
+                    // so it should sweep left-to-right in step order, matching the OLED piano
+                    // roll's own left-to-right sweep (per the user's own report that the two
+                    // displays disagreeing on direction was confusing).
+                    int gr=KBD_ROWS-1-r, gc=c, idx=gr*KBD_COLS+gc;
+                    int li=(idx>=0&&idx<NUM_LEDS+4)?crdToIdx(idx,0):-1;
+                    if (li<0||li>=NUM_LEDS) continue;
+                    const NooEvent& e = nooHistory[(nooHistoryPos + c) % 8];
+                    bool newest = (c == KBD_COLS - 1);
+                    uint8_t bri = newest ? 255 : (e.active ? 140 : 10);
+                    uint8_t hue = e.active ? (uint8_t)(((int)(e.degree[0] + 14) * 256) / 28) : 0;
+                    leds[li] = CHSV(hue, 220, bri);
+                }
+                break;
+            }
             case MODE_DR2: {
                 // Left half (cols 4-7) = sequencer: row0=beat, row1=step (bright=touched
                 // last, mid=in multi-select batch, dim=has hits for the focused instrument,
@@ -8518,6 +9651,23 @@ static void updateLedsAndShow()
                 }
                 break;
             }
+            case MODE_EUCLI: {
+                // Row = lane (flipped, 3-row — see handleNoteKeyAudio's MODE_EUCLI case),
+                // column = which step-count palette entry is currently selected for that
+                // lane (column indexes kEucliStepOptions[] directly, no left/right flip).
+                for (int r=0;r<KBD_NOTE_ROWS;r++) for (int c=0;c<KBD_COLS;c++) {
+                    int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
+                    if (idx<0||idx>=NUM_LEDS+4) continue;
+                    int li=crdToIdx(idx,0);
+                    if (li<0||li>=NUM_LEDS) continue;
+                    if (r >= EUCLI_LANES) { leds[li]=CRGB::Black; continue; }
+                    uint8_t lane = (uint8_t)(EUCLI_LANES - 1 - r);
+                    uint8_t hue = (uint8_t)(lane * 64);  // distinct hue per lane
+                    bool selected = (kEucliStepOptions[c] == euSteps[lane]);
+                    leds[li] = selected ? CHSV(hue,255,220) : CHSV(hue,120,14);
+                }
+                break;
+            }
             default:
                 for(int r=0;r<KBD_NOTE_ROWS;r++) for(int c=0;c<KBD_COLS;c++){
                     int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
@@ -8629,31 +9779,6 @@ static void ledUpdateTask(void*)
     }
 }
 
-// ==================== STATS TASK ====================
-static volatile uint32_t s_mainLoopCount = 0;  // incremented each loop() iteration
-
-// Prints system health to Serial every second: temperature, heap, keyboard and main-loop stats.
-// Runs at priority 1 on Core 0 — only executes when everything else is idle.
-static void statsTask(void*)
-{
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-
-        float    temp  = temperatureRead();
-        uint32_t freeH = esp_get_free_heap_size();
-        uint32_t minH  = esp_get_minimum_free_heap_size();
-
-        uint32_t kbdPolls = 0, kbdMaxIv = 0;
-        kbdGetStats(kbdPolls, kbdMaxIv);
-
-        uint32_t loopHz = s_mainLoopCount;
-        s_mainLoopCount = 0;
-
-        Serial.printf("[SYS] %.0f°C  heap=%lu(min=%lu)  kbd=%lu/s maxIv=%lums  loop=%lu/s\n",
-                      temp, freeH, minH, kbdPolls, kbdMaxIv, loopHz);
-    }
-}
-
 // ==================== AUDIO EVENT BRIDGE ====================
 // kbdEventBridge runs on Core 0 (kbdPollTask, priority 8).
 // It only enqueues the event and wakes the LED task — no AMY calls here.
@@ -8738,7 +9863,7 @@ static bool notePreviewSafeDuringFxOverlay() {
     switch (currentMode) {
         case MODE_SYNTH: case MODE_STONE: case MODE_OMNI: case MODE_SAMPLE:
         case MODE_I303:  case MODE_MOD2:  case MODE_MODULAR: case MODE_GRANULAR2:
-        case MODE_POKEMON:
+        case MODE_POKEMON: case MODE_CRUNCH:
             return true;
         case MODE_DRUM2: return drum2View != 1;   // PAD/ANIM views preview; SEQ view edits steps
         case MODE_303S:  return !s303SeqView;      // PAD view previews; SEQ view edits steps
@@ -8834,6 +9959,72 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                 if (fxList[0].active) applyFxEffect(0);
             } else {
                 audioStoneNoteOff(note);
+            }
+            break;
+        }
+        case MODE_CRUNCH:{
+            // Literal port of MothOS's own InputManager: the 4x8 grid stands in for
+            // MothOS's 4x4 keypad (16 keys: 4 sticky shift keys M/N/O/P + 12 note/command
+            // keys A-L), using the SAME row/column mapping technique the user already
+            // validated in their own MothOS_GroovePadBox fork — physical top row (row==3)
+            // is the 4 shift keys, columns mirror in halves, rows 2/1/0 are the 12 note
+            // keys (I-L/E-H/A-D, val=row*4+colInLogical = 0-11). No key-release behavior —
+            // original MothOS has none either (fire-and-forget percussive triggers, no
+            // held-note sustain), so this ignores `pressed==false` entirely.
+            // col0 is the RIGHTMOST physical key in this codebase's convention (col7 is
+            // leftmost — see OMNI's own "col0(right)..col7(left)" comment), so a plain
+            // `col%4` would make the logical column DESCEND left-to-right while the
+            // on-screen legend/browser draw it ASCENDING — a visible mirror between the
+            // screen and the keys. `3-(col%4)` makes it ascend left-to-right on the keys
+            // too, matching the screen.
+            if (!pressed) break;
+            uint8_t colInLogical = (uint8_t)(3 - (col % 4));
+            bool anyArmed = false; uint8_t armedIdx = 0;
+            for (uint8_t i = 0; i < 4; i++) if (crunchFnc[i]) { anyArmed = true; armedIdx = i; break; }
+            if (row == 3) {
+                // Shift key (M,N,O,P = index 0-3). If another shift is already armed, this
+                // press is itself the argument (val 0-3) for that armed shift — mirrors
+                // InputManager::ProcessFunctionClick's own "consume, don't arm" branch.
+                if (anyArmed) {
+                    for (uint8_t i = 0; i < 4; i++) crunchFnc[i] = false;
+                    switch (armedIdx) {
+                        case 0: crunchDispatchCommand('O', colInLogical); break;
+                        case 1: crunchDispatchCommand('V', colInLogical); break;
+                        case 2: crunchDispatchCommand('T', colInLogical); break;
+                        case 3: crunchDispatchCommand(colInLogical == 3 ? 'P' : 'L', colInLogical); break;
+                    }
+                } else {
+                    for (uint8_t i = 0; i < 4; i++) crunchFnc[i] = false;
+                    crunchFnc[colInLogical] = true;
+                }
+            } else {
+                uint8_t val = (uint8_t)(row * 4 + colInLogical);  // 0-11
+                if (anyArmed) {
+                    for (uint8_t i = 0; i < 4; i++) crunchFnc[i] = false;
+                    switch (armedIdx) {
+                        case 0: crunchDispatchCommand('I', val); break;
+                        case 1:
+                            if (val < 4) crunchDispatchCommand('A', val);
+                            else if (val < 8) crunchDispatchCommand('D', (uint8_t)(val - 4));
+                            else crunchDispatchCommand('E', (uint8_t)(val - 8));
+                            break;
+                        case 2:
+                            if (val < 4) crunchDispatchCommand('#', val);
+                            else if (val < 8) crunchDispatchCommand('$', (uint8_t)(val - 4));
+                            else crunchDispatchCommand('^', (uint8_t)(val - 8));
+                            break;
+                        case 3:
+                            if (val < 4) crunchDispatchCommand(val < 2 ? 'X' : (val == 2 ? 'H' : 'C'), val);
+                            else if (val < 8) crunchDispatchCommand('*', (uint8_t)(val - 4));
+                            else crunchDispatchCommand('B', (uint8_t)(val - 8));
+                            break;
+                    }
+                } else {
+                    crunchDispatchCommand('N', val);
+                    // Same re-assert-on-trigger as STONE above: a retriggered oscillator
+                    // can carry stale filter state from whatever FILT last set on it.
+                    if (fxList[0].active) applyFxEffect(0);
+                }
             }
             break;
         }
@@ -9243,6 +10434,24 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                 }
             }
             grvRecomputeActivePatFilled();
+            break;
+        }
+        case MODE_EUCLI: {
+            // Row = lane (0-3), column = a one-of-8 step-count palette pick (NOT a timeline
+            // step placement like every other grid-editing mode above) — kEucliStepOptions[]
+            // has exactly KBD_COLS=8 entries by design, so a single press fully selects that
+            // lane's step count. Re-clamps the pulse count and rebuilds the pattern, and
+            // resets that lane's own playhead (its old position may be out of range now).
+            // Row is flipped (3-row): lane0 is drawn as the TOP bar / innermost ring on
+            // screen, so it must be the physically TOP key row, not the bottom one — fixes
+            // the reported top/bottom mismatch between the keyboard rows and the display.
+            if (!pressed || row >= EUCLI_LANES || col >= 8) break;
+            uint8_t lane = (uint8_t)(EUCLI_LANES - 1 - row);
+            euSteps[lane] = kEucliStepOptions[col];
+            euPulses[lane] = (uint8_t)constrain((int)euPulses[lane], 0, (int)euSteps[lane]);
+            eucliRebuildPattern(euPattern[lane], euSteps[lane], euPulses[lane]);
+            euPlayhead[lane] = 0;
+            euLastStepMs[lane] = millis();
             break;
         }
         case MODE_303S: {
@@ -9713,6 +10922,7 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     } else {
                         audioLoadDJTrack(buildSdFilePath().c_str());
                         djBrowsing = false;
+                        djAutoPlayPending = true;  // start playing as soon as the (async) load finishes
                     }
                 }
             } else if (audioDJIsLoaded()) {
@@ -9749,6 +10959,18 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                 uint8_t note = genComputeNote(col, (uint8_t)(genOctave + row));
                 activeNotes[row][col] = pressed ? note : 0;
                 if (audioReady) { if (pressed) audioNoteOn(note, 0.8f*volume); else audioNoteOff(note); }
+            }
+            break;
+        case MODE_NOOB:
+            // One key = one whole scale: row picks the mood (kNooVariationNames), column
+            // picks the root note (0-7, C..G) — live, regenerating the pattern immediately
+            // so the change is audible right away. Grid stays read-only for VISUALIZATION
+            // otherwise (see updateLedsAndShow()'s case) — this is a select gesture, not
+            // note-preview.
+            if (pressed) {
+                nooScaleVariation = (uint8_t)row;
+                nooScaleRootSemi  = (uint8_t)col;
+                nooReseed();
             }
             break;
         case MODE_MIDI: {
@@ -10046,9 +11268,23 @@ void setup() {
     setupOled();
     joystickCalibration();
     SPI.begin(SD_SCLK,SD_MISO,SD_MOSI);
-    if(SD.begin(SD_CS,SPI,20000000)){sdReady=true; Serial.println("SD OK");}
+    if(SD.begin(SD_CS,SPI,SD_SPI_HZ)){
+        sdReady=true; Serial.println("SD OK");
+    }
+#if CONFIG_TINYUSB_MSC_ENABLED
+    // Registered even when no card is present at boot — msc.begin() (needs the real card
+    // geometry, and returns false without these callbacks) is redone at every MODE_USB entry.
+    msc.vendorID("GrvEP");
+    msc.productID("SD Card");
+    msc.productRevision("1.0");
+    msc.onRead(usbMscRead);
+    msc.onWrite(usbMscWrite);
+    msc.onStartStop(usbMscStartStop);
+    msc.mediaPresent(false);
+#endif
 
     audioInit();
+    audioStreamWorkersInit();
     s_audioEventQueue = xQueueCreate(16, sizeof(KeyEvent));
     s_noteDirectQueue = xQueueCreate(16, sizeof(NoteEvent));
     setNoteKeyCallback(kbdEventBridge);
@@ -10057,7 +11293,6 @@ void setup() {
     xSemaphoreGive(s_oledDone); // pre-give: first drawScreen can start immediately
     xTaskCreatePinnedToCore(audioHandlerTask, "audioHdlr", 8192, nullptr, 22, &s_audioHandlerHandle, 0);
     xTaskCreatePinnedToCore(ledUpdateTask,    "led",       3072, nullptr,  4, nullptr, 0);
-    xTaskCreatePinnedToCore(statsTask,        "stats",     4096, nullptr,  1, nullptr, 0);
     xTaskCreatePinnedToCore(displayTask,      "disp",      2048, nullptr,  3, &s_displayTaskHandle, 0);
 
 #if CONFIG_TINYUSB_MIDI_ENABLED
@@ -10087,8 +11322,16 @@ void setup() {
 
 // ==================== LOOP ====================
 void loop() {
-    s_mainLoopCount++;
     amy_update();
+    // Both ticks can trigger background SD reads (grain decode, .pcm16 cache building) —
+    // must stay fully silent for the whole MODE_USB session, not just skipped once at entry
+    // (see usbMscTryEnter()'s own comment).
+    if (currentMode == MODE_USB) usbMscPoll();
+    if (!usbMscActive) {
+        audioDJTick();  // chunk-boundary prefetch/handoff — unconditional, not tied to MODE_DJ's UI being on-screen (see audioDJTick()'s own comment)
+        if (djAutoPlayPending && audioDJIsLoaded()) { djAutoPlayPending = false; audioDJPlayPause(true); }
+        audioSSTick();  // same, for SS2/SAMPLE's large-sample streaming voice
+    }
 
 #ifndef SIMULATOR
     // ---- SD CARD HOT-SWAP DETECTION ----
@@ -10101,10 +11344,26 @@ void loop() {
     // with an in-flight background sample load from bgServiceTask.
     {
         static uint32_t lastSdCheck = 0;
+        // While the card stays absent, each retry attempt calls SD.begin() -> f_mount(),
+        // which logs its own noisy driver-level error lines on every single failure
+        // (sd_diskio.cpp's "f_mount failed"/"Select Failed") — fine once, but at a fixed 1s
+        // cadence it reads as an infinite error loop for as long as the card stays out.
+        // Back off progressively (capped at 5s) instead, so a prolonged absence stays quiet;
+        // reset to 1s the moment the card is either present or freshly lost, so removal/
+        // reinsertion both stay promptly detected.
+        static uint32_t sdRetryIntervalMs = 1000;
         uint32_t nowSd = millis();
-        if (nowSd - lastSdCheck > 1000 && audioIsStreamingDone()) {
+        // Skip entirely while MODE_USB has the card exposed raw to the host — this probe's
+        // own SD.open("/") is exactly the kind of app-side FatFs access that mode requires
+        // nothing else ever does (see MODE_USB's own state-block comment).
+        // Also skipped while a stream is playing: this SD.open() runs on the loop task, which is the
+        // one driving audio (amy_update), and contends with the stream's own SD reads for the SPI
+        // bus — blocking here long enough is heard as a dropout every time the two collide.
+        if (!usbMscActive && !audioDJStreamActive() && !audioSSStreamActive()
+            && nowSd - lastSdCheck > sdRetryIntervalMs && audioIsStreamingDone()) {
             lastSdCheck = nowSd;
             if (sdReady) {
+                sdRetryIntervalMs = 1000;
                 // Cheap real I/O probe — fails immediately once the card is physically gone.
                 File f = SD.open("/");
                 if (f) {
@@ -10113,11 +11372,25 @@ void loop() {
                     sdReady = false;
                     SD.end();  // reset _pdrv so a later begin() actually re-probes
                     Serial.println("SD: card lost");
+                    // Anything reading live from the card (DJ/SS2 streaming, an in-progress
+                    // SD browse) is about to fail anyway with no card left to read from —
+                    // stop it and bounce back to the main menu instead of leaving the user on
+                    // a screen that silently stopped working. audioDJPlayPause/
+                    // audioStopAllSamples only touch already-decoded PSRAM/oscillator state,
+                    // no further SD access, so they're safe to call with the card already gone.
+                    audioDJPlayPause(false);
+                    audioStopAllSamples();
+                    audioAllNotesOff();
+                    menuOpen = true; menuRow = 0; menuCol = 0; menuOnTabBar = true;
+                    sdLostMsgUntil = nowSd + 2500;
                 }
-            } else if (SD.begin(SD_CS, SPI, 20000000)) {
+            } else if (SD.begin(SD_CS, SPI, SD_SPI_HZ)) {
                 sdReady = true;
+                sdRetryIntervalMs = 1000;
                 Serial.println("SD: card detected");
                 sdListDir(sdPath.length() > 1 ? sdPath.c_str() : "/");
+            } else {
+                sdRetryIntervalMs = min(sdRetryIntervalMs + 500, (uint32_t)5000);
             }
         }
     }
@@ -10215,11 +11488,16 @@ void loop() {
             gestDrillReturn=true;
             switchMode(MODE_GEST);
             joyLongFired=true;
-        } else if (s_overlay == OVERLAY_INSTR) {
+        } else if (s_overlay == OVERLAY_INSTR || s_overlay == OVERLAY_CRUNCH) {
             s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
             joyLongFired = true;
         } else if (menuOpen) {
             selectMenuItem();
+            joyLongFired = true;
+        } else if (currentMode==MODE_CRUNCH) {
+            // Natural pairing with "joystick X selects a track": clicking it mutes/
+            // unmutes whichever track is currently selected.
+            crunchTrackMute[crunchSelectedTrack] = !crunchTrackMute[crunchSelectedTrack];
             joyLongFired = true;
         } else if (currentMode==MODE_GRANULAR2 && sdReady) {
             if(sdCursor<sdFileCount){
@@ -10397,7 +11675,13 @@ void loop() {
                 } else {
                     audioLoadDJTrack(buildSdFilePath().c_str());
                     djBrowsing = false;
+                    djAutoPlayPending = true;  // start playing as soon as the (async) load finishes
                 }
+            } else if (!djBrowsing && audioDJIsLoaded()) {
+                // Stutter/glitch: press-and-hold freezes the playhead and loops a short
+                // BPM-synced window (see audioDJStutterStart()'s own comment) — release below
+                // (the existing !click reset block) resumes from the frozen position.
+                audioDJStutterStart((float)bpm);
             }
             joyLongFired = true;
         } else {
@@ -10407,6 +11691,7 @@ void loop() {
         }
     }
 
+    if (!click && lastClick && currentMode==MODE_DJ && !djBrowsing) audioDJStutterEnd();
     if (!click) { joyClickMs = 0; joyLongFired = false; joyBrwActed = false; }
     lastClick=click;
 
@@ -10639,23 +11924,34 @@ void loop() {
                     if (ss2PlayMode == 1) audioStopAllSamples();  // OVR: cut all before playing
                     for (uint8_t slot=0; slot<SS2_SLOTS; slot++) {
                         if (!(s2mask & (1u << slot))) continue;
-                        ss2Loaded[slot] = audioKeyLoaded((uint8_t)(SS2_KEY_BASE + slot));
+                        uint8_t keyIdx = (uint8_t)(SS2_KEY_BASE + slot);
+                        ss2Loaded[slot] = audioKeyLoaded(keyIdx);
                         if (!ss2Loaded[slot]) continue;
                         float ss2v = 0.7f * gestSeqVol[3];
-                        if (alt == 1) {  // REV
-                            audioPlayKeyRev((uint8_t)(SS2_KEY_BASE + slot), ss2v);
+                        bool large = audioKeyIsLarge(keyIdx);
+                        if (alt == 1) {  // REV: always cuts and restarts, like NRM
+                            if (large) audioPlayKeyStreamed(keyIdx, /*reverse=*/true, ss2v);
+                            else       audioPlayKeyRev(keyIdx, ss2v);
                             ss2LastPlayMs[slot] = millis();
                             ss2CurSlot = slot;
                         } else if (alt == 2) {  // FUL: no retrigger while sample running
-                            uint32_t dur = audioKeyLengthMs((uint8_t)(SS2_KEY_BASE + slot));
-                            uint32_t ela = (uint32_t)(millis() - ss2LastPlayMs[slot]);
-                            if (dur == 0 || ela >= dur || ss2LastPlayMs[slot] == 0) {
-                                audioPlayKey((uint8_t)(SS2_KEY_BASE + slot), ss2v);
+                            bool stillPlaying;
+                            if (large) {
+                                stillPlaying = audioKeyStreamStillPlaying(keyIdx);
+                            } else {
+                                uint32_t dur = audioKeyLengthMs(keyIdx);
+                                uint32_t ela = (uint32_t)(millis() - ss2LastPlayMs[slot]);
+                                stillPlaying = dur != 0 && ela < dur && ss2LastPlayMs[slot] != 0;
+                            }
+                            if (!stillPlaying) {
+                                if (large) audioPlayKeyStreamed(keyIdx, /*reverse=*/false, ss2v);
+                                else       audioPlayKey(keyIdx, ss2v);
                                 ss2LastPlayMs[slot] = millis();
                             }
                             ss2CurSlot = slot;
                         } else {  // NRM
-                            audioPlayKey((uint8_t)(SS2_KEY_BASE + slot), ss2v);
+                            if (large) audioPlayKeyStreamed(keyIdx, /*reverse=*/false, ss2v);
+                            else       audioPlayKey(keyIdx, ss2v);
                             ss2LastPlayMs[slot] = millis();
                             ss2CurSlot = slot;
                         }
@@ -10880,6 +12176,21 @@ void loop() {
         }
     }
 
+    // CRUNCH: joystick X cycles the selected/armed track — same arm/debounce idiom as
+    // GROOVE's own grvFocusTrack cycling above (same physical gesture, same code shape).
+    if (currentMode == MODE_CRUNCH && !menuOpen) {
+        static unsigned long crunchJxMs = 0;
+        static bool crunchJxArm = false;
+        float jx = cachedJoyX / 64.0f;
+        unsigned long now = millis();
+        bool jxH = (fabsf(jx) > 0.45f);
+        if (!jxH) crunchJxArm = false;
+        if (jxH && (!crunchJxArm || now - crunchJxMs >= 300)) {
+            crunchSelectedTrack = (uint8_t)((crunchSelectedTrack + (jx > 0 ? 1 : CRUNCH_TRACKS - 1)) % CRUNCH_TRACKS);
+            crunchJxMs = now; crunchJxArm = true;
+        }
+    }
+
     // ---- SAMPLE SEQUENCER ----
     if(seqPlaying){
         static unsigned long lastSeqStep=0;
@@ -11054,6 +12365,20 @@ void loop() {
                     expArpNextMs = millis() + arpInterval;
                 }
             }
+        }
+
+        // ==================== DJ dynamic/experimental controls (10ms tick) ====================
+        // Joystick X = scratch, joystick Y = granular spray amount — always live once a track
+        // is loaded and playing in the DJ play view (inert at rest: centered = no scratch,
+        // amount 0 = no grains). See audioDJScratchNudge()/audioDJSetGrainAmount() in
+        // audio_engine.cpp for the mechanics; the joystick-click stutter/glitch control is
+        // handled separately, in the JOYSTICK CLICK block above (press/release edges).
+        if (currentMode==MODE_DJ && !djBrowsing && audioReady && audioDJIsLoaded() && !menuOpen) {
+            float jx = constrain(cachedJoyX/64.0f, -1.0f, 1.0f);
+            float jy = constrain(cachedJoyY/64.0f, -1.0f, 1.0f);
+            if (fabsf(jx) > DJ_SCRATCH_DEADZONE) audioDJScratchNudge(jx);
+            else audioDJScratchEnd();
+            audioDJSetGrainAmount(fmaxf(0.0f, jy));
         }
 
         // ==================== EXP2 PHYSICS (10ms tick) ====================
@@ -11363,6 +12688,75 @@ void loop() {
             }
         }
 
+        // ==================== NOOB (10ms tick) ====================
+        // Free-running event stream — NOT a fixed step grid (an earlier version swung ±35%
+        // around 8 evenly-spaced slots; per the user's own explicit choice, rhythm now needs
+        // far more range than a mild swing could ever give, so the fixed grid is gone
+        // entirely). Each event: decide fresh-vs-repeat (nooVariation), play it if active,
+        // then schedule the NEXT event's gap with a rhythm-driven random multiplier — at
+        // nooRhythm=0 that multiplier is always ~1.0 (regular pulse); at nooRhythm=1 it
+        // ranges ~0.15x-1.85x the nominal gap, SYMMETRIC around 1.0 so the average tempo
+        // never drifts with rhythm (only the irregularity does — see this block's own
+        // comment at the placement line for why an earlier asymmetric range was a real bug,
+        // not just a false impression, on real hardware).
+        // Polyphonic: nooTriggerVoice() can hold several notes at once, and a long gate can
+        // outlast its own event's gap, naturally overlapping the next event's notes.
+        if (currentMode==MODE_NOOB && audioReady) {
+            uint32_t nowExpire = millis();
+            for (uint8_t v = 0; v < NOO_POLY_MAX; v++)
+                if (nooVoices[v].note != 0xFF && (int32_t)(nowExpire - nooVoices[v].offAtMs) >= 0) {
+                    audioNoteOff(nooVoices[v].note);
+                    nooVoices[v].note = 0xFF;
+                }
+        }
+        if (currentMode==MODE_NOOB && !menuOpen && !nooPaused) {
+            uint32_t nowN = millis();
+            if ((int32_t)(nowN - nooNextEventAtMs) >= 0) {
+                // nooHistory[nooHistoryPos] is the OLDEST of the rolling 8 — either
+                // regenerate it fresh (nooVariation chance) or leave it as-is, which
+                // replays exactly what played 8 events ago (see nooHistory's own comment).
+                NooEvent& slot = nooHistory[nooHistoryPos];
+                if (((float)random(0, 1000) / 1000.0f) < nooVariation) nooGenerateEvent(slot);
+                slot.gapMult = nooPendingGapMult;  // how irregular THIS event's own arrival was — see gapMult's own comment
+                nooHistoryPos = (uint8_t)((nooHistoryPos + 1) % 8);
+
+                float baseMs = constrain(60000.0f / (float)bpm * NOO_EVENT_BASE_SUBDIV, 40.0f, 2000.0f);
+                if (slot.active && audioReady) {
+                    float gateFrac = 0.15f + 2.35f * nooRhythm;
+                    uint32_t gateMs = (uint32_t)(baseMs * gateFrac);
+                    for (uint8_t k = 0; k < slot.noteCount; k++) {
+                        uint8_t note = nooMidiNoteForDegree((int)NOO_DEGREE_CENTER + slot.degree[k]);
+                        nooTriggerVoice(note, nowN + gateMs);
+                    }
+                }
+                // Placement: gap until the next event widens from "always exactly baseMs"
+                // at rhythm=0 to "anywhere from 0.15x to 1.85x baseMs" at rhythm=1 — a
+                // SYMMETRIC range around 1.0 (both bounds move by the same amount,
+                // 1-0.85*rhythm .. 1+0.85*rhythm), not the asymmetric 0.15x-4x range this
+                // originally shipped with. That asymmetry meant the AVERAGE gap (the
+                // midpoint of the range) drifted from 1.0x at rhythm=0 up to ~2.1x at
+                // rhythm=1 — i.e. turning rhythm up made the whole pattern noticeably
+                // slower ON AVERAGE, which is exactly "rhythm affecting speed" again,
+                // just averaged over many events instead of a fixed per-step multiplier —
+                // reported as still-not-fixed on real hardware. A range symmetric around
+                // 1.0 keeps the mean gap at baseMs regardless of rhythm — only the spread
+                // (irregularity) grows, never the average tempo.
+                float spread = nooRhythm * 0.85f;
+                float mult = 1.0f - spread + ((float)random(0, 1000) / 1000.0f) * (2.0f * spread);
+                nooNextEventAtMs = nowN + (uint32_t)(baseMs * mult);
+                nooPendingGapMult = mult;  // stashed for whichever event this schedules — see gapMult's own comment
+            }
+        }
+
+        // EUCLI's own dedicated clock (NOT the shared drum2Playing clock — see this repo's own
+        // documented reason at the GROOVE/DR2 clocks: sharing it would audibly collide with
+        // whatever DRUM2/SYSEQ/etc. still has loaded in the background). Deliberately only
+        // ticks while MODE_EUCLI is on-screen (unlike DRUM2/GROOVE's clocks, which keep
+        // running in the background) — simpler and avoids a surprising "still playing after
+        // I left the mode" behavior for a mode this performance-oriented.
+        if (currentMode==MODE_EUCLI) eucliTick();
+        if (currentMode==MODE_CRUNCH) crunchTick();
+
         readPots();
         s_battVSmooth += (muxCache[1] / 4095.0f * 10.4f - s_battVSmooth) * 0.05f;
 
@@ -11598,7 +12992,7 @@ void loop() {
                     // the pot's travel sits in the musically useful 0.5x-2x range, with the
                     // extremes (0.25x/4x) reachable at the very ends. Pots 3-6 (P4-P7) =
                     // active FX params, same convention as every other instrument mode.
-                    if (!djBrowsing && audioDJIsLoaded() && fabsf(pots[1].value - djLastP1) > 0.003f) {
+                    if (!djBrowsing && audioDJIsLoaded() && fabsf(pots[1].value - djLastP1) > 0.006f) {
                         djLastP1 = pots[1].value;
                         audioDJSetSpeed(0.25f * powf(16.0f, pots[1].value));
                     }
@@ -12088,6 +13482,104 @@ void loop() {
                     }
                     break;
                 }
+                case MODE_EUCLI: {
+                    // FX overlay open: P4-P7 belong to the active FX's own params instead
+                    // of EUCLI's own pulse controls — same established pattern as
+                    // DR2/DRUM2/GROOVE above.
+                    static float lpEuFx[4] = {-1.f,-1.f,-1.f,-1.f};
+                    static uint8_t lpEuFxSel = 0xFF;
+                    bool anyFxActive = false;
+                    for (int f=0;f<FX_COUNT;f++) if(fxList[f].active){anyFxActive=true;break;}
+                    if (anyFxActive) {
+                        if (lpEuFxSel != fxSelected || fxPotNeedSync) {
+                            for (int p=0;p<4;p++) lpEuFx[p]=pots[3+p].value;
+                            lpEuFxSel=fxSelected; fxPotNeedSync=false;
+                        }
+                        bool fxChanged=false;
+                        for (int p=0;p<4;p++) {
+                            if (fxList[fxSelected].paramNames[p][0]=='\0') continue;
+                            if (fabsf(pots[3+p].value-lpEuFx[p])>0.001f) {
+                                float mn=fxList[fxSelected].paramMin[p];
+                                float mx=fxList[fxSelected].paramMax[p];
+                                if (fxSelected==0 && p==0)
+                                    fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
+                                else
+                                    fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
+                                lpEuFx[p]=pots[3+p].value; fxChanged=true;
+                            }
+                        }
+                        if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
+                        break;
+                    }
+                    lpEuFxSel = 0xFF;
+                    // P2: global decay-length modifier applied to every hit (0.25x .. 2x)
+                    if (fabsf(pots[1].value - euLastP2) > 0.003f) {
+                        euDecayMod = 0.25f + pots[1].value * 1.75f;
+                        euLastP2 = pots[1].value;
+                    }
+                    // P4-P7: per-lane pulse (hit) count, 0..euSteps[lane]
+                    float* lastEuP[EUCLI_LANES] = {&euLastP4,&euLastP5,&euLastP6,&euLastP7};
+                    for (uint8_t l=0;l<EUCLI_LANES;l++) {
+                        if (fabsf(pots[3+l].value - *lastEuP[l]) > 0.006f) {
+                            uint8_t newPulses = (uint8_t)constrain((int)roundf(pots[3+l].value * euSteps[l]), 0, (int)euSteps[l]);
+                            if (newPulses != euPulses[l]) {
+                                euPulses[l] = newPulses;
+                                eucliRebuildPattern(euPattern[l], euSteps[l], euPulses[l]);
+                            }
+                            *lastEuP[l] = pots[3+l].value;
+                        }
+                    }
+                    break;
+                }
+                case MODE_CRUNCH: {
+                    // FX overlay open: P4-P7 belong to the active FX's own params — same
+                    // established pattern as EUCLI/DR2/DRUM2/GROOVE above (restored per the
+                    // user's request — CRUNCH's own key-grid FX-ish commands have no real
+                    // DSP behind them, so the shared FX bus is the actual way to shape its
+                    // sound). P2 (octave) stays always-on either way, since it's not an FX.
+                    uint8_t track = crunchSelectedTrack;
+                    static float lpCrunchFx[4] = {-1.f,-1.f,-1.f,-1.f};
+                    static uint8_t lpCrunchFxSel = 0xFF;
+                    bool anyFxActive = false;
+                    for (int f=0;f<FX_COUNT;f++) if(fxList[f].active){anyFxActive=true;break;}
+                    if (fabsf(pots[1].value - crunchLastP2) > 0.01f) {
+                        crunchTrackOctave[track] = (int8_t)(roundf(pots[1].value * 4.0f) - 2.0f);
+                        crunchLastP2 = pots[1].value;
+                    }
+                    if (anyFxActive) {
+                        if (lpCrunchFxSel != fxSelected || fxPotNeedSync) {
+                            for (int p=0;p<4;p++) lpCrunchFx[p]=pots[3+p].value;
+                            lpCrunchFxSel=fxSelected; fxPotNeedSync=false;
+                        }
+                        bool fxChanged=false;
+                        for (int p=0;p<4;p++) {
+                            if (fxList[fxSelected].paramNames[p][0]=='\0') continue;
+                            if (fabsf(pots[3+p].value-lpCrunchFx[p])>0.001f) {
+                                float mn=fxList[fxSelected].paramMin[p];
+                                float mx=fxList[fxSelected].paramMax[p];
+                                if (fxSelected==0 && p==0)
+                                    fxList[0].params[0]=mn*powf(mx/mn, pots[3].value);
+                                else
+                                    fxList[fxSelected].params[p]=mn+(mx-mn)*pots[3+p].value;
+                                lpCrunchFx[p]=pots[3+p].value; fxChanged=true;
+                            }
+                        }
+                        if (fxChanged && fxSelected!=0) applyFxEffect(fxSelected);
+                        break;
+                    }
+                    lpCrunchFxSel = 0xFF;
+                    // P4: selected track's volume/velocity scale.
+                    if (fabsf(pots[3].value - crunchLastP4) > 0.006f) {
+                        crunchTrackVolume[track] = fmaxf(0.05f, pots[3].value);
+                        crunchLastP4 = pots[3].value;
+                    }
+                    // P5: selected track's release-length modifier (0.25x .. 4x)
+                    if (fabsf(pots[4].value - crunchLastP5) > 0.003f) {
+                        audioCrunchSetTrackDecayMod(track, 0.25f + pots[4].value * 3.75f);
+                        crunchLastP5 = pots[4].value;
+                    }
+                    break;
+                }
                 case MODE_MOD2: {
                     // P2 = algo selection (discrete, 8 steps)
                     static float lp2_algo=-1.0f;
@@ -12444,6 +13936,36 @@ void loop() {
                             audioSetFilter(cutoff, 1.4f);
                         }
                     }
+                    break;
+                }
+                case MODE_NOOB: {
+                    // Pickup baselines are file-scope (nooLastP2 etc.), NOT local statics —
+                    // see their own declaration comment for why: a local static would never
+                    // reset across mode re-entries and would silently overwrite mode-entry's
+                    // defaults with wherever the pots physically sit.
+                    // Pot 2: voice/instrument select — sweeps the FULL SYNTH instrument list
+                    // (all SHAPE_COUNT shapes), same as MODE_SYNTH's own OVERLAY_INSTR
+                    // browser, per the user's own framing that NOOB is just an automated way
+                    // to play SYNTH. Moved here from B3 so it's a direct pot sweep instead of
+                    // a cycle-through button.
+                    if (fabsf(pots[1].value-nooLastP2)>0.01f) {
+                        nooLastP2=pots[1].value;
+                        uint8_t v = (uint8_t)(pots[1].value * (SHAPE_COUNT-0.01f));
+                        if (v != nooVoice) { nooVoice = v; nooApplyVoice(); }
+                    }
+                    // Pots 4-7 each regenerate the pattern live on every accepted change
+                    // (nooReseed()) — touching any of them is meant to be heard immediately,
+                    // not just bias the next natural re-roll.
+                    // Pot 4: density — proportion of re-rolled events that get a note.
+                    if (fabsf(pots[3].value-nooLastP4)>0.01f) { nooLastP4=pots[3].value; nooDensity = pots[3].value; nooReseed(); }
+                    // Pot 5: rhythm — note gate length (duration) + how irregular the
+                    // inter-event gap is (placement) — see the 10ms tick block.
+                    if (fabsf(pots[4].value-nooLastP5)>0.02f) { nooLastP5=pots[4].value; nooRhythm = pots[4].value; nooReseed(); }
+                    // Pot 6: shape — melodic random-walk step size AND chord-thickening chance.
+                    if (fabsf(pots[5].value-nooLastP6)>0.02f) { nooLastP6=pots[5].value; nooShape = pots[5].value; nooReseed(); }
+                    // Pot 7: variation — probability each event re-rolls fresh vs. repeats
+                    // the one 8 events ago.
+                    if (fabsf(pots[6].value-nooLastP7)>0.02f) { nooLastP7=pots[6].value; nooVariation = pots[6].value; nooReseed(); }
                     break;
                 }
                 default: break;
@@ -13251,6 +14773,25 @@ void loop() {
             }
         }
 
+        // CRUNCH instrument browser (OVERLAY_CRUNCH): JY=item, live-apply like OVERLAY_INSTR
+        // — sets the currently-SELECTED track's instrument (crunchSelectedTrack), not a
+        // single global one, since each of the 4 tracks now has its own independent sample.
+        if (s_overlay == OVERLAY_CRUNCH) {
+            static unsigned long lastCrunchNav = 0;
+            if (millis() - lastCrunchNav >= 150) {
+                float ny = cachedJoyY / 64.0f;
+                bool moved = false;
+                if (ny < -0.3f && crunchBrItem > 0)                      { crunchBrItem--; moved = true; }
+                else if (ny > 0.3f && crunchBrItem+1 < CRUNCH_INSTR_SLOTS) { crunchBrItem++; moved = true; }
+                if (moved) {
+                    crunchTrackInstrument[crunchSelectedTrack] = crunchBrItem;
+                    audioCrunchSetTrackInstrument(crunchSelectedTrack, crunchBrItem);
+                    lastCrunchNav = millis();
+                    drawScreen(false);
+                }
+            }
+        }
+
         // Global pitch bend via JY — SYNTH / HYBRID (MODULAR/MOD2 handle it themselves)
         if((currentMode==MODE_SYNTH||currentMode==MODE_MOD2)&&!menuOpen&&audioReady&&s_overlay!=OVERLAY_INSTR){
             float jy=cachedJoyY/64.0f;
@@ -13345,14 +14886,25 @@ void loop() {
                     if(ny>0.3f){menuOnTabBar=false;menuRow=0;menuCol=0;m=true;}
                 } else {
                     // In items: X navigates columns, Y navigates rows (Y up at row 0 → tab bar)
-                    uint8_t catRows=(kMenuCatSizes[menuCategory]+MENU_COLS-1)/MENU_COLS;
+                    uint8_t catSize=kMenuCatSizes[menuCategory];
+                    uint8_t catRows=(catSize+MENU_COLS-1)/MENU_COLS;
                     if(ny<-0.3f){
                         if(menuRow>0){menuRow--;m=true;}
                         else{menuOnTabBar=true;m=true;}
+                    } else if(ny>0.3f&&menuRow<catRows-1){menuRow++;m=true;}
+                    if(!menuOnTabBar){
+                        // The category's item count isn't always a multiple of MENU_COLS, so
+                        // the last row (and, after this row change, whichever row the cursor
+                        // now sits on) can be narrower than MENU_COLS — cap how far right the
+                        // cursor can go so it never lands on an empty cell past the category's
+                        // real item count (previously it could, since column movement only
+                        // checked "< MENU_COLS" and not the row's actual populated width).
+                        uint8_t colsOnRow=(uint8_t)(catSize-menuRow*MENU_COLS);
+                        if(colsOnRow>MENU_COLS) colsOnRow=MENU_COLS;
+                        if(menuCol>=colsOnRow) menuCol=(uint8_t)(colsOnRow-1);
+                        if(nx<-0.3f&&menuCol>0){menuCol--;m=true;}
+                        if(nx>0.3f&&menuCol+1<colsOnRow){menuCol++;m=true;}
                     }
-                    if(ny>0.3f&&menuRow<catRows-1){menuRow++;m=true;}
-                    if(nx<-0.3f&&menuCol>0){menuCol--;m=true;}
-                    if(nx>0.3f&&menuCol<MENU_COLS-1){menuCol++;m=true;}
                 }
                 if(m){ lastNav=millis(); drawScreen(true); }
             }

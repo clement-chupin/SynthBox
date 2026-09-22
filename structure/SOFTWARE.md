@@ -38,7 +38,7 @@ structure/
 
 ---
 
-## Modes (35 implémentés)
+## Modes (37 implémentés)
 
 > Table régénérée depuis l'enum `AppMode` de `config.h` (source de vérité — en cas de
 > doute, relire l'enum directement). Les anciens noms `MODE_DRUMS`/`MODE_FX`/`MODE_SEQ`/
@@ -81,7 +81,9 @@ structure/
 | SWARM | `MODE_SWARM` | Essaim de boids (cohésion/séparation/alignement), zone d'attraction pilotée au joystick |
 | GEN | `MODE_GEN` | Génératif : joystick X=texture procédurale, Y=méthode sonore, indépendamment réglables |
 | DJ | `MODE_DJ` | Platine DJ/remix : un gros sample SD (mp3/wav), scrub/vitesse/reverse + FX partagés |
-| **GROOVE** | `MODE_GROOVE` | **Nouveau** — Séquenceur unifié drums+synth+303 : la grille 4×8 entière = le pattern de la piste focus (voir section dédiée plus bas) |
+| GROOVE | `MODE_GROOVE` | Séquenceur unifié drums+synth+303 : la grille 4×8 entière = le pattern de la piste focus (voir section dédiée plus bas) |
+| **EUCLI** | `MODE_EUCLI` | **Nouveau** — Séquenceur euclidien 4 pistes : touche = nombre de pas (palette 4-32), P4-P7 = nombre de coups, affichage en anneaux concentriques (voir section dédiée plus bas) |
+| **CRUNCH** | `MODE_CRUNCH` | **Nouveau** — Tracker 4 pistes façon MothOS, enregistrement live (pas d'édition pas-à-pas) : touches = 4 shifts + 12 notes/commandes, 12 slots instrument (2 banks + 10 mélodiques) (voir section dédiée plus bas) |
 
 Trois modes « expérimentaux » historiques (EXP/EXP2/EXP3) partagent une philosophie : jouer
 des notes/sons intéressants sans connaissance de théorie musicale, contrairement aux modes
@@ -106,14 +108,16 @@ prolongent cette famille — voir la section « Modes expérimentaux » plus bas
 | 70–101 | `DRUM_OSC_BASE + 0..31` | Pads batterie (32 sons uniques) |
 | 150–181 | `GRANULAR_OSC_BASE + 0..31` | Granular slicer slices |
 | 182–213 | `SAMPLE_OSC_BASE + 0..31` | Lecture keys samples (polyphonique) |
+| 214–217 | `CRUNCH_OSC_BASE + 0..3` | **Nouveau** — CRUNCH : 4 pistes, un oscillateur fixe et monophonique par piste (pas de round-robin — une nouvelle note sur une piste déjà sonore retrigger simplement l'oscillateur de cette piste) |
 | 240–245 | `STONE_OSC_BASE + 0..5` | STONE : 6 voix round-robin sur un seul sample |
 
 `MODE_MODULAR` (canaux 14-15) n'appartient PAS à `SYNTH_CH` — c'est le seul autre mode
-(avec STONE/GRANULAR2/DRUM2/SAMPLE) à utiliser des canaux/oscillateurs dédiés plutôt que
-l'allocateur de voix dynamique d'AMY. Piège classique : `audioSetAllFilters()` /
+(avec STONE/GRANULAR2/DRUM2/SAMPLE/CRUNCH) à utiliser des canaux/oscillateurs dédiés plutôt
+que l'allocateur de voix dynamique d'AMY. Piège classique : `audioSetAllFilters()` /
 `audioSetAllFiltersT()` (utilisées par le FX FILT partagé) sont câblées par défaut pour
 `SYNTH_CH` — tout nouveau canal dédié doit explicitement y être ajouté (voir
-`audioApplyFilterToStone()` / `audioApplyFilterToModular()` dans `audio_engine.cpp` comme
+`audioApplyFilterToStone()` / `audioApplyFilterToModular()` / `audioApplyFilterToCrunch()`
+dans `audio_engine.cpp` comme
 patron), sinon le FX FILT semble actif mais ne modifie rien pour ce canal.
 
 ### Bus AMY
@@ -257,8 +261,9 @@ Les FX bus-0 (REVERB/CHORUS/DELAY/EQ/RESECHO/REP/BITCRS/RINGMOD/COMPRESSOR/FILT-
 s'appliquent après le mix, donc à **toute** source sonore (synthé, sample, granulaire…).
 FILT (types LPF/HPF/BPF) et DISTORT/OVERDRIVE en revanche ciblent des canaux/oscillateurs
 AMY précis — voir l'avertissement dans la table des canaux ci-dessus : historiquement,
-seul `SYNTH_CH` (+ GRANULAR2 via un masque d'oscillateurs actifs) était couvert ; STONE et
-MODULAR ont été ajoutés ensuite (`audioApplyFilterToStone`/`audioApplyFilterToModular`).
+seul `SYNTH_CH` (+ GRANULAR2 via un masque d'oscillateurs actifs) était couvert ; STONE,
+MODULAR puis CRUNCH ont été ajoutés ensuite (`audioApplyFilterToStone`/
+`audioApplyFilterToModular`/`audioApplyFilterToCrunch`).
 La 303S (bus 1) est mergée dans le bus 0 **avant** le traitement FX dans `amy.c`, donc les
 effets bus-0 s'appliquent au signal combiné sans allocation mémoire supplémentaire.
 
@@ -415,6 +420,146 @@ vois est ce que tu presses".
 
 ---
 
+## MODE_EUCLI — Séquenceur euclidien 4 pistes
+
+Nouveau mode, catégorie SEQNC. Chaque piste (une par ligne de la grille clavier) a son
+propre nombre de pas (palette fixe `{4,6,8,12,16,20,26,32}`, une valeur par colonne) et son
+propre nombre de coups (P4-P7, un potard par piste), répartis par un accumulateur à la
+Bjorklund (`eucliRebuildPattern()`, généralisé depuis la version câblée en dur à 8 pas de
+MODE_GEN). Chaque piste tourne sur sa **propre tête de lecture** (`euPlayhead[4]`), pas une
+position partagée — un vrai polymètre : deux pistes à pas différents dérivent l'une par
+rapport à l'autre au fil des mesures au lieu de rester synchronisées.
+
+- **Horloge dédiée** (`eucliTick()`, extraite en fonction autonome plutôt qu'inline dans
+  `loop()` — nécessaire pour pouvoir la piloter manuellement en test headless, `loop()` ne
+  tournant jamais pendant `setup()`), pas la pulsation `drum2Step` partagée par
+  DRUM2/SYSEQ/303S/SS2/GEST — même raison que GROOVE : éviter une collision audible avec un
+  pattern resté en lecture dans un autre mode.
+- **Touches = palette, pas placement de pas** : contrairement à tous les autres modes
+  d'édition de grille (DRUM2/GROOVE/SS2…), une touche ne pose/efface pas un pas — elle
+  choisit d'un coup le nombre de pas de sa ligne (`kEucliStepOptions[col]`). La colonne 0
+  physique (la plus à gauche — voir la note sur la convention colonne ci-dessous) donne 4
+  pas, la dernière colonne 32.
+- **Banques de sons** (B3, `kEucliBanks[4][4]`) : 4 kits curés parmi les 32 pads
+  `kDrumPads[]` partagés (voir `audioDrum2Hit()`), un par ligne. Le nom du pad affecté à
+  chaque piste est affiché en toutes lettres à côté de sa barre (`audioDrumPadLabel()`) —
+  sans ça, changer de banque ne produisait qu'un numéro opaque à l'écran, pas de quoi
+  comprendre ce que B3 venait de changer (retour utilisateur direct).
+- **Affichage** : moitié haute = 4 anneaux concentriques (modèle : le dessin orbital
+  d'EXP3, `drawCircle` par rayon + marqueurs placés à la trigonométrie), moitié basse = une
+  barre + lecture `X/S` + le nom du pad par piste.
+- **Boutons** : B1 Play/Stop, B2 FX (`OVERLAY_FX` standard), B3 cycle banque, B4 reset
+  toutes les têtes de lecture à 0 (sans toucher aux pas/pulses).
+
+Deux inversions gauche/droite et haut/bas ont dû être corrigées après coup (rapportées par
+l'utilisateur, pas visibles en lisant le code seul) — voir « Bugs corrigés » plus bas :
+
+## MODE_CRUNCH — Tracker 4 pistes façon MothOS
+
+Nouveau mode, catégorie SEQNC (pas INSTR — un tracker/enregistreur de pattern, pas un
+instrument joué). Port du modèle de contrôle de
+[MothOS](https://github.com/MothSynths/MothOS) (firmware du synthé MothSynth), pas une
+création originale : l'utilisateur avait déjà lui-même adapté MothOS à un clavier 4×8 très
+proche de celui de GrvEP dans son propre fork
+`/home/cchupin/projects/MothOS_GroovePadBox`, qui a servi de référence directe pour le
+portage — voir `Voice.cpp`/`Tracker.cpp`/`InputManager.cpp`/`ScreenManager.cpp` de ce fork
+pour la source originale de tout ce qui suit.
+
+### Enregistrement live, pas édition pas-à-pas
+
+Contrairement à tous les autres séquenceurs du projet (DRUM2/GROOVE/SYSEQ/SS2/EUCLI…),
+CRUNCH n'a **aucune** grille d'édition de pas. Le modèle MothOS d'origine
+(`Tracker::SetNote()`) : tant que le transport tourne (`crunchPlaying`), tout ce qui est
+joué au clavier est capturé en direct dans le pattern de la piste sélectionnée, à la
+position courante de la tête de lecture — « jouer, c'est enregistrer », sans étape d'armement
+séparée. `crunchTick()` (autonome, même raison qu'`eucliTick()` — testable en headless) ne
+fait que la **lecture** ; la capture se fait entièrement dans `handleNoteKeyAudio()`.
+
+### Le clavier remplace le clavier 4×4 + 4 touches shift de MothOS
+
+Le firmware MothOS original tourne sur un clavier matriciel 4×4 (16 touches : 4 touches
+« shift » collantes M/N/O/P + 12 touches note/commande A-L). Le fork de l'utilisateur avait
+déjà résolu l'adaptation à un clavier 4×8 physique (colonnes dupliquées par moitié,
+`col % KEY_COLS`) — repris ici à l'identique plutôt que d'inventer un schéma GrvEP maison :
+ligne physique du haut (row==3) = les 4 touches shift, les 3 lignes du dessous = les 12
+touches note/commande (A-D/E-H/I-L). Une touche shift arme un mode « collant » (montré à
+l'écran par un overlay légende façon `UpdateInstructionsScreen`) ; la touche suivante
+(n'importe laquelle, y compris une autre touche shift) consomme l'armement et exécute la
+commande — `crunchDispatchCommand()` (dans `main.cpp`) est un portage quasi-littéral de
+`Tracker::SetCommand()` : sélection d'instrument, octave, sélection/mute/solo/volume de
+piste, forme d'enveloppe, longueur de note, effacer piste/pattern, sélection de pattern,
+copier/coller, mode chanson, presets BPM, play/stop.
+
+**Convention colonne** : dans ce codebase, la colonne 0 est la touche la plus à **droite**
+(col7 la plus à gauche — voir le commentaire d'OMNI). Un `col % 4` brut ferait donc
+*descendre* la colonne logique de gauche à droite sur le clavier alors que la légende à
+l'écran la dessine en *montant* — d'où `3 - (col % 4)`, pas `col % 4` tout court (bug
+rapporté par l'utilisateur, voir « Bugs corrigés »).
+
+### 12 slots instrument, pas 12 pitches d'un seul sample
+
+Piège du premier portage (corrigé après coup, signalé par l'utilisateur) : l'original
+distingue clairement, via `Voice::ReadDrumWaveform`/`ReadSfxWaveform` vs `ReadWaveform`,
+deux familles d'instruments sous la commande `'I'` (0-11) — pas 12 variations d'un seul
+timbre :
+
+- **Slot 0 « DRUM »** et **slot 1 « SFX »** : chacune des 12 touches note joue un
+  échantillon **différent** (un kit de percussions / un kit de bruitages), toujours à sa
+  hauteur native — aucun pitch-shift.
+- **Slots 2-11** (10 instruments mélodiques) : un seul échantillon fixe par slot, dont les
+  12 touches note pilotent la hauteur chromatique (`60 + octave*12 + val`).
+
+`audioCrunchResolveSampleIndex()`/`audioCrunchSlotIsBank()`/`audioCrunchSlotIsNative()`/
+`audioCrunchSlotName()` (`audio_engine.cpp`) sont la source de vérité unique pour cette
+résolution — utilisés à la fois par la lecture audio et par l'UI (légende, header, browser
+B4), pour qu'ils ne puissent pas diverger.
+
+Les slots 0-6 (banks + 5 des 10 mélodiques) réutilisent purement et simplement le buffer
+PSRAM des 32 pads batterie déjà chargés (`pcm_get_sample_ram_for_preset`, zéro donnée
+neuve — même technique que le premier portage). Les slots 7-11 (5 instruments mélodiques
+supplémentaires) sont en revanche du **contenu audio réellement nouveau** : les timbres
+`instrumentN` originaux de MothOS n'ont pas d'équivalent dans la banque `kDrumPads[]`
+existante — 5 des 11 fichiers du fork utilisateur (les plus petits, ~194 Ko une fois
+reconditionnés `int32`→`int16_t`) ont été vendorisés dans `src/sounds/crunchinstr1-5.h` et
+chargés via un nouveau `pcm_load()` dédié (`audioLoadCrunchNativeInstruments()`) — pas
+aliasés, cette donnée n'existe nulle part ailleurs dans GrvEP.
+
+### Ce qui n'a PAS été porté
+
+Les effets par voix de MothOS (echo/arp-chord/whoosh/pitchbend, lowpass/retrig/wobble,
+overdrive) n'ont aucun équivalent DSP dans GrvEP — plutôt que d'improviser un mapping vers
+des effets sans rapport, les commandes clavier correspondantes (`'D'`/`'A'`) sont
+reconnues (la légende les affiche, l'armement se consomme normalement) mais restent des
+no-op sonores. Le vrai façonnage du son de CRUNCH passe par le bus FX partagé de GrvEP
+(B2 + `OVERLAY_FX`, P4-P7 quand un FX est actif) — convention standard, pas un pont vers les
+commandes clavier no-op ci-dessus.
+
+### Contrôles
+
+| Contrôle | Rôle |
+|----------|------|
+| Clavier | 4 shifts (M/N/O/P, ligne du haut) + 12 notes/commandes (A-L) — voir ci-dessus |
+| Joystick X | Cycle la piste sélectionnée (même idiome que GROOVE) |
+| Clic joystick | Mute/unmute la piste sélectionnée |
+| P2 | Octave de la piste sélectionnée (continu, -2..+2) |
+| P4 | Volume/vélocité de la piste sélectionnée (hors FX actif) |
+| P5 | Longueur de relâchement de la piste sélectionnée (hors FX actif) |
+| P4-P7 | Paramètres du FX actif (`OVERLAY_FX` ouvert) — convention standard |
+| B1 | Play/Stop |
+| B2 | `OVERLAY_FX` |
+| B4 | Browser des 12 slots instrument (`OVERLAY_CRUNCH`) pour la piste sélectionnée |
+
+### Écran
+
+Porté directement du propre fork `MothOS_GroovePadBox` de l'utilisateur
+(`ScreenManager::UpdateMainScreen`, déjà adapté là-bas pour un panneau 128×128) : colonne
+gauche = contexte (instrument/piste/octave/statut), colonne droite = gros compteur de pas +
+numéro de pattern + BPM + marqueur de battement clignotant, bas = une ligne par piste avec
+VU-mètre à décroissance de crête. Overlay légende (4×4) affiché à la place tant qu'un shift
+est armé.
+
+---
+
 ## Modes expérimentaux (EXP / EXP2 / EXP3 / LIFE / SWARM)
 
 Philosophie commune : jouer des sons intéressants sans connaissance de théorie musicale
@@ -536,3 +681,39 @@ tombe dans la même famille perceptible côté utilisateur : « le potard reste 
 Pattern de fix qui s'est répété trois fois cette session : remplacer le seuil/plafond dur
 par soit une marge/hystérésis, soit — mieux — un remapping continu qui garde toute la
 course du potard utile.
+
+### Volume incohérent entre pads `kDrumPads[]` (CLAP/HIHAT2/RIDE plus faibles)
+`audioLoadDrumSamples()` charge deux formats source : `int8_t` (mis à l'échelle ×256 au
+chargement) et « 16-bit dans un conteneur `int32` » (copié tel quel). Les deux formats
+n'avaient jamais été exportés au même niveau — le ×256 des échantillons `int8_t` tombe par
+hasard près de la pleine échelle, mais les échantillons « 16-bit en conteneur » jouaient au
+niveau arbitraire produit par leur propre outil de conversion, parfois nettement plus bas
+(CLAP, HIHAT2, RIDE…). Rapporté via le mode EUCLI (4 pistes jouées côte à côte rendent
+l'écart flagrant), mais le bug touche tout consommateur de `kDrumPads[]` : DRUM2, GROOVE,
+SYSEQ, et les banks DRUM/SFX de CRUNCH (qui aliasent les mêmes buffers). Fix : normalisation
+de crête à deux passes (mesurer le pic, puis reprojeter vers une cible commune ~30000) pour
+les deux formats, remplaçant le `×256` en dur.
+
+### Menu : curseur atteignant des cases vides sur une catégorie non multiple de `MENU_COLS`
+La navigation joystick de la grille menu limitait le déplacement colonne à `< MENU_COLS`
+(largeur fixe de la grille), pas à la largeur réellement peuplée de la **ligne courante** —
+sur une catégorie dont le nombre d'items n'est pas un multiple de 3 (SEQNC : 9 items après
+l'ajout de CRUNCH, AUTRE : 11), la dernière ligne est incomplète et le curseur pouvait
+s'y déplacer sur une case vide (rien n'y est dessiné — le curseur « disparaît »
+visuellement). Fix : la largeur de colonne autorisée se recalcule à chaque déplacement de
+ligne à partir du nombre réel d'items restants sur la ligne courante.
+
+### EUCLI : lignes clavier inversées haut/bas par rapport à l'affichage
+`euSteps[row]` indexait directement par la ligne clavier brute, alors que l'affichage
+dessine la piste 0 comme l'anneau le plus intérieur / la barre la plus haute — sur ce
+clavier, la ligne physique du haut est `row==3`, pas `row==0` (confirmé indépendamment par
+le commentaire de câblage du fork `MothOS_GroovePadBox` de l'utilisateur : « physical row 3
+is top »). Fix : `lane = EUCLI_LANES-1-row` pour que la ligne physique du haut pilote la
+piste dessinée en haut.
+
+### CRUNCH : colonnes clavier en miroir par rapport à la légende à l'écran
+Même famille que le bug EUCLI ci-dessus mais sur l'axe colonne : `col % 4` (au lieu de
+`3-(col%4)`) faisait *descendre* la colonne logique de gauche à droite sur le clavier
+(rappel : col0 = touche la plus à **droite** dans ce codebase, pas la gauche), alors que la
+légende à l'écran dessine ses 4 colonnes en *montant* de gauche à droite — la touche la
+plus à gauche du clavier ne correspondait pas à la cellule la plus à gauche de la légende.

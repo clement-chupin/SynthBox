@@ -132,6 +132,7 @@ public:
         return fwrite(buf, 1, len, _fp);
     }
 
+    int getWriteError() const { return 0; }
     void close() {
         if (_fp)  { fclose(_fp);    _fp  = nullptr; }
         if (_dir) { closedir(_dir); _dir = nullptr; }
@@ -162,6 +163,7 @@ class SDClass {
 public:
     bool begin(uint8_t, SPIClass&, uint32_t = 4000000) { return _init(); }
     bool begin(uint8_t) { return _init(); }
+    void end() {}  // no real unmount/remount distinction on the desktop filesystem — begin() is always idempotent
 
     File open(const char* path, const char* mode = FILE_READ) {
         std::string abs = sdAbsPath(path);
@@ -202,6 +204,12 @@ public:
     }
     bool remove(const char* path) {
         return ::remove(sdAbsPath(path).c_str()) == 0;
+    }
+    bool rename(const char* pathFrom, const char* pathTo) {
+        return ::rename(sdAbsPath(pathFrom).c_str(), sdAbsPath(pathTo).c_str()) == 0;
+    }
+    bool rename(const String& pathFrom, const String& pathTo) {
+        return rename(pathFrom.c_str(), pathTo.c_str());
     }
 
     uint64_t totalBytes() const { return (uint64_t)16 * 1024 * 1024 * 1024; }

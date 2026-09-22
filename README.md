@@ -33,6 +33,17 @@ Le même code applicatif (`src/`) tourne sur quatre cibles :
 
 ## Nouveautés récentes
 
+- **MODE_CRUNCH — tracker 4 pistes façon MothOS** — port du modèle de contrôle du
+  firmware [MothOS](https://github.com/MothSynths/MothOS) : pas d'édition pas-à-pas,
+  enregistrement live (jouer pendant que le pattern tourne capture directement la note),
+  clavier simulant le clavier 4×4 + 4 touches shift d'origine, 12 slots instrument (2
+  banks de percussions/bruitages + 10 instruments mélodiques, dont 5 échantillons MothOS
+  authentiques nouvellement intégrés). Bus FX partagé de GrvEP accessible en plus (B2 +
+  potards habituels). Détails dans [structure/SOFTWARE.md](structure/SOFTWARE.md).
+- **MODE_EUCLI — séquenceur euclidien 4 pistes** — chaque piste choisit son propre nombre
+  de pas (palette 4 à 32 via une touche) et son nombre de coups (un potard par piste),
+  répartis automatiquement par algorithme euclidien ; polymètre réel (chaque piste a sa
+  propre tête de lecture). Affichage en anneaux concentriques.
 - **MODE_GROOVE — séquenceur unifié drums/synth/303** — toute la grille 4×8 affiche/édite
   le pattern (jusqu'à 32 pas) d'une seule piste parmi 10 (8 pads batterie + synthé + 303),
   focus cyclé au joystick X, au lieu de la hiérarchie à 3 niveaux de DR2. Mute/solo par

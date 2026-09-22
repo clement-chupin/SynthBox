@@ -83,6 +83,35 @@ void audioLoadDrumSamples();
 void audioPlayDrumPad(uint8_t col, float vel);
 const char* audioDrumPadLabel(uint8_t col);
 
+// ==================== CRUNCH (MODE_CRUNCH) ====================
+// MothOS-style 4-track live-record tracker: CRUNCH_TRACKS (4) independent, monophonic
+// tracks, each set to one of CRUNCH_INSTR_SLOTS (12) instrument slots — matching
+// MothOS's own original structure (see Voice::ReadDrumWaveform/ReadSfxWaveform vs.
+// ReadWaveform): slot 0 = "DRUM" bank (12 different drum hits, one per note value, all at
+// native pitch), slot 1 = "SFX" bank (same idea), slots 2-6 = 5 melodic instruments
+// aliased from the drum-pad bank (BS1/BS2/GTR/SYN/PAD), slots 7-11 = 5 MORE melodic
+// instruments using genuine vendored MothOS sample content (not aliased — see
+// CRUNCH_INSTR_PRESET_BASE in config.h). Call audioLoadCrunchSamples() after
+// audioLoadDrumSamples(), and audioLoadCrunchNativeInstruments() once after that.
+// Pattern/transport/track-select state lives in main.cpp
+// (crunchTrackInstrument[]/crunchNote[][][]/etc.) — this is just the per-track voice layer.
+void audioLoadCrunchSamples();
+void audioLoadCrunchNativeInstruments();
+void audioCrunchSetTrackInstrument(uint8_t track, uint8_t slot);  // slot: 0-11, see CRUNCH_INSTR_SLOTS
+uint8_t audioCrunchGetTrackInstrument(uint8_t track);
+void audioCrunchSetTrackDecayMod(uint8_t track, float mod);  // release-time multiplier, 1.0=default 40ms
+void audioCrunchSetTrackEnvelope(uint8_t track, uint8_t envIdx);  // 0=FadeOut 1=FadeIn 2=NoFade 3=Loop (MothOS's 'E')
+// Resolves (slot, note val 0-11) to a raw kDrumPads[]/CRUNCH_PRESET_BASE sample index —
+// only valid for bank slots (0/1) and the 5 aliased melodic slots (2-6); the 5 native
+// instrument slots (7-11) have no kDrumPads index, see audioCrunchSlotIsNative() below.
+uint8_t audioCrunchResolveSampleIndex(uint8_t slot, uint8_t val0to11);
+bool audioCrunchSlotIsBank(uint8_t slot);    // true for slots 0 (DRUM) and 1 (SFX)
+bool audioCrunchSlotIsNative(uint8_t slot);  // true for the 5 vendored-instrument slots (7-11)
+const char* audioCrunchSlotName(uint8_t slot);  // "DRUM"/"SFX"/sample name — single source of truth for the UI
+void audioCrunchNoteOn(uint8_t track, uint8_t val0to11, int8_t octave, float velocity);
+void audioCrunchNoteOff(uint8_t track, uint8_t note);
+void audioCrunchAllNotesOff();
+
 // ==================== STONE (sample tone) ====================
 // One SD sample played pitched across the keyboard, like a normal synth voice. Polyphony
 // is a small round-robin over fixed, directly-addressed oscillators (not an AMY channel).
@@ -112,43 +141,131 @@ void audioStoneSetLoopMode(bool loop);
 bool audioStoneGetLoopMode();
 
 // ==================== DJ (MODE_DJ) ====================
-// One mono "deck" for a whole song — scrub/speed/reverse, see config.h's DJ_* block for
-// why this is flash-backed rather than PSRAM like every other sample mode.
-// audioLoadDJTrack: background load (decode-once, then flash-cached forever by path+size —
-// re-opening the same file is instant on subsequent loads, same as any other flash-tier sample).
+// One mono "deck" for a whole song — scrub/speed/reverse/loop, same 16-bit PSRAM decode
+// pipeline as STONE (see config.h's DJ_* block for the capacity tradeoff this implies).
 void audioLoadDJTrack(const char* path);
 bool audioDJIsLoaded();
-// Increments once per successful track load — lets the UI know when to recompute its
-// cached waveform (audioDJComputeWaveform() scans the whole track, too expensive to
-// call every drawScreen() frame) without needing to compare file paths.
+// True once EITHER the whole file has finished decoding OR a short prefix is ready — use
+// this (not audioDJIsLoaded()) to gate "is the deck usable yet" UI/input, so Play/seek/
+// speed become available almost immediately instead of waiting out the full decode.
+bool audioDJCanPlayYet();
+// Frames decoded so far for the load currently in flight (0 once a new load starts).
+uint32_t audioDJGetDecodedFrames();
+// Increments once per successful NEW track load (not on every chunk swap — see
+// audioDJGetChunkGen() for that) — lets the UI know when the loaded track itself changed.
 uint32_t audioDJGetLoadGen();
+// Increments on every chunk-boundary swap, seek, or reverse toggle — i.e. whenever the
+// currently-displayed ~DJ_CHUNK_SECONDS chunk changes, not just on a brand new track load.
+// Use this (not audioDJGetLoadGen()) to know when to recompute the cached waveform.
+uint32_t audioDJGetChunkGen();
 // Starts/resumes or stops playback from the current position (see audioDJSeek()).
 void audioDJPlayPause(bool playing);
 bool audioDJIsPlaying();
-// Seeks to a fractional position (0..1) in the track and, if playing, retriggers from
-// there (an audible retrigger click is expected — this is a real seek, not a smooth
-// scratch; see structure/SOFTWARE.md for why AMY has no live-phase API to avoid it).
+// Drives chunk-boundary prefetch/handoff — call unconditionally from loop(), regardless
+// of whether MODE_DJ is currently on-screen (see its own comment: audio streaming
+// shouldn't depend on UI rendering cadence).
+void audioDJTick();
+// Seeks to a fractional position (0..1) of the estimated whole-track duration and, if
+// playing, retriggers from there once the target chunk is decoded in the background (an
+// audible retrigger click is expected — this is a real seek, not a smooth scratch; see
+// structure/SOFTWARE.md for why AMY has no live-phase API to avoid it).
 void audioDJSeek(float posFrac);
-// Current playhead position (0..1), continuously estimated from elapsed time (AMY has
-// no live phase readback) — good enough for a UI playhead, not sample-accurate.
+// Current playhead position (0..1 of the estimated whole-track duration), continuously
+// estimated from elapsed time (AMY has no live phase readback) — good enough for a UI
+// playhead/time readout, not sample-accurate.
 float audioDJGetPosFrac();
+// How far playback is through the CURRENTLY DISPLAYED chunk, in that chunk buffer's own
+// natural (already-reversed-if-applicable) reading order — use this for an on-screen
+// cursor drawn over audioDJComputeWaveform()'s image, not audioDJGetPosFrac() (which is
+// relative to the whole track, not the one chunk actually shown).
+float audioDJGetChunkProgressFrac();
+bool audioDJChunkTouchesStart();
+bool audioDJChunkTouchesEnd();
 // Playback rate, pitch coupled (turntable-style, like a real deck's speed/pitch fader) —
 // 1.0 = normal, 0.5 = half speed/an octave down, 2.0 = double/an octave up. Updates a
 // SOUNDING voice smoothly with no retrigger (AMY's per-voice fractional midi_note).
 void audioDJSetSpeed(float speed);
 float audioDJGetSpeed();
-// Reverse toggle. First call lazily builds a reversed copy (PSRAM, capped at
-// DJ_REV_MAX_BYTES — see config.h) of the loaded track; this can take a moment for a
-// long track, so it's a real background task, not instant. audioDJIsReverseReady()
-// tells the UI whether that build finished yet.
+// Reverse toggle: continues from the current position, streaming chunks backward through
+// the file in the background exactly like forward playback streams them ahead (see
+// config.h's DJ_* block) — near-unlimited range, not capped to one buffer's worth.
 void audioDJSetReverse(bool reverse);
 bool audioDJGetReverse();
+// True once the deck has ANY chunk loaded and playable — every direction change goes
+// through the same background chunk-decode-then-activate path as any other seek now, so
+// there's no separate one-time "reverse buffer" build to wait for; kept as its own
+// function (rather than folding into audioDJCanPlayYet()) since the UI already
+// distinguishes "not ready to play at all" from "reverse specifically isn't set up yet".
 bool audioDJIsReverseReady();
-// Waveform (128 peak bins) from the loaded (forward) buffer, for OLED display —
-// mirrors audioComputeStoneWaveform().
+// Waveform (128 peak bins) from the CURRENTLY ACTIVE chunk (~DJ_CHUNK_SECONDS), for OLED
+// display — mirrors audioComputeStoneWaveform(). Unlike the old one-shot design (which
+// held the whole track in RAM and could show all of it), this necessarily shows only the
+// active chunk — pair with audioDJGetChunkProgressFrac() for the on-screen cursor, not
+// audioDJGetPosFrac().
 bool audioDJComputeWaveform(uint8_t* waveform128);
-// Track length in seconds, from the loaded buffer's frame count/rate. 0 if not loaded.
+// Estimated whole-track length in seconds (exact for wav, CBR-ratio estimate for mp3).
+// 0 if not loaded.
 float audioDJGetLengthSeconds();
+
+// ---- Dynamic/experimental performance controls ----
+// Manual scratch: jx is the raw joystick X reading, -1..1 (sign = direction, magnitude =
+// scrub speed). Call every ~10ms while |jx| exceeds the deadzone; call audioDJScratchEnd()
+// once when it returns to center (cheap no-op if no gesture was in progress). Confined to
+// whatever's currently resident in RAM (no SD access) — see audio_engine.cpp's comment on
+// why a sustained scratch can't range further than that without a real decode.
+void audioDJScratchNudge(float jx);
+void audioDJScratchEnd();
+// Granular spray: amount 0..1, 0 = no grains (default/at rest). Grains are short one-shot
+// snippets read from already-resident audio, layered on top of the main deck signal — call
+// continuously (every ~10ms) from the joystick Y reading; the actual spawn scheduling runs
+// inside audioDJTick().
+void audioDJSetGrainAmount(float amount01);
+float audioDJGetGrainAmount();
+// Stutter/glitch: freezes the playhead and loops a short (BPM-synced) window until released.
+// bpmForSync is the app's current global BPM (used only to size the loop window).
+void audioDJStutterStart(float bpmForSync);
+void audioDJStutterEnd();
+bool audioDJIsStuttering();
+
+// ---- USB Mass Storage mode support (MODE_USB, main.cpp) ----
+// Nothing may touch SD (background grain decode, the .pcm16 cache builder) while the SD card
+// is exposed raw to the USB host — audioDJJobBusy()/audioDJForceQuiesce() let main.cpp poll
+// and force-abort that background activity without exposing the file-static state directly.
+bool audioDJStreamActive();  // playing or a grain job in flight — used to keep SD polling off the audio path
+bool audioDJJobBusy();       // true if a grain-decode or pcm16-cache-build task is in flight
+void audioDJCloseFiles();    // closes open cache/tee files; only call with no grain job in flight
+void audioDJForceQuiesce();  // bumps the track generation so any in-flight pcm16 build aborts ASAP (does not touch playback state)
+
+// ==================== SS2 large-sample streaming ====================
+// SS2 slots (keyIdx 0-15) and MODE_SAMPLE keys share one underlying per-key storage
+// (config.h's SS2 comment) and one loader, audioLoadKey() — which now decides on its own
+// whether a file fits the normal full-decode-into-PSRAM path or needs this streaming path
+// instead (see config.h's "SS2 large-sample streaming" block for the design/rationale).
+// Callers don't choose; they just check audioKeyIsLarge() to pick which play function to
+// call. Only ONE large key streams at a time — a single shared mono voice, like MODE_DJ's
+// one deck — triggering any large key (same or different) cuts whatever it was doing.
+bool audioKeyIsLarge(uint8_t keyIdx);
+// Triggers/retriggers the shared streaming voice for keyIdx, forward or backward. No-op if
+// keyIdx isn't flagged large. Unlike audioPlayKey()/audioPlayKeyRev() (instant, static
+// buffer), this cuts any other large key that was streaming and (re)starts fresh — the
+// first chunk decodes in the background, so there's a short (bounded) latency before
+// sound starts, same tradeoff as MODE_DJ's initial chunk load.
+void audioPlayKeyStreamed(uint8_t keyIdx, bool reverse, float vel);
+// True while the shared voice is actively streaming THIS key and hasn't reached the true
+// end (forward) or true start (backward) of the file yet — use this instead of the
+// elapsed-ms-vs-audioKeyLengthMs() comparison for a large key's "still playing" check
+// (e.g. SS2's FUL alteration, which doesn't retrigger while true).
+bool audioKeyStreamStillPlaying(uint8_t keyIdx);
+// Drives the shared streaming voice's chunk-boundary prefetch/handoff — call
+// unconditionally from loop(), same reasoning as audioDJTick().
+void audioSSTick();
+
+// See audioDJJobBusy()/audioDJForceQuiesce()'s own comment — same purpose, SS2 side.
+void audioStreamWorkersInit();  // once at boot, while internal RAM is still unfragmented
+bool audioSSStreamActive();
+bool audioSSJobBusy();
+void audioSSCloseFiles();
+void audioSSForceQuiesce();
 
 // Legacy wrappers (delegate to audioLoadAndPlay with vel=0)
 bool audioLoadFromSD(const char* path, uint16_t preset);
