@@ -395,3 +395,21 @@ de relâchement) — les deux chemins écrivent le même état, aucun conflit.
 | EXP | STANDALONE | libre | libre |
 | EXP2 | STANDALONE | libre | libre |
 | EXP3 | STANDALONE | libre | libre |
+
+---
+
+## Conventions transverses (tous templates)
+
+- **Pots P1/P3 réservés** (Volume/BPM) dans tous les modes — un mode ne peut utiliser que P2 et
+  P4-P7. Détail et bug LANIM associé : SOFTWARE.md, section « Pots ».
+- **Curseurs de pots = grille 2×2 placée selon la position PHYSIQUE des potards** (`potGridPos()`,
+  `main.cpp` : P4=haut-droite, P5=bas-droite, P6=bas-gauche, P7=haut-gauche autour du joystick ;
+  P2, sans coin propre, prend haut-gauche) — jamais `i%2`/`i/2`. Jamais alignés en colonne : 4 paramètres liés aux pots
+  s'affichent en deux rangées de deux barres étiquetées (panneau FX, LANIM, NOOB, moitié basse
+  d'EUCLI). Exceptions assumées : la bande de 7 faders de MIDI (elle reproduit le matériel) et
+  les listes de texte de MOD2 (pas des curseurs).
+- **Grille FX** : voir SOFTWARE.md « Effets » (interface, sélection au clavier cols 4-7, appui
+  long = automatisation). L'ouverture de l'overlay est câblée **mode par mode** dans
+  `handleButton()` ; un nouveau mode doit choisir un bouton libre et ajouter son propre cas
+  (état des lieux et modes qui n'y ont pas accès : HANDOFF.md).
+- **Légende console** : chaque mode a besoin d'une entrée dans `ctrlLabelsFor()`.

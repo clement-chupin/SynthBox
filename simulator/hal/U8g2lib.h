@@ -80,6 +80,7 @@ public:
     void drawCircle(u8g2_uint_t x0, u8g2_uint_t y0, u8g2_uint_t rad, uint8_t opt=15) { u8g2_DrawCircle(&u8g2, x0, y0, rad, opt); }
     void drawDisc  (u8g2_uint_t x0, u8g2_uint_t y0, u8g2_uint_t rad, uint8_t opt=15) { u8g2_DrawDisc  (&u8g2, x0, y0, rad, opt); }
     void drawLine(u8g2_uint_t x1, u8g2_uint_t y1, u8g2_uint_t x2, u8g2_uint_t y2) { u8g2_DrawLine(&u8g2, x1, y1, x2, y2); }
+    void drawTriangle(int16_t x0, int16_t y0, int16_t x1, int16_t y1, int16_t x2, int16_t y2) { u8g2_DrawTriangle(&u8g2, x0, y0, x1, y1, x2, y2); }
 
     // bitmap: MSB of each byte = leftmost pixel, cnt bytes per row
     void drawBitmap(u8g2_uint_t x, u8g2_uint_t y, u8g2_uint_t cnt, u8g2_uint_t h, const uint8_t* bitmap) {

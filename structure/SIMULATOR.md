@@ -153,3 +153,51 @@ Dépendances : SDL2 (installé localement dans `sdl2_local/`), libmpg123 (packag
 | Glisser pots          | Clic + drag vertical sur les sliders |
 | Clic joystick         | Clic sur le cercle joystick |
 | Drag joystick         | Drag dans le cercle joystick |
+
+---
+
+## Recettes de vérification headless (instrumentation TEMPORAIRE)
+
+Il n'y a pas de suite de tests ; on vérifie en instrumentant temporairement, en compilant
+dans un dossier jetable, en lisant la sortie, puis en **retirant tout** (`grep -rn TEMP_DBG
+src simulator/*.cpp simulator/*.h "lib/AMY Synthesizer/src/"*.c` doit ne rien retourner
+avant de conclure). Toute instrumentation est gardée par `#ifdef TEMP_DBG_xxx` et activée par
+`cmake -DCMAKE_CXX_FLAGS="-DTEMP_DBG_xxx" -DCMAKE_C_FLAGS="-DTEMP_DBG_xxx" ..` dans un
+`simulator/build_xxx/` (à supprimer ensuite). Lancer avec `DISPLAY=:1 timeout N ./grvep_sim >
+log 2>&1`, **tuer tout `grvep_sim` restant** après (`pgrep -af grvep_sim`).
+
+**Test dans `setup()`** : `setup()` s'exécute entièrement avant que `loop()` démarre (thread
+séparé, `sim_main.cpp`). Le thread audio miniaudio, lui, tourne déjà : un test peut donc
+enchaîner « régler un FX, `delay(500)`, mesurer » dans `setup()` sans jamais appeler `loop()`.
+Ce qui dépend d'un tick de `loop()` (anti-zipper FILT, LFO 10 ms, `eucliTick`) doit être appelé
+à la main — ou piloter `applyFxEffect()` directement. Pour appeler `loop()` depuis `setup()`
+il faut une déclaration avant (`void loop();` gardée par le même `#ifdef`).
+
+**Mesure audio** (le moyen fiable ; l'automatisation `xdotool` de la fenêtre SDL ne l'est pas) —
+dans `lib/AMY Synthesizer/src/libminiaudio-audio.c`, juste après
+`int16_t * buf = amy_simple_fill_buffer();` dans `data_callback`, cumuler somme des carrés /
+pic L et R / compteur dans des globals C (`double g_tapSumSqL; int32_t g_tapPeakL,g_tapPeakR;
+long g_tapCount;`), les déclarer `extern` dans le test de `setup()` et imprimer RMS/pic après
+`tapReset(); delay(500);`. Comparer des **niveaux relatifs entre états** (baseline vs FX,
+ordre A vs B) plutôt que des valeurs absolues. Toujours laisser les réglages se stabiliser
+(`delay(300+)`) et rejouer une note tenue si l'enveloppe décroît (les patches type piano
+baissent tout seuls — piège de mesure rencontré).
+
+**Capture de l'OLED** — dans `simulator/sim_window.cpp`, fonction `simWindowRender()`, **avant**
+`SDL_RenderPresent(s_rend)` (après, le backbuffer est vide → capture toute noire), sous
+`#ifdef TEMP_DBG_SCREENSHOT` : lire `getenv("GRVEP_SCREENSHOT_PATH")`, attendre ~90 frames,
+`SDL_CreateRGBSurface(0,OLED_W,OLED_H,32,0x00FF0000,0x0000FF00,0x000000FF,0xFF000000)`,
+`SDL_RenderReadPixels(s_rend,&{OLED_X,OLED_Y,OLED_W,OLED_H},SDL_PIXELFORMAT_ARGB8888,…)`,
+`SDL_SaveBMP`, `exit(0)` (ajouter `#include <cstdlib>`). Convertir (`convert x.bmp x.png`) et
+ouvrir l'image. L'état d'écran voulu s'injecte dans `setup()` (ex. `s_overlay = OVERLAY_FX;`,
+un thread d'affichage dédié redessine en continu). Un affichage parasite venu d'événements X11
+perdus sur un `DISPLAY=:1` partagé est arrivé une fois : relancer avant de conclure à un bug.
+
+**Simuler une pression joystick** : `extern bool g_simJoySW;` (défini dans `sim_state.cpp`) ;
+la broche est lue inversée (`click = !digitalRead(JOYSW)`).
+
+## Une seule copie d'AMY
+
+Le simulateur compile `lib/AMY Synthesizer/src/*.c` (liste dans `simulator/CMakeLists.txt`,
+variable `AMY_SRC`) et inclut `amy.h` depuis le même dossier via `simulator/hal/AMY-Arduino.h`.
+Ce sont exactement les sources de la cible ESP32 : voir CLAUDE.md.

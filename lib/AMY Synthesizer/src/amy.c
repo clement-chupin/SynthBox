@@ -203,6 +203,68 @@ float amy_comp_threshold = 0.5f;
 float amy_comp_ratio     = 4.0f;
 static float amy_comp_env = 0.0f;
 
+// DRIVE FX: consolidated bus-0 distortion (GrvEP), replacing separate OVERDRIVE/
+// DISTORT FX that were each just a resonant filter sweep with no actual
+// waveshaping at all ("ressemble juste à un LPF"). One engine, 4 selectable
+// algorithms sharing the same drive/tone/level trio (type: 0=Overdrive gentle
+// tanh, 1=Distort harder saturating exponential, 2=Fuzz hard clip, 3=Destrukt
+// foldback) plus a shared post-saturation brightness tilt (tone). Set from
+// audio_engine.cpp via audioSetDrive().
+float amy_drive_on    = 0.0f;
+float amy_drive_amt   = 0.0f;   // 0..1
+float amy_drive_tone  = 0.5f;   // 0..1, 0=bright, 1=dark
+float amy_drive_level = 1.0f;   // 0..~1.5
+float amy_drive_type  = 0.0f;   // 0=Overdrive,1=Distort,2=Fuzz,3=Destrukt
+static float amy_drive_tone_lp[AMY_NCHANS] = {0};
+
+
+// RESECHO FX: bespoke delay + filter-IN-THE-FEEDBACK-PATH engine, ported from a sibling
+// project's design. This is a SEPARATE mono delay line (not shared with DELAY) with a
+// Chamberlin state-variable filter inside the feedback loop and feedback allowed much
+// closer to unity, so it can genuinely "ring" for a long time and build an evolving
+// texture — a hard clamp on the fed-back sample keeps that bounded/stable instead of
+// truly blowing up even at extreme settings. Mono in, mono wet added equally to both
+// channels (matches the ported design, which used one delay buffer).
+// The feedback tap used to be the SVF's BANDPASS output (`band`), which concentrates
+// all resonant buildup at one specific frequency (`amy_resoecho_centre`, "Tone" in the
+// UI) — reported as sounding like it only rings at one arbitrary pitch rather than
+// resonating across the spectrum. It now taps the SVF's LOWPASS output (`low`) instead:
+// broadband/comb-filter-style resonance across the whole passband below the (now
+// renamed) damping cutoff, only progressively darkened above it — see
+// amy_apply_resoecho()'s own comment.
+float    amy_resoecho_on            = 0.0f;
+float    amy_resoecho_level         = 0.0f;    // wet mix amount
+float    amy_resoecho_feedback      = 0.0f;    // 0..~0.97
+// Damping cutoff, Hz (was a resonant bandpass CENTRE frequency — the feedback tap is now
+// the SVF's lowpass output, not its bandpass, see amy_apply_resoecho()'s own comment: the
+// resonance is broadband/comb-filter-like across the whole passband below this cutoff,
+// not concentrated at one pitch). Higher = brighter/more of the spectrum resonates.
+float    amy_resoecho_centre        = 800.0f;
+float    amy_resoecho_reso          = 2.0f;    // higher = more resonant peak
+uint32_t amy_resoecho_delay_samples = 4410;    // BPM-synced, set from audio_engine.cpp
+static SAMPLE*  amy_resoecho_buf     = NULL;
+static uint32_t amy_resoecho_buf_len = 0;      // power of 2
+static uint32_t amy_resoecho_write   = 0;
+static float    amy_resoecho_svf_low  = 0.0f;
+static float    amy_resoecho_svf_band = 0.0f;
+
+// FILT FX (GrvEP), Typ=LPF/HPF/BPF: a bus-0 Chamberlin state-variable filter (same
+// stable, no-feedback-loop-overflow design already used for RESECHO's own resonant
+// filter). This — together with LADDER (amy_ladder_*, above/below) — is what makes
+// FILT a genuine bus-0 chain participant: previously LPF/HPF/BPF were per-oscillator
+// only (applied at the very source, upstream of every bus effect), which meant they
+// could never be positioned relative to RESECHO/DRIVE/etc. by activation order the
+// way the user wanted ("je veux juste que les FX se placent les uns à la suite des
+// autres selon l'ordre d'activation"). Set from audio_engine.cpp via
+// audioSetFiltBus(); dispatched by activation order in amy_apply_ordered_fx() below,
+// not a fixed position.
+float amy_filt_on      = 0.0f;
+float amy_filt_type    = 0.0f;  // 0=LPF, 1=HPF, 2=BPF (LADDER uses amy_ladder_* instead)
+float amy_filt_cutoff  = 2000.0f;
+float amy_filt_reso    = 1.0f;
+static float amy_filt_svf_low[AMY_NCHANS]  = {0};
+static float amy_filt_svf_band[AMY_NCHANS] = {0};
+
 // Public pointer to recently-emitted waveform block.
 output_sample_type * amy_out_block = NULL;
 // Audio input blocks. Filled by the audio implementation before rendering.
@@ -266,6 +328,29 @@ uint32_t enclosing_power_of_2(uint32_t n) {
     uint32_t result = 1;
     while (result < n)  result <<= 1;
     return result;
+}
+
+// RESECHO FX config — see amy_resoecho_* declarations above. Lazily allocates a
+// fixed-size buffer on first use (matches config_echo's own 700ms/32768-sample
+// headroom, so no realloc is ever needed again as delay_ms changes with BPM — only
+// the read offset amy_resoecho_delay_samples moves).
+void amy_resoecho_config(float level, float feedback, float centre_hz, float resonance,
+                          float delay_ms, int on) {
+    if (amy_resoecho_buf == NULL) {
+        amy_resoecho_buf_len = enclosing_power_of_2((uint32_t)(0.7f * AMY_SAMPLE_RATE) + 1);
+        amy_resoecho_buf = (SAMPLE*)malloc_caps(amy_resoecho_buf_len * sizeof(SAMPLE), amy_global.config.ram_caps_delay);
+        if (amy_resoecho_buf == NULL) { amy_resoecho_buf_len = 0; return; }
+        for (uint32_t i = 0; i < amy_resoecho_buf_len; i++) amy_resoecho_buf[i] = F2S(0.0f);
+    }
+    amy_resoecho_level    = level;
+    amy_resoecho_feedback = feedback;
+    amy_resoecho_centre   = centre_hz;
+    amy_resoecho_reso     = resonance;
+    uint32_t ds = (uint32_t)(delay_ms * (AMY_SAMPLE_RATE / 1000.0f));
+    if (ds < 1) ds = 1;
+    if (ds >= amy_resoecho_buf_len) ds = amy_resoecho_buf_len - 1;
+    amy_resoecho_delay_samples = ds;
+    amy_resoecho_on = on ? 1.0f : 0.0f;
 }
 
 void config_echo(uint8_t bus, float level, float delay_ms, float max_delay_ms, float feedback, float filter_coef) {
@@ -1935,6 +2020,268 @@ void amy_process_event(amy_event *e) {
     }
 }
 
+// ==================== GrvEP bus-0 FX chain (activation-order dispatch) ====================
+// The GrvEP-custom bus-0 effects below (FILT-non-ladder/LADDER, DRIVE, RESECHO, the
+// REP/BITCRS wavefold, RINGMOD, COMPRESS) each get their own function here so they can
+// be applied in ANY order — specifically the order the user actually activated them in
+// (fxOrderList/fxOrderCount, tracked on the GrvEP/main.cpp side and mirrored here via a
+// plain extern), not a fixed pipeline position. This is a deliberate replacement for an
+// earlier one-off "run a second LPF specifically after RESECHO" patch, which worked for
+// that one pairing but wasn't what was actually asked for: "je veux juste que les FX se
+// placent les uns à la suite des autres selon l'ordre d'activation. Si j'active ResEcho
+// puis LPF, j'aurai donc synth > ResEcho > LPF > sortie audio."
+//
+// AMY's OWN built-in per-bus effects (REVERB/CHORUS/FLANGER/DELAY/EQ/RES — the ones
+// implemented via config_reverb/config_chorus/config_echo/config_eq) are NOT part of
+// this reordering: they live inside AMY's own fixed per-bus loop (further below, after
+// this dispatch), which processes EQ->chorus->echo->reverb in that fixed relative order
+// regardless of when the user turned them on. Reordering those against each other or
+// against this GrvEP chain would need restructuring AMY's own mixer, out of scope here.
+// They always run AFTER this whole GrvEP chain, same position as before.
+//
+// FILT converting to a pure bus-0 effect (LPF/HPF/BPF via a new Chamberlin state-variable
+// filter here, alongside the existing separate LADDER design) — instead of also keeping
+// its old per-oscillator application — is what makes it a genuine, positionable chain
+// participant at all: a per-oscillator filter is applied at the very source, upstream of
+// every bus effect, so it could never be "placed after ResEcho" no matter what. This also
+// means FILT now reaches literally everything mixed into bus 0 uniformly (drums, samples,
+// patches, T303, etc.), same as LADDER already did, rather than only the specific
+// oscillator ranges audioSetAllFiltersT() was wired to reach.
+extern uint8_t fxOrderList[];
+extern uint8_t fxOrderCount;
+
+// REP/BITCRS wavefold — shared single gain (amy_wavefold_gain_bus0), see audioSetWavefold().
+static void amy_apply_wavefold_bus0(SAMPLE* buf) {
+    if (amy_wavefold_gain_bus0 <= 1.001f || buf == NULL) return;
+    int n = AMY_BLOCK_SIZE * AMY_NCHANS;
+    float peak = 0.0f;
+    for (int i = 0; i < n; i++) { float a = fabsf(buf[i]); if (a > peak) peak = a; }
+    if (peak <= 0.001f) return;
+    float g = amy_wavefold_gain_bus0;
+    float inv_peak = 1.0f / peak;
+    for (int i = 0; i < n; i++) {
+        float s = buf[i] * inv_peak * g;
+        float phase = fmodf(s + 1.0f, 4.0f);
+        if (phase < 0.0f) phase += 4.0f;
+        buf[i] = ((phase < 2.0f) ? (phase - 1.0f) : (3.0f - phase)) * peak;
+    }
+}
+
+// RINGMOD: multiplies the signal by a sine carrier. One carrier phase per stereo frame
+// (not per channel) so the carrier stays phase-locked across L/R. fbl is PLANAR (each
+// channel its own contiguous AMY_BLOCK_SIZE run — see the final mix's own indexing).
+static void amy_apply_ringmod(SAMPLE* buf) {
+    if (amy_ringmod_on <= 0.5f || amy_ringmod_mix <= 0.001f || buf == NULL) return;
+    float phaseInc = amy_ringmod_freq * 2.0f * (float)M_PI / (float)AMY_SAMPLE_RATE;
+    float mix = amy_ringmod_mix;
+    for (int i = 0; i < AMY_BLOCK_SIZE; i++) {
+        float carrier = sinf(amy_ringmod_phase);
+        for (int ch = 0; ch < AMY_NCHANS; ch++) {
+            int idx = i + ch * AMY_BLOCK_SIZE;
+            float dry = buf[idx];
+            buf[idx] = dry * (1.0f - mix) + (dry * carrier) * mix;
+        }
+        amy_ringmod_phase += phaseInc;
+        if (amy_ringmod_phase > 2.0f * (float)M_PI) amy_ringmod_phase -= 2.0f * (float)M_PI;
+    }
+}
+
+// FILT: LADDER (existing two-cascade feedforward-resonance design, unchanged/kept
+// exactly as tuned) or LPF/HPF/BPF (new Chamberlin state-variable filter — the SAME
+// stable topology already proven in RESECHO's own resonant filter, picking whichever
+// of its three simultaneous taps (low/high/band) matches Typ).
+static void amy_apply_filt(SAMPLE* buf) {
+    if (buf == NULL) return;
+    if (amy_ladder_on > 0.5f) {
+        // g = 1 - exp(-2*pi*fc/fs): correct one-pole coefficient for cutoff fc.
+        float g = 1.0f - expf(-2.0f * (float)M_PI * amy_ladder_cutoff / (float)AMY_SAMPLE_RATE);
+        if (g < 0.001f) g = 0.001f;
+        if (g > 0.999f) g = 0.999f;
+        float nyquist  = AMY_SAMPLE_RATE * 0.5f;
+        float headroom = (nyquist - amy_ladder_cutoff) / nyquist;
+        if (headroom < 0.0f) headroom = 0.0f;
+        if (headroom > 1.0f) headroom = 1.0f;
+        float fc2 = amy_ladder_cutoff * (1.0f + 0.6f * headroom);
+        float g2 = 1.0f - expf(-2.0f * (float)M_PI * fc2 / (float)AMY_SAMPLE_RATE);
+        if (g2 < 0.001f) g2 = 0.001f;
+        if (g2 > 0.999f) g2 = 0.999f;
+        for (int ch = 0; ch < AMY_NCHANS; ch++) {
+            float* s = amy_ladder_stage[ch];
+            SAMPLE* cbuf = buf + ch * AMY_BLOCK_SIZE;
+            for (int i = 0; i < AMY_BLOCK_SIZE; i++) {
+                float rawin = S2F(cbuf[i]);
+                s[0] += g * (rawin - s[0]);
+                s[1] += g * (s[0] - s[1]);
+                s[2] += g2 * (rawin - s[2]);
+                s[3] += g2 * (s[2] - s[3]);
+                float peak = (s[3] - s[1]) * amy_ladder_resonance;
+                float outv = s[1] + peak;
+                outv = tanhf(outv * 0.6f) * 1.6667f;
+                cbuf[i] = F2S(outv);
+            }
+        }
+    } else if (amy_filt_on > 0.5f) {
+        // Zero-delay-feedback (TPT/Zavalishin) state-variable filter: unconditionally
+        // stable for any cutoff/Q, unlike the Chamberlin form this replaced (only stable
+        // for f < ~2-q — at high cutoff + high resonance it diverged to full-scale/NaN
+        // and stayed stuck there even after the knobs came back to sane values).
+        uint8_t type = (uint8_t)amy_filt_type;
+        float fc = amy_filt_cutoff;
+        if (fc < 20.0f) fc = 20.0f;
+        if (fc > 0.45f * (float)AMY_SAMPLE_RATE) fc = 0.45f * (float)AMY_SAMPLE_RATE;
+        float g = tanf((float)M_PI * fc / (float)AMY_SAMPLE_RATE);
+        float k = 1.0f / (amy_filt_reso < 0.5f ? 0.5f : amy_filt_reso);
+        if (k < 0.08f) k = 0.08f;
+        float a1 = 1.0f / (1.0f + g * (g + k));
+        float a2 = g * a1;
+        float a3 = g * a2;
+        for (int ch = 0; ch < AMY_NCHANS; ch++) {
+            SAMPLE* cbuf = buf + ch * AMY_BLOCK_SIZE;
+            float ic1 = amy_filt_svf_low[ch], ic2 = amy_filt_svf_band[ch];
+            for (int i = 0; i < AMY_BLOCK_SIZE; i++) {
+                float x = S2F(cbuf[i]);
+                float v3 = x - ic2;
+                float v1 = a1 * ic1 + a2 * v3;
+                float v2 = ic2 + a2 * ic1 + a3 * v3;
+                ic1 = 2.0f * v1 - ic1;
+                ic2 = 2.0f * v2 - ic2;
+                float y = (type == 0) ? v2 : (type == 1) ? (x - k * v1 - v2) : (k * v1);
+                if (!(y > -64.0f && y < 64.0f)) { y = 0.0f; ic1 = 0.0f; ic2 = 0.0f; }  // NaN/inf guard
+                cbuf[i] = F2S(y);
+            }
+            amy_filt_svf_low[ch] = ic1;   // (reused as TPT integrator state ic1eq)
+            amy_filt_svf_band[ch] = ic2;  // (reused as TPT integrator state ic2eq)
+        }
+    }
+}
+
+static void amy_apply_drive(SAMPLE* buf) {
+    if (amy_drive_on <= 0.5f || buf == NULL) return;
+    uint8_t type = (uint8_t)amy_drive_type;
+    float amt = amy_drive_amt;
+    float pregain;
+    switch (type) {
+        case 0:  pregain = 1.0f + amt * 5.0f;  break;
+        case 1:  pregain = 1.0f + amt * 11.0f; break;
+        case 2:  pregain = 1.0f + amt * 25.0f; break;
+        default: pregain = 1.0f + amt * 9.0f;  break;
+    }
+    float odNorm = 1.0f / tanhf(pregain);
+    float toneCutoff = 18000.0f * powf(400.0f / 18000.0f, amy_drive_tone);
+    float g = 1.0f - expf(-2.0f * (float)M_PI * toneCutoff / (float)AMY_SAMPLE_RATE);
+    if (g < 0.001f) g = 0.001f;
+    if (g > 0.999f) g = 0.999f;
+    float level = amy_drive_level;
+    int n = AMY_BLOCK_SIZE * AMY_NCHANS;
+    for (int i = 0; i < n; i++) {
+        int ch = i / AMY_BLOCK_SIZE;
+        float s = S2F(buf[i]) * pregain;
+        float y;
+        if (type == 0) {
+            y = tanhf(s) * odNorm;
+        } else if (type == 1) {
+            y = (s >= 0.0f) ? (1.0f - expf(-s)) : (-1.0f + expf(s));
+        } else if (type == 2) {
+            y = (s > 1.0f) ? 1.0f : ((s < -1.0f) ? -1.0f : s);
+        } else {
+            float phase = fmodf(s + 1.0f, 4.0f);
+            if (phase < 0.0f) phase += 4.0f;
+            y = (phase < 2.0f) ? (phase - 1.0f) : (3.0f - phase);
+        }
+        amy_drive_tone_lp[ch] += g * (y - amy_drive_tone_lp[ch]);
+        buf[i] = F2S(amy_drive_tone_lp[ch] * level);
+    }
+}
+
+// RESECHO: mono delay line with a resonant state-variable filter inside the feedback
+// loop — see amy_resoecho_* declarations for why this is a separate engine from DELAY.
+static void amy_apply_resoecho(SAMPLE* buf) {
+    if (amy_resoecho_on <= 0.5f || amy_resoecho_buf == NULL || buf == NULL) return;
+    uint32_t mask = amy_resoecho_buf_len - 1;
+    uint32_t ds = amy_resoecho_delay_samples;
+    float f = 2.0f * sinf((float)M_PI * amy_resoecho_centre / (float)AMY_SAMPLE_RATE);
+    if (f > 1.9f) f = 1.9f;
+    float q = 1.0f / amy_resoecho_reso;
+    for (int i = 0; i < AMY_BLOCK_SIZE; i++) {
+        float inSample = 0.5f * (S2F(buf[i]) + S2F(buf[AMY_BLOCK_SIZE + i]));
+        uint32_t readIdx = (amy_resoecho_write - ds) & mask;
+        float delayed = S2F(amy_resoecho_buf[readIdx]);
+        float low  = amy_resoecho_svf_low + f * amy_resoecho_svf_band;
+        float high = delayed - low - q * amy_resoecho_svf_band;
+        float band = amy_resoecho_svf_band + f * high;
+        amy_resoecho_svf_low  = low;
+        amy_resoecho_svf_band = band;
+        // Broadband feedback tap (was `band*q`, the SVF's bandpass output — resonance
+        // concentrated at exactly `amy_resoecho_centre`, reported as sounding like it only
+        // "rings" at one arbitrary pitch). `low` is a lowpass instead: everything below the
+        // cutoff feeds back and can build up (comb-filter-style resonance across the WHOLE
+        // passband, not a single peak), only progressively darkened above the cutoff. The
+        // SVF's internal `q` still shapes `band`, which `low` integrates every sample, so
+        // Wild/resonance still audibly changes how much this self-sustains/saturates — it's
+        // just no longer the sole thing being fed back.
+        // 0.4x: `low`'s natural passband gain (further reinforced by resonance, since it
+        // integrates `band` every sample) runs noticeably hotter than the old `band*q`
+        // tap's deliberately-unity-normalized peak — empirically compensated so the same
+        // Lvl/FB/Wild dial positions land in roughly the same loudness ballpark as before.
+        float filtered = low * 0.22f;
+        float fbSample = inSample + filtered * amy_resoecho_feedback;
+        fbSample = 2.0f * tanhf(fbSample * 0.5f);  // soft ceiling (~2.0), bounded even at unity loop gain
+        if (!(fbSample > -8.0f && fbSample < 8.0f)) { fbSample = 0.0f; amy_resoecho_svf_low = 0.0f; amy_resoecho_svf_band = 0.0f; }
+        amy_resoecho_buf[amy_resoecho_write] = F2S(fbSample);
+        amy_resoecho_write = (amy_resoecho_write + 1) & mask;
+        float wet = filtered * amy_resoecho_level;
+        buf[i]                  = F2S(S2F(buf[i])                  + wet);
+        buf[AMY_BLOCK_SIZE + i] = F2S(S2F(buf[AMY_BLOCK_SIZE + i]) + wet);
+    }
+}
+
+// COMPRESSOR: feedforward peak-envelope-follower gain reduction. Linked stereo: one
+// envelope/gain value per frame driven by whichever channel is louder, applied to both
+// channels' (planar) copy of that same time index.
+static void amy_apply_compressor(SAMPLE* buf) {
+    if (amy_comp_on <= 0.5f || buf == NULL) return;
+    float thresh = amy_comp_threshold;
+    float ratio  = amy_comp_ratio;
+    float attackCoef  = expf(-1.0f / (0.005f * (float)AMY_SAMPLE_RATE));
+    float releaseCoef = expf(-1.0f / (0.080f * (float)AMY_SAMPLE_RATE));
+    for (int i = 0; i < AMY_BLOCK_SIZE; i++) {
+        float rect = 0.0f;
+        for (int ch = 0; ch < AMY_NCHANS; ch++) {
+            // S2F(): see COMPRESS's own history — comparing the raw SAMPLE magnitude
+            // directly against amy_comp_threshold (normalized 0..1) was off by
+            // 1<<S_FRAC_BITS on fixed-point builds, collapsing gr to near-zero always.
+            float a = fabsf(S2F(buf[i + ch * AMY_BLOCK_SIZE]));
+            if (a > rect) rect = a;
+        }
+        float coef = (rect > amy_comp_env) ? attackCoef : releaseCoef;
+        amy_comp_env = rect + coef * (amy_comp_env - rect);
+        float gr = 1.0f;
+        if (amy_comp_env > thresh && thresh > 0.001f) {
+            float over_db = 20.0f * log10f(amy_comp_env / thresh);
+            float comp_db = over_db * (1.0f - 1.0f / ratio);
+            gr = powf(10.0f, -comp_db / 20.0f);
+        }
+        for (int ch = 0; ch < AMY_NCHANS; ch++) buf[i + ch * AMY_BLOCK_SIZE] *= gr;
+    }
+}
+
+// Applies every active GrvEP-custom bus-0 FX in fxOrderList order (activation order).
+static void amy_apply_ordered_fx(SAMPLE* buf) {
+    if (buf == NULL) return;
+    for (uint8_t oi = 0; oi < fxOrderCount; oi++) {
+        switch (fxOrderList[oi]) {
+            case 0:  amy_apply_filt(buf);       break;  // FILT (LPF/HPF/BPF/LADDER)
+            case 1:  amy_apply_drive(buf);      break;  // DRIVE
+            case 7:  amy_apply_resoecho(buf);   break;  // RESECHO
+            case 8:  amy_apply_wavefold_bus0(buf); break;  // REP
+            case 9:  amy_apply_wavefold_bus0(buf); break;  // BITCRS (shares REP's gain)
+            case 11: amy_apply_ringmod(buf);    break;  // RINGMOD
+            case 12: amy_apply_compressor(buf); break;  // COMPRESS
+            default: break;  // AMY-native FX (REVERB/CHORUS/FLANGER/DELAY/EQ/RES) — fixed position, see below
+        }
+    }
+}
+
 int16_t * amy_fill_buffer() {
     AMY_PROFILE_START(AMY_FILL_BUFFER)
     #ifdef __EMSCRIPTEN__
@@ -2002,164 +2349,9 @@ int16_t * amy_fill_buffer() {
         memset(fbl[0][1], 0, n * sizeof(SAMPLE));
     }
 
-    // Global wavefolder on bus 0 (REP FX): applied after bus merge so all audio is folded.
-    if (amy_wavefold_gain_bus0 > 1.001f && fbl[0][0] != NULL) {
-        SAMPLE* buf = fbl[0][0];
-        int n = AMY_BLOCK_SIZE * AMY_NCHANS;
-        float peak = 0.0f;
-        for (int i = 0; i < n; i++) { float a = fabsf(buf[i]); if (a > peak) peak = a; }
-        if (peak > 0.001f) {
-            float g = amy_wavefold_gain_bus0;
-            float inv_peak = 1.0f / peak;
-            for (int i = 0; i < n; i++) {
-                float s = buf[i] * inv_peak * g;
-                float phase = fmodf(s + 1.0f, 4.0f);
-                if (phase < 0.0f) phase += 4.0f;
-                buf[i] = ((phase < 2.0f) ? (phase - 1.0f) : (3.0f - phase)) * peak;
-            }
-        }
-    }
-
-    // Global ring modulator on bus 0 (RINGMOD FX): multiplies the signal by a sine
-    // carrier. One carrier phase per stereo frame (not per channel) so the carrier
-    // stays phase-locked across L/R instead of decorrelating them.
-    if (amy_ringmod_on > 0.5f && amy_ringmod_mix > 0.001f && fbl[0][0] != NULL) {
-        SAMPLE* buf = fbl[0][0];
-        int n = AMY_BLOCK_SIZE * AMY_NCHANS;
-        float phaseInc = amy_ringmod_freq * 2.0f * (float)M_PI / (float)AMY_SAMPLE_RATE;
-        float mix = amy_ringmod_mix;
-        for (int i = 0; i < n; i += AMY_NCHANS) {
-            float carrier = sinf(amy_ringmod_phase);
-            for (int ch = 0; ch < AMY_NCHANS; ch++) {
-                float dry = buf[i+ch];
-                buf[i+ch] = dry * (1.0f - mix) + (dry * carrier) * mix;
-            }
-            amy_ringmod_phase += phaseInc;
-            if (amy_ringmod_phase > 2.0f * (float)M_PI) amy_ringmod_phase -= 2.0f * (float)M_PI;
-        }
-    }
-
-    // Global resonant LPF on bus 0 (FILT FX, Typ=LADDER) — see the amy_ladder_*
-    // declarations above for why this exists as custom DSP rather than an AMY
-    // filter_type (no ladder topology exists there).
-    //
-    // ---- History (read before changing this again) ----
-    // Three earlier designs all put the resonance inside a FEEDBACK loop (classic
-    // Moog-ladder style: last stage's output subtracted back from the input) and
-    // fought the same family of problems every time: stacking a saturator on every
-    // stage made it chaotic; a single saturator on the feedback tap saturated so
-    // early that resonance did almost nothing across ~95% of its range; giving that
-    // saturator more headroom fixed the range but then let genuine self-oscillation
-    // build up — which is exactly what a real acid filter does, but here it turned
-    // out harsh/shriek-y at high cutoffs and could occasionally get stuck ringing
-    // (a feedback loop's state can only be forced to zero by an explicit gate,
-    // which is fragile against anything that keeps "input" technically non-silent,
-    // e.g. a reverb/delay tail sharing the same bus).
-    //
-    // This design has NO feedback loop at all, so none of that class of bug can
-    // happen, structurally: two independent 2-pole lowpass cascades run at the
-    // SAME cutoff but different "voicing" (stageB is tuned slightly brighter), and
-    // their difference — a bandpass-shaped bump centered near the cutoff — is
-    // mixed back on top of the main (stageA) lowpass output, scaled by resonance.
-    // Since that mix is feedforward (added once, not fed back into next sample's
-    // input), it cannot compound or run away regardless of how high resonance is
-    // set: raising it only makes the bump louder, never unstable. With zero input,
-    // every stage is a plain leaky integrator decaying toward 0 — no separate
-    // "silence gate" hack is needed, it's just how a lowpass behaves.
-    if (amy_ladder_on > 0.5f && fbl[0][0] != NULL) {
-        // g = 1 - exp(-2*pi*fc/fs) is the correct one-pole coefficient for a target
-        // cutoff fc (leaky integrator y += g*(x-y) has -3dB point at fc only with
-        // this formula). The previous g = fc/(fs/2) linear approximation was way off
-        // except at very low fc — e.g. a nominal 4000Hz setting was actually acting
-        // like ~1400Hz, 16000Hz like ~9000Hz (verified numerically). That mismatch
-        // is very likely why the cutoff pot felt "off," and also why bass notes
-        // (whose dense harmonic spacing means many harmonics sit right around
-        // wherever the ACTUAL cutoff ends up) sounded so much more resonant/different
-        // than treble notes: the real cutoff was sitting much lower than the label
-        // suggested, so bass content was interacting with the resonant peak far more
-        // than a correctly-calibrated "4000Hz" filter would.
-        float g = 1.0f - expf(-2.0f * (float)M_PI * amy_ladder_cutoff / (float)AMY_SAMPLE_RATE);
-        if (g < 0.001f) g = 0.001f;
-        if (g > 0.999f) g = 0.999f;
-        // Second cascade's cutoff is a multiple brighter than the first, computed the
-        // same correct way (not by scaling the coefficient directly, which doesn't
-        // correspond to a clean frequency ratio) — the gap between the two is what
-        // shapes the resonant bump's width. A FIXED 1.6x ratio, hard-clamped near
-        // Nyquist, meant that at high cutoff settings cascade B had no room left to
-        // actually be 1.6x brighter: it degenerated into a nearly all-pass stage (g2
-        // close to 1), letting almost all of the input's raw high-frequency content
-        // straight through into the (s[3]-s[1]) difference used for the bump below —
-        // audible as harsh broadband sizzle/crackle in the treble rather than a clean
-        // resonant hump ("le LDR grésille un peu trop dans les aigus"). Shrinking the
-        // ratio itself toward 1.0 as cutoff approaches Nyquist keeps cascade B
-        // proportionally close to cascade A throughout, so the bump stays a narrowband
-        // hump near the cutoff instead of degrading into broadband hiss — behavior at
-        // low/mid cutoff (most of the practical range, headroom≈1) is unchanged. This
-        // also makes fc2 self-limiting (it can only approach amy_ladder_cutoff itself,
-        // never exceed it), so the old hard Nyquist clamp is no longer needed.
-        float nyquist  = AMY_SAMPLE_RATE * 0.5f;
-        float headroom = (nyquist - amy_ladder_cutoff) / nyquist;  // 1 at low cutoff, ->0 near Nyquist
-        if (headroom < 0.0f) headroom = 0.0f;
-        if (headroom > 1.0f) headroom = 1.0f;
-        float fc2 = amy_ladder_cutoff * (1.0f + 0.6f * headroom);  // ratio tapers 1.6x -> 1.0x
-        float g2 = 1.0f - expf(-2.0f * (float)M_PI * fc2 / (float)AMY_SAMPLE_RATE);
-        if (g2 < 0.001f) g2 = 0.001f;
-        if (g2 > 0.999f) g2 = 0.999f;
-        int n = AMY_BLOCK_SIZE * AMY_NCHANS;
-        SAMPLE* buf = fbl[0][0];
-        for (int ch = 0; ch < AMY_NCHANS; ch++) {
-            // Repurposed from the old feedback design: s[0]/s[1] = cascade A (the
-            // main 2-pole lowpass that's actually output), s[2]/s[3] = cascade B
-            // (the brighter reference cascade used only to derive the peak).
-            float* s = amy_ladder_stage[ch];
-            for (int i = ch; i < n; i += AMY_NCHANS) {
-                float rawin = S2F(buf[i]);
-                s[0] += g * (rawin - s[0]);
-                s[1] += g * (s[0] - s[1]);
-                s[2] += g2 * (rawin - s[2]);
-                s[3] += g2 * (s[2] - s[3]);
-                float peak = (s[3] - s[1]) * amy_ladder_resonance;
-                float outv = s[1] + peak;
-                // Gentle safety soft-clip — engages only if a user dials resonance
-                // very high on loud material; does not define the resonance
-                // character itself (that's entirely the feedforward peak above).
-                outv = tanhf(outv * 0.6f) * 1.6667f;
-                buf[i] = F2S(outv);
-            }
-        }
-    }
-
-    // Global compressor on bus 0 (COMPRESSOR FX): feedforward peak-envelope-follower
-    // gain reduction, run last so it acts as a final glue/limiting stage over the fold/
-    // ringmod/ladder-filter processing above it, same spirit as a mastering compressor
-    // sitting after everything else in the chain. Attack/release times are fixed
-    // (5ms/80ms) — musically reasonable defaults rather than adding two more pot slots.
-    if (amy_comp_on > 0.5f && fbl[0][0] != NULL) {
-        // Linked stereo: one envelope/gain-reduction value per frame, driven by
-        // whichever channel is louder — keeps L/R gain matched instead of each
-        // channel compressing independently (which would wobble the stereo image).
-        SAMPLE* buf = fbl[0][0];
-        float thresh = amy_comp_threshold;
-        float ratio  = amy_comp_ratio;
-        float attackCoef  = expf(-1.0f / (0.005f * (float)AMY_SAMPLE_RATE));
-        float releaseCoef = expf(-1.0f / (0.080f * (float)AMY_SAMPLE_RATE));
-        for (int i = 0; i < AMY_BLOCK_SIZE; i++) {
-            float rect = 0.0f;
-            for (int ch = 0; ch < AMY_NCHANS; ch++) {
-                float a = fabsf(buf[i*AMY_NCHANS + ch]);
-                if (a > rect) rect = a;
-            }
-            float coef = (rect > amy_comp_env) ? attackCoef : releaseCoef;
-            amy_comp_env = rect + coef * (amy_comp_env - rect);
-            float gr = 1.0f;
-            if (amy_comp_env > thresh && thresh > 0.001f) {
-                float over_db = 20.0f * log10f(amy_comp_env / thresh);
-                float comp_db = over_db * (1.0f - 1.0f / ratio);
-                gr = powf(10.0f, -comp_db / 20.0f);
-            }
-            for (int ch = 0; ch < AMY_NCHANS; ch++) buf[i*AMY_NCHANS + ch] *= gr;
-        }
-    }
+    // GrvEP's own bus-0 FX (FILT/DRIVE/RESECHO/REP/BITCRS/RINGMOD/COMPRESS), applied in
+    // activation order — see amy_apply_ordered_fx() above.
+    amy_apply_ordered_fx(fbl[0][0]);
 
     for (int bus=0; bus <= amy_global.highest_bus; ++bus) {
         // Per-bus EQ

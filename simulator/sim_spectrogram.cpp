@@ -27,11 +27,7 @@
 // visible at boot as "AMY_BLOCK_SIZE=128" and confirmed via i2s.c's stereo config) →
 // libminiaudio-audio.c's OUTPUT_RING_FRAMES = AMY_BLOCK_SIZE*8 = 1024,
 // OUTPUT_RING_LENGTH (interleaved stereo int16 samples) = 1024*2 = 2048. Not pulling
-// these from amy.h here: this simulator target's own HAL header resolves amy.h to a
-// sibling repo's copy (other_projects/amy) while actually linking the OTHER AMY
-// copy's compiled sources (lib/AMY Synthesizer) — harmless for the handful of plain
-// numeric constants this file needs, but not worth adding an include-path dependency
-// on either copy for.
+// these from amy.h here: plain numeric constants, not worth an include-path dependency.
 extern "C" {
     extern int16_t  output_ring[];
     extern uint16_t ring_write_ptr;

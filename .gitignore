@@ -27,3 +27,6 @@ android-native/SDL2/
 
 # Keep only the packaged APK to publish
 !releases/*.apk
+
+# graphify (knowledge-graph tool) output — generated, not source
+graphify-out/

@@ -6,7 +6,7 @@ generative modes — cellular automaton, boid swarm, theremin, ball physics...),
 sample playback, OLED, a 4×8 key grid, joystick, 7 potentiometers, addressable LEDs.
 
 The same application code (`src/`) runs on four targets. **Read this whole file before
-touching build config or AMY's DSP code** — the AMY dual-copy setup below is the single
+touching build config or AMY's DSP code** — the single AMY copy described below is the single
 most likely thing to trip up a fresh session.
 
 ## The four build targets
@@ -21,50 +21,34 @@ most likely thing to trip up a fresh session.
 Full commands (flashing, monitor, `--install`, release builds, etc.) are in the root
 `README.md`.
 
-### Required one-time setup for the ESP32 target
+## AMY: one copy, shared by every target
 
-`platformio.ini`'s `lib_deps` includes `${PROJECT_DIR}/../other_projects/amy` — a
-**hard-coded relative path to a sibling checkout that does not exist in this repo**. The
-ESP32 build will fail to find the AMY library unless that sibling clone exists:
+AMY (the synth engine, `amy.c`/`amy.h`/etc.) lives in exactly one place:
+**`lib/AMY Synthesizer/src/`**, vendored in this repo. The ESP32 build picks it up
+automatically because PlatformIO scans `lib/` (there is deliberately no AMY entry in
+`platformio.ini`'s `lib_deps`), and the simulator/Android/Web builds compile the same
+files via `simulator/CMakeLists.txt` (`AMY_SRC`) and `simulator/hal/AMY-Arduino.h`. No
+sibling checkout is needed anymore. (It used to be two hand-synced copies — this repo's
+plus `../other_projects/amy` — which had drifted apart, e.g. the ESP32 one lacked the
+bus1->bus0 merge, so bus-0 FX never reached the TB-303 there.) Any DSP change is made
+once, in `lib/AMY Synthesizer/src/`.
 
+Buffer layout note: the per-bus `fbl[]` buffers are **planar** (`[L,L,L...][R,R,R...]`,
+channel `c` at `buf + c*AMY_BLOCK_SIZE`) in this copy, despite a stale "interleaved"
+comment on `mix_with_pan()`. Index them planar-style in any new bus DSP. `SAMPLE` is
+fixed-point (s8.23) on every target incl. the simulator — use `S2F()`/`F2S()`.
+
+If PlatformIO ever seems to build a stale AMY after an edit:
 ```bash
-# from the parent directory of this repo
-mkdir -p other_projects
-git clone https://github.com/shorepine/amy.git other_projects/amy
-```
-
-Nothing else in this repo depends on that sibling path — only the ESP32/PlatformIO build.
-The desktop simulator, Android, and Web targets use the AMY copy vendored directly in
-`lib/AMY Synthesizer/src/` (see below) and don't need it.
-
-## AMY: two copies, kept in sync by hand
-
-AMY (the synth engine, `amy.c`/`amy.h`/etc.) exists in **two places** in this project, and
-they are **not** the same file kept in sync by tooling — any DSP-level change (bus effects,
-oscillators, filters) has to be applied to both by hand:
-
-1. **`lib/AMY Synthesizer/src/`** — vendored into this repo, used by the desktop simulator
-   and Android builds. Audio buffers here are **interleaved** stereo (`L,R,L,R,...`).
-2. **`../other_projects/amy/src/`** (the sibling clone above) — used by the ESP32 build via
-   PlatformIO's `lib_deps`. Audio buffers here are **planar** (`[L,L,L...][R,R,R...]`).
-
-The buffer layout difference is the single most common source of subtle bugs when porting a
-DSP change between the two copies — a loop that does `for (i = ch; i < n; i += NCHANS)`
-(interleaved-correct) is wrong on the planar copy, which needs
-`for (i = 0; i < BLOCK_SIZE; i++)` over `buf + ch*BLOCK_SIZE`. When changing AMY DSP code,
-check both loops' indexing explicitly, not just copy-paste the body.
-
-After touching the ESP32-side copy, PlatformIO's cached lib copy can go stale — if a rebuild
-doesn't pick up the change:
-```bash
-rm -rf ".pio/libdeps/esp32-s3-devkitc-1/AMY Synthesizer"
-pio run -e esp32-s3-devkitc-1
+rm -rf .pio/build/esp32-s3-devkitc-1
+pio run -e esp32-s3-devkitc-1     # first run after clearing can hit a transient SCons error; just re-run
 ```
 
 ## Architecture docs (`structure/`)
 
 Deep-dive documentation lives in `structure/` — see `structure/README.md` for an index.
-Start with `structure/SOFTWARE.md` (modes, AMY channel map, FX chain) and
+Taking over the project? Read `structure/HANDOFF.md` first (owner's working agreements,
+current state, pitfalls, pending work). Then `structure/SOFTWARE.md` (modes, AMY channel map, FX chain) and
 `structure/TEMPLATES.md` (the shared UI conventions every mode follows — read this before
 adding a new mode, most of the wiring is copy-a-template-and-fill-in-the-blanks).
 
@@ -163,3 +147,13 @@ default when touching related code:
   the equivalent line for whichever Claude model made the change).
 - No automated test suite — "done" means built cleanly for the target(s) touched *and*
   verified via the simulator (see Testing methodology above), not just "compiles."
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

@@ -43,6 +43,25 @@ enum AppMode : uint8_t {
     MODE_NOOB,      // generative melody: density/rhythm/shape/variation pots, keys pick scale
     MODE_EUCLI,     // euclidean drum sequencer: 4 lanes, per-lane step count + pulse count, concentric-ring display
     MODE_CRUNCH,    // CrunchE-inspired sample instrument: the 32-sample drum bank replayed pitched, across the keyboard
+    MODE_AMBIENT,   // drone/pad synth inspired by Casual Machines' "Slide Synth Lab" — reuses MODE_MODULAR's
+                    // dual-wavetable-osc engine (MOD3_OSCA_CH/MOD3_OSCB_CH) with ambient-tuned defaults
+    MODE_NOOB2,     // NOOB's generative engine (density/rhythm/shape/variation), sounding through the
+                    // MODE_AMBIENT engine instead of SYNTH_CH — P2 picks an AmbientPresetDef instead of a SynthShape
+    MODE_OMNI2,     // OMNI's chord-grid + strum strip, chord notes sounding through the MODE_AMBIENT engine —
+                    // P2 picks an AmbientPresetDef instead of a SynthShape
+    MODE_BREAK,     // probabilistic breakbeat generator (X0X/BB-Gen-inspired): an SD loop sliced into 8,
+                    // a MOVE/STAY generator plays it, the 4x8 grid is a live performance layer on top
+                    // (column=slice, row=variant: normal/reverse/half-speed/stutter) — built on the
+                    // GRANULAR2 engine (audioPlayGranular2 etc.), reuses its sample slot 0
+    MODE_FELU,      // Felucca-inspired synth: 9 of its 13 engines (ANALOG/WHEEL/TRIO/PHASE/FM6/LOFI/
+                    // VOICE/PHYS/NOISE) reimplemented as AMY SynthShape + P4-P7 macro knobs (MOD2's own
+                    // "shape + macros" pattern, not a literal fixed-point DSP port) — algorithm browser
+                    // (B3) + simple POLY play (B4=OCT)
+    MODE_DRUMS2,    // synthesized TR-808-style kit (8 pads, DRUM2's own template) — SINE/TRIANGLE/NOISE
+                    // + filter + EG0 amp/EG1 pitch envelopes, no PCM; replaces DRUM2's sample-based kit
+                    // for users who found it "a bit cheap"-sounding
+    MODE_DRUMS3,    // same template as MODE_DRUMS2, tuned for a TR-909-style character (brighter/
+                    // punchier: more pitch-sweep + click on the kick, higher-centered snare/hat filters)
     MODE_COUNT
 };
 
@@ -77,8 +96,21 @@ enum MenuItem : uint8_t {
     MENU_NOOB,
     MENU_EUCLI,
     MENU_CRUNCH,
+    MENU_AMBIENT,
+    MENU_NOOB2,
+    MENU_OMNI2,
+    MENU_BREAK,
+    MENU_FELU,
+    MENU_DRUMS2,
+    MENU_DRUMS3,
     MENU_ITEM_COUNT
 };
+// Two entries say "303S": MENU_303S (index 13) is the original step-sequencer mode, never
+// wired into kMenuCatInstr/Seq/Aut (dead/unreachable — see structure/HANDOFF.md) so this
+// never shows as a visible duplicate; MENU_303S2 (index 22) is the one actually reachable
+// (SEQNC tab), renamed from "303S2" to plain "303S" per the user's own request now that
+// it has absorbed the role (patches, held-modifier alterations, etc.) and "303S" unambiguously
+// means this one in practice.
 static const char* menuLabels[] = {
     "SYNTH","OMNI","SAMPL",
     "LIGHT","LPLY","DIAG",
@@ -89,11 +121,14 @@ static const char* menuLabels[] = {
     "MEDIA","LANIM","EXP",
     "EXP2","EXP3","303S",
     "PKMN","SERUM","GEST",
-    "PURGPCM","USB","STONE",
+    "PURGE","USB","STONE",
     "GEST2",
-    "IMPORT","LIFE","SWRM",
-    "GEN","DJ","GROOVE",
-    "NOOB","EUCLI","CRUNCH"
+    "IMPRT","LIFE","SWRM",
+    "GEN","DJ","GROOV",
+    "NOOB","EUCLI","CRNCH",
+    "AMBNT","NOOB2","OMNI2",
+    "BREAK","FELU",
+    "DRUM2","DRUM3"
 };
 #define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
 
@@ -143,6 +178,27 @@ static const int16_t shapePatch[] = {
     9,42,                       // Juno evolution presets: Organ II (ratio 1.932), Frontier (ratio 5.263)
     -2,-2,-2                    // Custom ALGO: FM_DRIFT, FM_BELL, SAT_DRIFT
 };
+
+// Per-shape output-level compensation (multiplies velocity via s_patchVolumeScale in
+// audioSetShapeOnSynth(), audio_engine.cpp) — attenuation only (<=1.0), measured via a
+// headless RMS sweep (see structure/SOFTWARE.md). Shapes with multiple detuned/stacked
+// oscillators or high filter resonance are naturally louder than a single SAW/SINE at the
+// same velocity; this keeps them from dominating the mix when switching shapes mid-set.
+// Measured via a headless RMS/peak sweep (all 35 shapes, fixed velocity 1.0, steady-state
+// window) — see structure/SOFTWARE.md. Values are attenuation-only, normalized against
+// plain SAW's own level (~9500 RMS); shapes quieter than that reference are left at 1.0
+// (untouched) rather than boosted, per the user's own framing (fix the loud ones).
+static const float shapeGain[] = {
+    1.00f,0.27f,1.00f,0.81f,0.45f,1.00f,1.00f,1.00f, // SAW,SAW_FM,SQR,SIN,SSAW,ACID,BASS,PLCK
+    1.00f,1.00f,1.00f,                                // WHT,PINK,BRWN
+    1.00f,1.00f,1.00f,0.19f,0.73f,                    // Juno: BRASS,STRINGS,PIANO,ORGAN,CHOIR
+    1.00f,1.00f,1.00f,1.00f,1.00f,1.00f,1.00f,        // DX7: EP,BELLS,BASS,BRASS,STRINGS,ORGAN,VOICE
+    1.00f,1.00f,0.91f,1.00f,                          // TECHNO_LEAD,RAVE_BASS,HOOVER,TECHNO_STAB
+    1.00f,1.00f,0.34f,                                 // ACID_WOBBLE,ELECTRO_PLUCK,INDUSTRIAL
+    0.24f,0.38f,                                       // JUNO_ORGAN2,JUNO_FRONTIER
+    0.17f,0.17f,0.17f                                  // FM_DRIFT,FM_BELL,SAT_DRIFT
+};
+static_assert(sizeof(shapeGain)/sizeof(shapeGain[0]) == SHAPE_COUNT, "shapeGain[] must have exactly SHAPE_COUNT entries");
 
 // Modular synth: limited shape palette for Pot2 selection
 enum ModShape : uint8_t {
@@ -204,10 +260,51 @@ enum {
 #define T303_CH  2
 #define SW2_CH_BASE  10   // AMY synth channels 10-13 for SW2 ±1/±2 semitone layers
 #define SW2_VOICES    4   // polyphony per SW2 sub-channel
-#define MOD3_OSCA_CH 14   // modular synth (MODE_MODULAR) — osc A, dedicated dynamic channel
+#define MOD3_OSCA_CH 14   // modular synth (MODE_MODULAR, MODE_AMBIENT, MODE_NOOB2, MODE_OMNI2 — mutually
+                          // exclusive, shared channels/state, see main.cpp's amb*/kAmbientPresets) — osc A
 #define MOD3_OSCB_CH 15   // modular synth — osc B (detuned via per-note pitch_bend)
 #define NUM_SYNTH_VOICES 8
 #define OSCS_PER_VOICE 2
+
+// Ambient preset bank — one control (NOOB2/OMNI2's own P2, or MODE_AMBIENT itself via a
+// future picker) selects a whole curated timbre for the shared MOD3_OSCA_CH/MOD3_OSCB_CH
+// dual-wavetable engine, since NOOB2/OMNI2's own pots are busy with their generative/
+// chord+strum controls and have none spare to re-expose oscillator waves/positions/
+// filter/drift/detune individually. Named fields (not a generic p[4] like kMod2Algos[])
+// since every ambient control is fixed, not per-preset-assigned. Applied via
+// ambApplyPreset() in main.cpp, which mirrors mod2AlgoApply()'s reset-then-push shape.
+struct AmbientPresetDef {
+    const char* name;   // <=6 chars for OLED display
+    uint8_t     oscTable, oscBTable;   // wavetable index (0-4) per oscillator
+    float       oscAPos, oscBPos;      // morph position (0-1)
+    float       cutoff, reso;          // filter
+    float       lfoRate, lfoDepth;     // wavetable-drift LFO
+    float       detuneSemisB;          // osc B detune amount
+    uint8_t     envIdx;                // index into envTable[]/EnvPreset
+    float       gain;                  // per-preset velocity compensation (see below)
+};
+// gain: measured via a headless RMS/peak/clip-count sweep (same 3-note chord across all
+// 6 presets in MODE_OMNI2) — these presets were never level-calibrated when first
+// written, only picked for "musically reasonable" cutoff/reso by ear/eye. Result: a
+// 2.2x loudness spread (Glass quietest ~5767 RMS, Sub loudest ~12505) and 3 of 6
+// (DeepPad/Sub/Chorus) hard-clipping outright on an ordinary chord — reported as
+// "certains instruments crackle, ou sont trop faible par rapport aux autres". Low cutoff
+// + resonance is the main culprit: a filter's resonant peak BOOSTS energy near cutoff
+// rather than just attenuating above it, so a low-cutoff/resonant preset (Sub) can end up
+// LOUDER, not quieter, than a wide-open one (Glass). Normalized against Glass (the
+// quietest, left at 1.0 — attenuation-only, same policy as shapeGain[]) rather than
+// retuning the filters themselves, which would change each preset's actual character.
+static const AmbientPresetDef kAmbientPresets[] = {
+    // name     oscTbl oscBTbl oscAPos oscBPos cutoff  reso  lfoRate lfoDepth detune envIdx   gain
+    {"Glass",   0,     3,      0.15f,  0.55f,  5500.0f,1.0f, 0.15f,  0.25f,   0.12f, ENV_PAD, 1.00f},
+    {"DeepPad", 4,     1,      0.30f,  0.70f,  1200.0f,1.4f, 0.05f,  0.45f,   0.35f, ENV_PAD, 0.52f},
+    {"Drone",   1,     1,      0.50f,  0.50f,   800.0f,2.2f, 0.03f,  0.55f,   0.20f, ENV_PAD, 0.78f},
+    {"Shimmer", 3,     0,      0.20f,  0.80f,  6500.0f,1.0f, 0.30f,  0.40f,   0.45f, ENV_PAD, 0.77f},
+    {"Sub",     2,     2,      0.10f,  0.20f,   500.0f,1.2f, 0.08f,  0.15f,   0.10f, ENV_PAD, 0.46f},
+    {"Chorus",  0,     4,      0.40f,  0.60f,  3200.0f,1.1f, 0.18f,  0.35f,   0.50f, ENV_PAD, 0.54f},
+};
+#define AMBIENT_PRESET_COUNT (sizeof(kAmbientPresets)/sizeof(kAmbientPresets[0]))
+
 #define AMY_OSC_STRUM 50
 #define PCM_PREVIEW_PRESET  100  // AMY preset slot for sample browser preview
 #define PCM_PREVIEW_OSC      60  // AMY oscillator for preview playback
@@ -378,6 +475,30 @@ enum {
 #define SS2_RING_FRAMES   (SS2_RING_SECONDS * 20000u)
 #define SS_PRESET         365  // one preset for the whole ring (was SS_PRESET_A/B, two 30s buffers)
 
+// ==================== DRUMS2/DRUMS3 (synthesized 808/909-style kits) ====================
+// Pure AMY synthesis (SINE/TRIANGLE/NOISE waves + filter + EG0 amp/EG1 pitch envelopes),
+// no PCM — unlike DRUM2 (sample playback), these two modes exist because the sample kit
+// was reported as "a bit cheap"-sounding. Same 8-pad/16-step template as DRUM2 (own
+// independent pattern + clock though — not wired into the shared DRUM2/SYSEQ/303S2/SS2/
+// GEST clock, see audioDrumSynthHit()'s own comment in audio_engine.cpp). Needs its own
+// fixed oscillator range (no PCM preset slots needed at all, since nothing here plays a
+// sample) — required raising `max_oscs` above AMY's default 250 (see audioInit()) since
+// every oscillator up to 249 was already spoken for by an existing fixed range.
+#define DRUMS2_OSC_BASE   250  // AMY oscillators 250-257 — MODE_DRUMS2 (TR-808-style), 1 per pad
+#define DRUMS3_OSC_BASE   258  // AMY oscillators 258-265 — MODE_DRUMS3 (TR-909-style), 1 per pad
+#define DRUMS_PADS          8
+#define DRUMS_STEPS        16
+#define DRUMS_KIT_808       0
+#define DRUMS_KIT_909       1
+#define DRUMS_BD 0  // kick
+#define DRUMS_SD 1  // snare
+#define DRUMS_LT 2  // low tom
+#define DRUMS_HT 3  // hi tom
+#define DRUMS_RS 4  // rimshot
+#define DRUMS_CP 5  // clap
+#define DRUMS_CH 6  // closed hat — chokes OH
+#define DRUMS_OH 7  // open hat — choked by CH
+
 // ==================== GRANULAR ====================
 // Row layout (8-slice mode): R0=one-shot px, R1=px+px+1, R2=sx→end, R3=px reversed
 // GRANULAR_SOURCE_PRESET: raw decoded sample (waveform display)
@@ -478,6 +599,59 @@ static const Mod2AlgoDef kMod2Algos[] = {
       {{"Drv",1.0f,8.0f,0.25f},{"Cut",200,8000,0.50f},{"Res",0.5f,8,0.10f},{"Dpt",0,1,0.20f}} },
 };
 #define MOD2_ALGO_COUNT  7
+
+// ==================== FELU — Felucca-inspired synth engines ====================
+// 9 of Felucca's 13 synthesis engines (ANALOG/WHEEL/TRIO/PHASE/FM6/LOFI/VOICE/PHYS/NOISE
+// — the other 4 are redundant with existing GrvEP modes: GRAIN/SAMPLE/DRUM/SLICE). Same
+// "AMY SynthShape + 4 exposed macro knobs" pattern as MOD2 above — a literal fixed-point
+// DSP port of Felucca's actual C engines would be a major architectural departure from
+// GrvEP's single-AMY-copy design (see CLAUDE.md), so each engine is instead mapped onto
+// an AMY shape NOT already used by MOD2's own 7 algos (avoiding timbral redundancy, per
+// the user's own "nouveaux timbres seulement" scoping).
+struct FeluParamDef {
+    const char* name;   // ≤4 chars for OLED display
+    float       mn;     // minimum real value
+    float       mx;     // maximum real value
+    float       dflt;   // default (normalized 0-1)
+};
+
+struct FeluAlgoDef {
+    const char*    name;   // ≤4 chars
+    const char*    desc;   // short description (≤20 chars)
+    SynthShape     shape;  // base AMY synthesis shape
+    FeluParamDef   p[4];   // P4, P5, P6, P7 descriptors
+};
+
+static const FeluAlgoDef kFeluAlgos[] = {
+    //  name   desc                       shape              P4                     P5                    P6                   P7
+    { "ANLG", "Analog square+filter",   SHAPE_SQUARE,
+      {{"Cut",80,8000,0.55f}, {"Res",0.5f,10,0.10f}, {"Drv",1.0f,4.0f,0.0f}, {"Dcy",10,2000,0.25f}} },
+
+    { "WHEL", "Tonewheel+rotary chorus",SHAPE_JUNO_ORGAN,
+      {{"Cut",200,8000,0.75f},{"Chr",0,1,0.35f},     {"Rvb",0,1,0.25f},     {"Dcy",10,2000,0.30f}} },
+
+    { "TRIO", "Detuned trio+drive",     SHAPE_INDUSTRIAL,
+      {{"Cut",80,8000,0.45f}, {"Res",0.5f,14,0.25f}, {"Drv",1.0f,4.0f,0.0f},{"Rvb",0,1,0.15f}} },
+
+    { "PHAS", "FM phase drift",         SHAPE_FM_DRIFT,
+      {{"Dpt",0,7,1.2f},      {"Rvb",0,1,0.15f},     {"Chr",0,1,0.0f},      {"Drv",1.0f,3.0f,0.0f}} },
+
+    { "FM6 ", "6-op FM bell",           SHAPE_FM_BELL,
+      {{"Dpt",0,7,1.0f},      {"Cut",80,8000,0.60f}, {"Res",0.5f,8,0.10f}, {"Rvb",0,1,0.20f}} },
+
+    { "LOFI", "Degraded electric piano",SHAPE_DX7_EP,
+      {{"Cut",80,8000,0.35f}, {"Drv",1.0f,5.0f,0.0f},{"Rvb",0,1,0.15f},     {"Dcy",10,2000,0.30f}} },
+
+    { "VOIC", "Formant voice+chorus",   SHAPE_DX7_VOICE,
+      {{"Cut",200,8000,0.70f},{"Chr",0,1,0.40f},     {"Rvb",0,1,0.25f},     {"Dcy",10,2000,0.35f}} },
+
+    { "PHYS", "Plucked physical model", SHAPE_ELECTRO_PLUCK,
+      {{"Cut",80,8000,0.50f}, {"Res",0.5f,10,0.15f}, {"Drv",1.0f,3.0f,0.0f},{"Dcy",10,1000,0.15f}} },
+
+    { "NOIS", "Filtered noise texture", SHAPE_NOISE_WHITE,
+      {{"Cut",80,8000,0.40f}, {"Res",0.5f,10,0.10f}, {"Drv",1.0f,3.0f,0.0f},{"Dcy",10,2000,0.25f}} },
+};
+#define FELU_ALGO_COUNT  9
 
 // MOD2 LFO combined mode: destination × waveform shape
 // B4 cycles 7 modes: Off, Pitch×3 shapes, Filter×3 shapes

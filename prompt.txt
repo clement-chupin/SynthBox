@@ -1,0 +1,15 @@
+j'aimerais ajouter un mode EUCLI dans les séquenceur,
+ce serait un séquenceur de drums sous la forme euclidienne, c'est à dire que pour 4 drums, on indique le nombre de step et le nombre d'activation voulu
+on aurait en touche le nombre de step S : 4 6 8 12 16 20 26 32 sur chaque lignes pour les 4 drums
+et en potentiomètre les P4-7 qui définirait le nombre d'activation pour chaque drums, entre 0 et S
+pour les autres controle, on aurait via B1-4 : start/stop , FX, change drums bank, reset.
+P1 : volume, P2 : drums modifier, P3 : BPM
+
+Et en affichage, l'écran divisée en 2 partie : en haut, 4 cercle concentrique indiquant le nombre de step et d'activation pour chaque drums
+et en bas de l'écran, les paramètres sous forme de curseur, et affiché X/S pour chaque drums.
+Sinon comportement classique pour les autres menu (FX...)
+
+
+j'aimerais également rajouter un mode CRUNCH sous INSTR, ui se base sur un autre projet de synthé, que j'avais déja intégré sur une autre version de ce clavier sous
+/home/cchupin/projects/CrunchE_GroovePadBox
+Tu devra prendre en compte les spécificité de ce mode, et permettre, comme les autres instruments, d'utilisé l'entièreté du clavier, et les B1-4 / P1-7 en réglage de ce mode pour le rendre complet et ergonomique à utiliser

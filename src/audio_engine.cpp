@@ -297,6 +297,12 @@ void audioInit() {
     amy_config_t cfg = amy_default_config();
     cfg.features.startup_bleep = 0;
     cfg.features.default_synths = 0;
+    // AMY's own default is 250 (every fixed oscillator range up to DJ_GRAIN_OSC_BASE+1=249
+    // was already carved out of that ceiling, see config.h). Raised by 16 to make room for
+    // DRUMS2_OSC_BASE/DRUMS3_OSC_BASE (8 each, synthesized 808/909-style kits) — a modest
+    // increase (~16 extra oscillator structs, a few hundred bytes each) with real RAM
+    // headroom to spare per the last measured ESP32 build (~43% RAM at the time).
+    cfg.max_oscs = 266;
     // Emscripten WASM has no pthreads (no -pthread flag); single-threaded mode.
     // SDL simulator is also single-threaded for AMY purposes.
 #ifdef __EMSCRIPTEN__
@@ -1280,7 +1286,11 @@ void audioSetShapeOnSynth(SynthShape shape, uint8_t synthCh) {
         s_noiseShape = (shape==SHAPE_NOISE_WHITE || shape==SHAPE_NOISE_PINK || shape==SHAPE_NOISE_BROWN);
         s_synthChIsPatch = (shapePatch[(uint8_t)shape] >= 0);
         s_currentPatchNumber = shapePatch[(uint8_t)shape];
-        if (!s_synthChIsPatch) s_patchVolumeScale = 1.0f;
+        // Per-shape volume compensation (config.h's shapeGain[]) — every shape gets a
+        // measured attenuation, not just the one hardcoded Juno-organ special case this
+        // used to be. Set unconditionally here (not per-branch below) so it applies the
+        // same way whether the shape is an AMY patch or a custom wave.
+        s_patchVolumeScale = shapeGain[(uint8_t)shape];
         s_patchFilterModified = false; // new shape = clean filter state
     }
     int16_t patch = shapePatch[shape];
@@ -1290,10 +1300,6 @@ void audioSetShapeOnSynth(SynthShape shape, uint8_t synthCh) {
     if (patch >= 0) {
         // AMY preset patch (Juno / DX7 / Piano)
         e.patch_number = patch;
-        // Per-patch volume compensation: some AMY presets are louder than others.
-        // patch 8 = JUNO_ORGAN, which is ~2× the amplitude of the other Juno patches.
-        if (synthCh == SYNTH_CH)
-            s_patchVolumeScale = (patch == 8) ? 0.55f : 1.0f;
     } else if (patch == -2) {
         // SAW_FM: 6-op ALGO with default LPF so pots 3-4 (cutoff/reso) have something to bite
         e.wave = ALGO;
@@ -1608,31 +1614,26 @@ void audioSetFmDepth(float depth) {
     amy_add_event(&e);
 }
 
-void audioSetOverdrive(float drive) {
-    if (!audioReady) return;
-    if (drive < 0.01f) {
-        audioSetAllFilters(0.0f, 1.5f);
-    } else {
-        float cut = 3500.0f - drive * 2500.0f;  // 3500 → 1000 Hz
-        float res = 1.5f  + drive * 2.5f;       // 1.5 → 4.0
-        audioSetAllFilters(cut, res);
-    }
-}
+// DRIVE FX: consolidated distortion, fully bus-0 (amy_drive_*, amy.c) — replaces
+// the old separate OVERDRIVE/DISTORT FX, each of which was a single fixed algorithm
+// driven only by a filter sweep (no real waveshaping at all, "ressemble juste à un
+// LPF"). Reaches literally everything mixed into bus 0, unlike a filter sweep
+// wired per-mode. type: 0=Overdrive (gentle tanh), 1=Distort (harder saturating
+// exponential), 2=Fuzz (hard clip), 3=Destrukt (foldback) — see amy.c's processing
+// block for each curve. tone is now a single shared post-saturation brightness
+// control (bus-0 one-pole tilt), not a per-algorithm filter peak/sweep.
+extern "C" float amy_drive_on;      // defined in amy.c; 0=bypass, 1=engaged
+extern "C" float amy_drive_amt;     // defined in amy.c; 0..1
+extern "C" float amy_drive_tone;    // defined in amy.c; 0..1, 0=bright, 1=dark
+extern "C" float amy_drive_level;   // defined in amy.c; output level, 0..~1.5
+extern "C" float amy_drive_type;    // defined in amy.c; 0=Overdrive,1=Distort,2=Fuzz,3=Destrukt
 
-// Distortion: BPF resonance peak — tone sweeps the peak frequency, drive raises resonance.
-// Using FILTER_BPF (not LPF) gives a "presence boost" character very different from the LPF FX:
-// instead of darkening the signal it emphasises a narrow harmonic band, producing crunch/bite.
-void audioSetDistortion(float drive, float tone) {
-    if (!audioReady) return;
-    if (drive < 0.01f) {
-        audioSetAllFiltersT(0.0f, 1.5f, FILTER_LPF24);  // bypass — clears filter on all oscillators
-        return;
-    }
-    // tone 0→1 sweeps peak from 600 Hz (warm/mid crunch) to 8000 Hz (bright/harsh bite)
-    float cutHz = 600.0f + tone * 7400.0f;
-    // drive 0→1 raises resonance peak height: 2 (subtle) → 6 (screaming)
-    float res = 2.0f + drive * 4.0f;
-    audioSetAllFiltersT(cutHz, res, FILTER_BPF);
+void audioSetDrive(float drive, float tone, float level, uint8_t type, bool on) {
+    amy_drive_on    = on ? 1.0f : 0.0f;
+    amy_drive_amt   = drive;
+    amy_drive_tone  = tone;
+    amy_drive_level = level;
+    amy_drive_type  = (float)type;
 }
 
 void audioSetVolume(float vol) {
@@ -1659,6 +1660,53 @@ void audioSetDelay(float level, float delay_ms, float feedback, float filter_coe
     if (!audioReady) return;
     // max_delay_ms=700 → enclosing_power_of_2(30870)=32768 samples = 256KB PSRAM (vs 512KB at 800ms)
     config_echo(0, level, delay_ms, 700.0f, feedback, filter_coef);
+}
+
+// RESECHO FX: delay + filter-in-feedback engine (amy.c). level=wet mix,
+// feedback=0..~0.97, centre_hz=damping cutoff (see amy.c's own comment — the feedback
+// tap is the SVF's lowpass output now, not its bandpass, so this is a broadband
+// brightness control, not a resonant-peak picker), resonance=higher is more resonant,
+// delay_ms=BPM-synced tap length, on=0/1.
+extern "C" void amy_resoecho_config(float level, float feedback, float centre_hz,
+                                     float resonance, float delay_ms, int on);
+
+// damp (0..1, replaces the old "tone" param — see amy.c: the feedback path used to tap a
+// resonant BANDPASS output, so "Tone" picked WHICH frequency rang, reported as sounding
+// like it only resonates at one arbitrary pitch instead of across the spectrum. The tap
+// is now the SVF's LOWPASS output, so what's left to control is simply how much high end
+// survives each repeat — a familiar echo/reverb "Damp" knob, broadband either way):
+// damp=0 -> 8000Hz cutoff (bright, most of the spectrum resonates), damp=1 -> 300Hz
+// (dark, repeats darken fast).
+//
+// wild (0..1): tames or unleashes THIS SAME engine's resonance — NOT a blend between
+// two different delay engines (that was tried first and rejected: "je n'ai pas envie
+// d'avoir une interpolation entre 2 effets"). At wild=0 both the filter's resonance
+// peak and the effective feedback are scaled way down, so the echo decays quickly and
+// stays gentle/plain — closer in spirit to the simple RES FX, without the
+// self-sustaining build-up that was reported as sounding harsh/unpleasant ("résonne
+// beaucoup trop"). At wild=1 it's the full experimental character (today's behavior) —
+// feedback and resonance both reach their normal dialed-in range, still hard-clamped
+// for safety but genuinely able to ring for a long time. Continuous in between, all
+// inside the one dedicated delay line.
+void audioSetResoEcho(float level, float feedback, float damp, float wild, float delay_ms, bool on) {
+    if (!audioReady) return;
+    damp = constrain(damp, 0.0f, 1.0f);
+    float cutoffHz = 8000.0f - damp * 7700.0f;  // damp=0 (bright) -> 8000Hz; damp=1 (dark) -> 300Hz
+    wild = constrain(wild, 0.0f, 1.0f);
+    float wildResonance = 1.5f + feedback * 2.5f;  // more feedback -> more resonant peak too
+    float resonance   = 1.0f + wild * (wildResonance - 1.0f);  // 1.0 (flat/damped) .. wildResonance
+    // Loop gain (the filter tap has UNITY-ish peak gain at low resonance, so this IS
+    // roughly the loop gain):
+    //   wild 0    -> 0.35*fb/0.85 : quick, gentle decay
+    //   wild ~0.6 -> ~1.0 (at max FB) : sustains without growing
+    //   wild 1    -> up to 1.4 : GROWS every pass until amy.c's in-loop soft limiter
+    //                (2*tanh(x/2)) catches it — a genuinely saturated, harmonically rich,
+    //                sustained tone at a KNOWN ceiling instead of a runaway. Bounded on
+    //                purpose: a downstream LPF then simply attenuates a normal-sized signal
+    //                (no "infinite level" to fight). The previous unity-max mapping (needed
+    //                to stop the old fb/q runaway) made it impossible to saturate at all.
+    float effFeedback = (feedback / 0.85f) * (0.35f + 1.05f * wild);
+    amy_resoecho_config(on ? level : 0.0f, effFeedback, cutoffHz, resonance, delay_ms, on ? 1 : 0);
 }
 
 // ==================== SAMPLE PLAYBACK ====================
@@ -3595,6 +3643,21 @@ void audioT303Duty(float duty) {
     amy_add_event(&e);
 }
 
+// "Patch"/algorithm select for the 303 — replaces the old live Accent toggle (removed per
+// user request: accent was a velocity boost, not a texture/algorithm, and the user wanted
+// the button freed up for this instead). Deliberately does NOT touch wave (that stays on
+// the joystick) — cycles the filter's slope/type instead, which is the one DSP-level
+// "character" knob available on T303_CH without touching oscillator/voice allocation
+// (filter_type is a light-touch field only, same class as the FILT bus FX's own toggle —
+// never a full num_voices/oscs_per_voice reconfigure, so it's safe mid-note).
+void audioT303SetFilterType(uint8_t filterType) {
+    if (!audioReady) return;
+    amy_event e = amy_default_event();
+    e.synth      = T303_CH;
+    e.filter_type = filterType;
+    amy_add_event(&e);
+}
+
 // Polyphonic 303 (I303 mode): same engine as T303 but 6 voices for chord/melody play.
 void audioI303Init(float cutoff, float reso, float envMod, float decay, uint8_t amyWave) {
     if (!audioReady) return;
@@ -3628,6 +3691,23 @@ void audioSetLadderFilter(float cutoffHz, float resonance, bool on) {
     amy_ladder_resonance  = resonance;
 }
 
+// FILT FX, Typ=LPF/HPF/BPF: a genuine bus-0 filter (amy_filt_*, amy.c), applied in
+// activation order alongside RESECHO/DRIVE/etc. (see amy_apply_ordered_fx() in amy.c)
+// instead of the old per-oscillator-only application, which was upstream of every bus
+// effect and could never be positioned relative to them ("je veux juste que les FX se
+// placent les uns à la suite des autres selon l'ordre d'activation"). type: 0=LPF,
+// 1=HPF, 2=BPF (LADDER keeps using audioSetLadderFilter() above, unrelated).
+extern "C" float amy_filt_on;
+extern "C" float amy_filt_type;
+extern "C" float amy_filt_cutoff;
+extern "C" float amy_filt_reso;
+void audioSetFiltBus(float cutoffHz, float resonance, uint8_t type, bool on) {
+    amy_filt_on     = on ? 1.0f : 0.0f;
+    amy_filt_type   = (float)type;
+    amy_filt_cutoff = cutoffHz;
+    amy_filt_reso   = resonance;
+}
+
 void audioSetRingmod(float freqHz, float mix, bool on) {
     amy_ringmod_on   = on ? 1.0f : 0.0f;
     amy_ringmod_freq = freqHz;
@@ -3638,19 +3718,6 @@ void audioSetCompressor(float threshold, float ratio, bool on) {
     amy_comp_on        = on ? 1.0f : 0.0f;
     amy_comp_threshold = threshold;
     amy_comp_ratio     = ratio;
-}
-
-// AUTOPAN FX: per-oscillator equal-power pan (AMY's msynth->pan, real stereo — the
-// board's I2S output is genuinely stereo, see i2s.c's I2S_SLOT_MODE_STEREO). 0=full
-// left, 0.5=center, 1=full right. Applied to the two channels most modes actually
-// play notes on; other channels (T303/tracker/etc.) stay centered — this mirrors
-// how audioSetVolume only ever targets SYNTH_CH plus T303's shared bus.
-void audioSetPan(float pan) {
-    if (!audioReady) return;
-    amy_event e = amy_default_event();
-    e.synth = SYNTH_CH;
-    e.pan_coefs[COEF_CONST] = pan;
-    amy_add_event(&e);
 }
 
 // Symmetric wavefolder for TRI/SAW2/SQ2: depth 0→1 maps gain 1x→32x (extreme folds).
@@ -3695,6 +3762,142 @@ void audioDrum2Hit(uint8_t padIdx, float vel, uint8_t midiNote, float decayMs) {
         e.filter_type = FILTER_NONE; // explicitly clear — oscillator retains previous filter_type otherwise
     }
     amy_add_event(&e);
+}
+
+// ==================== DRUMS2/DRUMS3 (synthesized 808/909-style kits) ====================
+// Pure AMY synthesis, no PCM. Each voice uses EG0 for its amplitude decay (the same
+// eg0_times/eg0_values breakpoint idiom as audioDrum2Hit above) and, for the 3 tonal
+// voices (BD/LT/HT), a SECOND envelope (EG1) that sweeps the oscillator's own pitch down
+// right after the attack — the classic analog-kick "pitch drop" — via
+// freq_coefs[COEF_EG1]: AMY sums coefs[i]*ctrl_inputs[i] linearly into the oscillator's
+// log2-frequency (see combine_controls()/hold_and_modify() in amy.c), and
+// ctrl_inputs[COEF_EG1] is just the EG1 breakpoint curve's own interpolated value (not
+// further log-compressed — that compression is amp-only, in amp_combine_controls()) — so
+// freq_coefs[COEF_EG1] is literally "how many octaves above the base note, at EG1's own
+// peak of 1.0". Chosen empirically (verified by FFT over a captured hit — see
+// structure/SOFTWARE.md) rather than derived from a hardware schematic.
+// The 5 noise-based voices (SD/RS/CP/CH/OH) have no pitch at all — AMY's NOISE oscillator
+// never reads frequency (render_noise(), oscillators.c) — so their "pitch" input instead
+// drives a filter cutoff ("tone" knob), never a dead control either way.
+void audioDrumSynthHit(uint8_t kit, uint8_t pad, float vel, uint8_t pitch, float decayMs) {
+    if (!audioReady || kit > DRUMS_KIT_909 || pad >= DRUMS_PADS) return;
+    bool is909 = (kit == DRUMS_KIT_909);
+    amy_event e = amy_default_event();
+    e.osc = (is909 ? DRUMS3_OSC_BASE : DRUMS2_OSC_BASE) + pad;
+    e.velocity = constrain(vel, 0.0f, 3.0f);
+    e.filter_type = FILTER_NONE;
+    e.freq_coefs[COEF_CONST] = 0.0f;
+    e.freq_coefs[COEF_NOTE]  = 1.0f;
+    e.freq_coefs[COEF_EG1]   = 0.0f;
+    e.eg_type[0] = ENVELOPE_TRUE_EXPONENTIAL;
+    e.eg_type[1] = ENVELOPE_TRUE_EXPONENTIAL;
+
+    switch (pad) {
+    case DRUMS_BD: {
+        e.wave = TRIANGLE;
+        e.midi_note = pitch;
+        e.freq_coefs[COEF_EG1] = is909 ? 2.8f : 2.2f;  // pitch-drop depth, in octaves
+        float swMs = is909 ? 35.0f : 48.0f;
+        e.eg1_times[0]=1;   e.eg1_values[0]=1.0f;
+        e.eg1_times[1]=(uint32_t)swMs; e.eg1_values[1]=0.0f;
+        e.eg1_times[2]=5;   e.eg1_values[2]=0.0f;
+        float decMs = decayMs>0.0f ? decayMs : (is909?300.0f:450.0f);
+        e.eg0_times[0]=1;   e.eg0_values[0]=1.0f;
+        e.eg0_times[1]=(uint32_t)decMs; e.eg0_values[1]=0.0f;
+        e.eg0_times[2]=5;   e.eg0_values[2]=0.0f;
+        e.filter_type = FILTER_LPF24;
+        e.filter_freq_coefs[COEF_CONST] = is909 ? 1600.0f : 1100.0f;
+        e.resonance = is909 ? 1.6f : 1.0f;
+        break;
+    }
+    case DRUMS_LT: case DRUMS_HT: {
+        e.wave = TRIANGLE;
+        e.midi_note = pitch;
+        e.freq_coefs[COEF_EG1] = is909 ? 0.6f : 0.35f;
+        float swMs = is909 ? 55.0f : 80.0f;
+        e.eg1_times[0]=1;   e.eg1_values[0]=1.0f;
+        e.eg1_times[1]=(uint32_t)swMs; e.eg1_values[1]=0.0f;
+        e.eg1_times[2]=5;   e.eg1_values[2]=0.0f;
+        float decMs = decayMs>0.0f ? decayMs : (is909?220.0f:320.0f);
+        e.eg0_times[0]=1;   e.eg0_values[0]=1.0f;
+        e.eg0_times[1]=(uint32_t)decMs; e.eg0_values[1]=0.0f;
+        e.eg0_times[2]=5;   e.eg0_values[2]=0.0f;
+        e.filter_type = FILTER_LPF24;
+        e.filter_freq_coefs[COEF_CONST] = 2200.0f;
+        break;
+    }
+    case DRUMS_SD: {
+        e.wave = NOISE;
+        float cutoff = 400.0f * powf(14.0f, pitch/127.0f);  // ~400..5600Hz "tone"
+        e.filter_type = FILTER_BPF;
+        e.filter_freq_coefs[COEF_CONST] = is909 ? cutoff*1.3f : cutoff;
+        e.resonance = is909 ? 3.5f : 2.5f;
+        float decMs = decayMs>0.0f ? decayMs : (is909?220.0f:180.0f);
+        e.eg0_times[0]=1; e.eg0_values[0]=1.0f;
+        e.eg0_times[1]=(uint32_t)decMs; e.eg0_values[1]=0.0f;
+        e.eg0_times[2]=5; e.eg0_values[2]=0.0f;
+        break;
+    }
+    case DRUMS_RS: {
+        e.wave = NOISE;
+        float cutoff = 1500.0f * powf(6.0f, pitch/127.0f);
+        e.filter_type = FILTER_HPF;
+        e.filter_freq_coefs[COEF_CONST] = cutoff;
+        e.resonance = 1.5f;
+        float decMs = decayMs>0.0f ? decayMs : (is909?60.0f:70.0f);
+        e.eg0_times[0]=1; e.eg0_values[0]=1.0f;
+        e.eg0_times[1]=(uint32_t)decMs; e.eg0_values[1]=0.0f;
+        e.eg0_times[2]=5; e.eg0_values[2]=0.0f;
+        break;
+    }
+    case DRUMS_CP: {
+        // Approximates a clap's multi-burst "flam" with a single noise oscillator by
+        // giving EG0 several quick up/down bumps before the real tail — cheaper than
+        // layering oscillators, and EG0 already supports up to 24 breakpoints (plenty).
+        e.wave = NOISE;
+        float cutoff = 800.0f * powf(6.0f, pitch/127.0f);
+        e.filter_type = FILTER_BPF;
+        e.filter_freq_coefs[COEF_CONST] = cutoff;
+        e.resonance = 2.0f;
+        float decMs = decayMs>0.0f ? decayMs : (is909?180.0f:200.0f);
+        e.eg_type[0] = ENVELOPE_NORMAL;  // bumps read better without the exp-decay's own extra curvature
+        e.eg0_times[0]=1;  e.eg0_values[0]=1.0f;
+        e.eg0_times[1]=10; e.eg0_values[1]=0.05f;
+        e.eg0_times[2]=1;  e.eg0_values[2]=1.0f;
+        e.eg0_times[3]=10; e.eg0_values[3]=0.05f;
+        e.eg0_times[4]=1;  e.eg0_values[4]=0.9f;
+        e.eg0_times[5]=(uint32_t)decMs; e.eg0_values[5]=0.0f;
+        e.eg0_times[6]=5;  e.eg0_values[6]=0.0f;
+        break;
+    }
+    case DRUMS_CH: case DRUMS_OH: {
+        bool open = (pad==DRUMS_OH);
+        e.wave = NOISE;
+        float cutoff = 3000.0f * powf(3.5f, pitch/127.0f);  // ~3k..10.5kHz "tone"
+        e.filter_type = FILTER_HPF;
+        e.filter_freq_coefs[COEF_CONST] = is909 ? cutoff*1.15f : cutoff;
+        e.resonance = 1.2f;
+        float decMs = decayMs>0.0f ? decayMs
+                    : open ? (is909?400.0f:500.0f) : (is909?45.0f:55.0f);
+        e.eg0_times[0]=1; e.eg0_values[0]=1.0f;
+        e.eg0_times[1]=(uint32_t)decMs; e.eg0_values[1]=0.0f;
+        e.eg0_times[2]=5; e.eg0_values[2]=0.0f;
+        break;
+    }
+    default: return;
+    }
+    amy_add_event(&e);
+}
+
+void audioDrumSynthAllOff(uint8_t kit) {
+    if (!audioReady || kit > DRUMS_KIT_909) return;
+    uint16_t oscBase = (kit == DRUMS_KIT_909) ? DRUMS3_OSC_BASE : DRUMS2_OSC_BASE;
+    for (uint8_t p = 0; p < DRUMS_PADS; p++) {
+        amy_event e = amy_default_event();
+        e.osc = oscBase + p;
+        e.velocity = 0.0f;
+        amy_add_event(&e);
+    }
 }
 
 // ==================== GRANULAR SLICER ====================
@@ -6260,7 +6463,7 @@ bool audioSSStreamActive() { return s_ssPlaying || s_ssNextBuilding; }
 void audioSSCloseFiles() { ssPcmCacheClose(); }
 void audioSSForceQuiesce() { s_ssTrackGen++; }
 
-void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, bool reverse, float vel, uint8_t playMode, uint16_t attackMs, uint32_t amyTime) {
+void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, bool reverse, float vel, uint8_t playMode, uint16_t attackMs, uint32_t amyTime, uint8_t midiNote) {
     if (!audioReady || sampleIdx >= GRAN2_MAX_SAMPLES) return;
     if (reverse && !ensureGranular2Reverse(sampleIdx)) {
         Serial.printf("[GR2 PLAY] s%d sl%d rev=1 SKIPPED: reverse buffer unavailable (PSRAM exhausted)\n",
@@ -6296,7 +6499,7 @@ void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, boo
     e.osc       = (uint16_t)(GRANULAR_OSC_BASE + oscIdx);
     e.wave      = PCM;
     e.preset    = preset;
-    e.midi_note = 69;
+    e.midi_note = midiNote;
     e.velocity  = vel;
     e.feedback  = loop ? 1.0f : 0.0f;
     e.eg0_times[0] = attackMs; e.eg0_values[0] = 1.0f;
@@ -6516,6 +6719,18 @@ void audioModularNoteOff(uint8_t note) {
 
 // Per-channel filter setter — audioSetFilter()/audioSetAllFiltersT() are hardcoded to
 // SYNTH_CH, so the modular synth's own 2 channels need their own small setter.
+//
+// filter_freq_coefs[COEF_NOTE]=1.0f adds full keyboard tracking: AMY combines filter
+// cutoff in LOG-frequency space as const + COEF_NOTE*logfreq_for_midi_note(note), and
+// logfreq_for_midi_note() is 0 at MIDI note 69 (A4/440Hz) — so cutoffHz above is exactly
+// the cutoff AT A4, and it now scales proportionally (doubles per octave up, halves per
+// octave down) with whatever note is actually playing. Without this (the previous
+// behaviour — coefs default to 0/unset), cutoffHz was a single fixed Hz value for every
+// note: a high note's fundamental/harmonics sit much closer to (or above) that fixed
+// ceiling than a low note's, so the LPF24's 24dB/oct rolloff hits treble far harder than
+// bass — reported as "les notes aigües sont beaucoup plus faibles" in MODE_AMBIENT.
+// MODE_MODULAR/MODE_NOOB2/MODE_OMNI2 share this same function (modCutoff/ambCutoff), so
+// they get the same correction for free.
 void audioModularSetFilter(float cutoffHz, float resonance) {
     if (!audioReady) return;
     for (uint8_t ch : {(uint8_t)MOD3_OSCA_CH, (uint8_t)MOD3_OSCB_CH}) {
@@ -6523,6 +6738,7 @@ void audioModularSetFilter(float cutoffHz, float resonance) {
         e.synth = ch;
         e.filter_type = FILTER_LPF24;
         e.filter_freq_coefs[COEF_CONST] = cutoffHz;
+        e.filter_freq_coefs[COEF_NOTE] = 1.0f;
         e.resonance = resonance;
         amy_add_event(&e);
     }

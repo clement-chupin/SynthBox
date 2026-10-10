@@ -33,8 +33,18 @@ void audioStopAllSamples();  // velocity=0 on all PCM oscillators (call when lea
 void audioSetReverb(float level, float liveness, float damping, float xover_hz);
 void audioSetChorus(float level, float lfo_freq, float depth);
 void audioSetDelay(float level, float delay_ms, float feedback, float filter_coef);
-void audioSetOverdrive(float drive);
-void audioSetDistortion(float drive, float tone);
+// RESECHO FX: a SEPARATE delay+resonant-filter-in-feedback engine (not shared with
+// the plain DELAY FX above). wild (0..1) tames or unleashes THIS engine's own
+// resonance/feedback (0=gentle, 1=full experimental) — see audioSetResoEcho()'s own
+// comment in audio_engine.cpp for why this isn't a blend with a second engine.
+void audioSetResoEcho(float level, float feedback, float damp, float wild, float delay_ms, bool on);
+// DRIVE FX: consolidated distortion — one bus-0 saturation engine, 4 selectable
+// algorithms (type: 0=Overdrive gentle tanh, 1=Distort harder saturating
+// exponential, 2=Fuzz hard clip, 3=Destrukt foldback), sharing the same
+// drive/tone/level trio so switching character doesn't require new knob settings.
+// Replaces the old separate audioSetOverdrive()/audioSetDistortion() (each was a
+// single-algorithm, filter-sweep-only FX) — see audio_engine.cpp for the rationale.
+void audioSetDrive(float drive, float tone, float level, uint8_t type, bool on);
 void audioSetEq(float low, float mid, float high);  // 3-band EQ: 1.0=flat, >1 boost, <1 cut
 void audioSetWavefold(float gain);  // global wavefold on bus 0: 1.0=dry, >1 folds (gain = 1/threshold)
 // Global "ladder"-style resonant LPF on bus 0 (FX FILT, Typ=LADDER): a custom 4-pole
@@ -44,15 +54,16 @@ void audioSetWavefold(float gain);  // global wavefold on bus 0: 1.0=dry, >1 fol
 // resonance has no hard ceiling (tanh keeps the loop stable at any gain); ~0-6 is
 // the useful range, higher self-oscillates harder.
 void audioSetLadderFilter(float cutoffHz, float resonance, bool on);
+// FILT FX, Typ=LPF/HPF/BPF: a genuine bus-0 filter, applied in FX activation order
+// alongside RESECHO/DRIVE/etc. (see audioSetFiltBus()'s own comment in
+// audio_engine.cpp). type: 0=LPF, 1=HPF, 2=BPF.
+void audioSetFiltBus(float cutoffHz, float resonance, uint8_t type, bool on);
 
 // RINGMOD FX: multiplies bus 0 by a sine carrier. mix 0=dry, 1=fully ring-modulated.
 void audioSetRingmod(float freqHz, float mix, bool on);
 // COMPRESSOR FX: feedforward peak envelope follower, linked stereo. threshold is
 // linear (bus headroom, not dBFS); ratio 1.0=no compression, higher=more limiting.
 void audioSetCompressor(float threshold, float ratio, bool on);
-// AUTOPAN FX: per-oscillator equal-power pan, one-shot (call every tick to sweep it).
-// 0=full left, 0.5=center, 1=full right.
-void audioSetPan(float pan);
 
 // Preview: aborts any in-progress load, loads file into preview preset and plays.
 void audioLoadAndPlay(const char* path, uint16_t preset, float vel);
@@ -318,7 +329,9 @@ bool audioIsGranular2Ready(uint8_t sampleIdx);
 uint8_t audioComputeGranular2Slices(uint8_t sampleIdx, uint8_t nSlices, uint8_t* waveform128);
 void audioApplyGranular2Splits(uint8_t sampleIdx, float* splits, int N, bool lopMode = false);
 // amyTime: AMY sysclock timestamp (ms) at which playback should start; UINT32_MAX = immediate.
-void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, bool reverse, float vel, uint8_t playMode = 0, uint16_t attackMs = 5, uint32_t amyTime = UINT32_MAX);
+// midiNote: playback pitch relative to the slice's registered base note (69) — 69=native
+// rate, 57 (-1 octave)=half speed, etc. (MODE_BREAK's half-speed performance key).
+void audioPlayGranular2(uint8_t oscIdx, uint8_t sampleIdx, uint8_t sliceIdx, bool reverse, float vel, uint8_t playMode = 0, uint16_t attackMs = 5, uint32_t amyTime = UINT32_MAX, uint8_t midiNote = 69);
 // FUL mode: startFrac = splits[sliceIdx] (fwd) or 1-splits[sliceIdx+1] (rev)
 void audioPlayGranular2Ful(uint8_t oscIdx, uint8_t sampleIdx, bool reverse, float vel, float startFrac);
 void audioStopGranular2(uint8_t oscIdx);
@@ -343,6 +356,7 @@ void audioT303Feedback(float fb);                                           // n
 void audioT303Duty(float duty);                                             // PULSE duty 0.5→0.01 for continuous wave morphing
 void audioT303Wavefold(float depth);                                        // wavefolder depth 0→1 symmetric — drives signal into triangle fold (1x→8x)
 void audioT303WavefoldAsym(float depth);                                    // wavefolder depth 0→1 positive-only (TRI2: fold peaks, preserve bass)
+void audioT303SetFilterType(uint8_t filterType);                            // "patch"/algo select — filter_type only, light touch (no reconfigure)
 
 // ==================== SxF (sous-octaves : SWF/SQF/SNF, wave types pour 303S/I303) ====================
 // Base sur T303_CH ; sous-canaux SW2_CH_BASE+0 (f-1, -12 demi-tons) et +1 (f-2, -24 demi-tons).
@@ -358,6 +372,14 @@ void audioSW2AllNotesOff();                              // flush all sub-channe
 // ==================== DRUM2 (TR-808 style per-pad control) ====================
 // Like audioPlayDrumPad but with per-pad pitch (midiNote) and optional EG decay override.
 void audioDrum2Hit(uint8_t padIdx, float vel, uint8_t midiNote, float decayMs);
+
+// ==================== DRUMS2/DRUMS3 (synthesized 808/909-style kits) ====================
+// kit: 0=DRUMS2 (TR-808-flavored), 1=DRUMS3 (TR-909-flavored). pad: DRUMS_BD..DRUMS_OH
+// (config.h). pitch: for BD/LT/HT, a literal MIDI note; for SD/RS/CP/CH/OH (noise-based,
+// no pitch to speak of) a 0-127 filter-cutoff/"tone" value instead. decayMs: amplitude
+// decay time (0 = voice's own built-in default shape, e.g. CP's multi-bump envelope).
+void audioDrumSynthHit(uint8_t kit, uint8_t pad, float vel, uint8_t pitch, float decayMs);
+void audioDrumSynthAllOff(uint8_t kit);  // stops any still-ringing voice in that kit's osc range (mode exit)
 
 // ==================== MODULAR SYNTH (MODE_MODULAR, wavetable dual-osc) ====================
 // Two dedicated dynamic channels (MOD3_OSCA_CH/MOD3_OSCB_CH, config.h) — not part of
