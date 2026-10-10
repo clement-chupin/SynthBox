@@ -428,6 +428,22 @@ AO. **DRUMS2/DRUMS3 : B4-clear-seul remplacé par B3=REC, B4=bank(court)/clear(l
    (`DRUMS_B4_LONGPRESS_MS`=600ms) efface uniquement le slot actif. Détails/vérification :
    SOFTWARE.md.
 
+AP. **MODE_PRESETS : banque de 45 patchs curatés, posée sur le moteur de FELU** — sur
+   demande explicite (« créer un mode avec pleins d'instruments dedans, les projets
+   Sloop, X0X et Felucca possèdent une diversité d'instruments et d'algorithmes »), scopé
+   par questions à une banque de presets parcourue par catégorie (pas un sélecteur
+   algo+macros brut, déjà couvert par FELU), large éventail assumé dès cette passe.
+   **Zéro nouveau DSP** : chaque preset est `{nom, catégorie, index d'algo FELU, 4 macros}`
+   (`PresetDef`/`kPresets[]`, config.h) appliqué via `presetApply()`, qui règle
+   `feluAlgoIdx`/`feluP[]` puis appelle `feluApplyP4P7()` — le pipeline de FELU lui-même.
+   8 catégories façon Sloop (BASS/KEYS/ORGAN/PAD/LEAD/PLUCK/STAB/FX), DIGITAL/SAMPLE/GRAIN
+   omis (déjà hors scope de FELU). `OVERLAY_PRESETS` (B3) mirror `OVERLAY_PKMN` (browser 2
+   colonnes) à un détail près : chaque déplacement joystick applique immédiatement le
+   preset survolé (preview live façon Sloop) au lieu d'un confirmer-puis-appliquer.
+   Vérifié par test headless : les 8 catégories produisent un signal audio non nul,
+   résolution catégorie+item→index plat du browser vérifiée. Détails : SOFTWARE.md.
+   D'autres presets/moteurs sont anticipés en itérations suivantes, pas dans cette passe.
+
 ## 5. Pièges et classes de bugs récurrentes (lire avant de toucher au DSP ou aux modes)
 
 **Audio / AMY**

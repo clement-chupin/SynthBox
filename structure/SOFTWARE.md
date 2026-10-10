@@ -96,6 +96,7 @@ structure/                Documentation (voir README.md ; HANDOFF.md = point d'e
 | FELU | `MODE_FELU` | Synthé inspiré de Felucca : 9 de ses 13 moteurs (ANALOG/WHEEL/TRIO/PHASE/FM6/LOFI/VOICE/PHYS/NOISE) réimplémentés en `SynthShape` AMY + 4 macros P4-P7 (même schéma que MOD2 — pas un portage DSP littéral, voir section dédiée plus bas) |
 | DRUMS2 | `MODE_DRUMS2` | Kit batterie **synthétisé** façon TR-808 (8 pads, même gabarit que DRUM2) : SINE/TRIANGLE/NOISE + filtre + enveloppes AMY, pas de PCM (voir section dédiée plus bas) |
 | DRUMS3 | `MODE_DRUMS3` | Même gabarit que DRUMS2, caractère TR-909 (plus percutant/brillant) (voir section dédiée plus bas) |
+| PRESETS | `MODE_PRESETS` | Banque de 45 patchs curatés (8 catégories façon Sloop) parcourue par browser 2 colonnes, posée sans nouveau DSP sur le moteur de MODE_FELU (voir section dédiée plus bas) |
 
 Trois modes « expérimentaux » historiques (EXP/EXP2/EXP3) partagent une philosophie : jouer
 des notes/sons intéressants sans connaissance de théorie musicale, contrairement aux modes
@@ -1876,6 +1877,55 @@ saturé (RMS/pic mesurés par tap temporaire), captures d'écran des vues PAD/SE
 resserrant la barre et en reculant le texte à `x=103`). ESP32 : build propre
 (`pio run -e esp32-s3-devkitc-1`), RAM/flash quasi inchangés (voir ci-dessus). **Non
 testé sur carte réelle.**
+
+---
+
+## MODE_PRESETS — banque de patchs curatée (inspirée du bank Sloop)
+
+Demande utilisateur : « créer un mode avec pleins d'instruments dedans, les projets
+Sloop, X0X et Felucca possèdent une diversité d'instruments et d'algorithmes, j'aimerais
+en tirer profit ! » — scopé par questions explicites à **une banque de presets à
+parcourir par catégorie** (pas un sélecteur algo+macros brut, FELU le fait déjà), avec un
+**large éventail** assumé (45 presets dès cette passe, d'autres possibles en itérations
+suivantes).
+
+**Zéro nouveau DSP** — MODE_PRESETS est une couche de curation posée sur le moteur
+existant de MODE_FELU (`feluAlgoIdx`/`feluP[4]`/`feluApplyP4P7()`, voir sa propre section
+plus haut) : chaque preset est juste `{nom, catégorie, index d'algo FELU, 4 macros
+normalisées}` (`PresetDef`, `kPresets[]`, `config.h`). `presetApply(idx)` charge un
+preset en réglant `feluAlgoIdx`/`feluP[]` puis en appelant `feluApplyP4P7()` — le même
+pipeline que FELU lui-même utilise pour ses propres macros.
+
+**45 presets, 8 catégories** (`PresetCategory`/`kPresetCatNames[]`) inspirées du
+classement "Kind" du bank Sloop (BASS/KEYS/ORGAN/PAD/LEAD/PLUCK/STAB/FX) : BASS(6)
+KEYS(4) ORGAN(5) PAD(9) LEAD(6) PLUCK(6) STAB(5) FX(4). Couvre les 9 moteurs FELU
+existants ; les presets Sloop tagués DIGITAL/SAMPLE/GRAIN (sans équivalent FELU — déjà
+hors scope de FELU lui-même, cf. sa propre section) sont omis, pas approximés. Instruments
+melodiques uniquement — la diversité "batterie" est déjà couverte par DRUM2/DRUMS2/
+DRUMS3, pas dupliquée ici.
+
+**UI** : B1=FX, B2=Env, B3 ouvre `OVERLAY_PRESETS`, B4=Octave (identique à FELU, B3
+remplace juste son sélecteur d'algo `OVERLAY_FELU_ALGO`). `OVERLAY_PRESETS` est un
+browser 2 colonnes (catégories à gauche / presets de la catégorie à droite) qui **mirror**
+`OVERLAY_PKMN` à l'identique (même géométrie, même séparateur vertical x=39) — seule
+différence : contrairement à PKMN (confirmer puis appliquer), chaque déplacement
+joystick dans `OVERLAY_PRESETS` **applique immédiatement** le preset survolé
+(prévisualisation live façon Sloop), une pression de touche ne fait que fermer l'overlay
+(`presetApply()` a déjà tourné pendant le scroll). P2 balaie l'index plat 0..44 ; P4-P7
+réutilisent tel quel le bloc FELU (`feluPCache[]`/`feluPotNeedsSync`/`potPopupShow()`).
+
+**Vérifié par test headless** : build simulateur + ESP32 propres ; injection au boot
+appliquant un preset par catégorie (8 au total) + note jouée + tap RMS confirmant un
+signal non nul pour chacune (ex. WOW BASS/VOIC, ACCORDION/TRIO, ATMOS PAD/TRIO, PWM
+LEAD/ANLG, METAL NOISE/NOIS...) ; résolution catégorie+index→index plat du browser
+vérifiée indépendamment (PAD, item 2 → "ATMOS PAD", idx 17) ; noms de presets confirmés
+≤11 caractères (budget d'affichage 12 car. respecté). Instrumentation temporaire retirée
+après vérification.
+
+**Itérations suivantes anticipées** (pas dans cette passe, per décision explicite de
+l'utilisateur "large éventail, quitte à itérer en plusieurs passes") : plus de presets
+dans les catégories existantes, voire de nouveaux moteurs si une approximation AMY
+raisonnable de DIGITAL/SAMPLE/GRAIN apparaît.
 
 ---
 

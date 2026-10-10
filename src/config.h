@@ -62,6 +62,12 @@ enum AppMode : uint8_t {
                     // for users who found it "a bit cheap"-sounding
     MODE_DRUMS3,    // same template as MODE_DRUMS2, tuned for a TR-909-style character (brighter/
                     // punchier: more pitch-sweep + click on the kick, higher-centered snare/hat filters)
+    MODE_PRESETS,   // curated patch bank across FELU's 9 engines (~45 named presets, 8 categories:
+                    // BASS/KEYS/ORGAN/PAD/LEAD/PLUCK/STAB/FX) — Sloop-style "browse by kind" instead
+                    // of FELU's own "pick an algo, dial 4 macros by hand"; same underlying engine
+                    // (feluAlgoIdx/feluP[]/feluApplyP4P7()), just a curated starting-point layer on
+                    // top. Melodic instruments only — drum diversity already covered by DRUM2/
+                    // DRUMS2/DRUMS3, not duplicated here.
     MODE_COUNT
 };
 
@@ -103,6 +109,7 @@ enum MenuItem : uint8_t {
     MENU_FELU,
     MENU_DRUMS2,
     MENU_DRUMS3,
+    MENU_PRESETS,
     MENU_ITEM_COUNT
 };
 // Two entries say "303S": MENU_303S (index 13) is the original step-sequencer mode, never
@@ -128,7 +135,7 @@ static const char* menuLabels[] = {
     "NOOB","EUCLI","CRNCH",
     "AMBNT","NOOB2","OMNI2",
     "BREAK","FELU",
-    "DRUM2","DRUM3"
+    "DRUM2","DRUM3","PRSET"
 };
 #define MENU_ROWS ((MENU_ITEM_COUNT + MENU_COLS - 1) / MENU_COLS)
 
@@ -652,6 +659,94 @@ static const FeluAlgoDef kFeluAlgos[] = {
       {{"Cut",80,8000,0.40f}, {"Res",0.5f,10,0.10f}, {"Drv",1.0f,3.0f,0.0f},{"Dcy",10,2000,0.25f}} },
 };
 #define FELU_ALGO_COUNT  9
+
+// ==================== MODE_PRESETS: curated patch bank ====================
+// Sloop (github.com/isod89/sloop-fm1, a custom firmware for the M-VAVE FM-1 built on
+// Felucca — the same lineage FELU above is inspired by) ships ~153 named sounds browsed
+// "by kind" (Bass/Keys/Organ/Pad/...), each a tuned preset on one of its 12 engines. This
+// is the same idea applied to GrvEP's own 9-engine subset (kFeluAlgos[] above) — a preset
+// is just {which algo, 4 macro values}, applied via the exact same feluAlgoIdx/feluP[]/
+// feluApplyP4P7() machinery FELU itself uses, so zero new DSP code, only curated content.
+// Sloop's own DIGITAL/SAMPLE/GRAIN-tagged sounds have no equivalent engine here (FELU's
+// own comment above explains why: redundant with GRANULAR2/SAMPLE/STONE/SS2) and are
+// skipped rather than approximated — not a silent gap, a deliberate one.
+enum PresetCategory : uint8_t { PRESET_BASS=0, PRESET_KEYS, PRESET_ORGAN, PRESET_PAD,
+                                 PRESET_LEAD, PRESET_PLUCK, PRESET_STAB, PRESET_FX,
+                                 PRESET_CAT_COUNT };
+static const char* kPresetCatNames[PRESET_CAT_COUNT] = {
+    "BASS","KEYS","ORGAN","PAD","LEAD","PLUCK","STAB","FX"
+};
+struct PresetDef {
+    const char* name;     // ≤12 chars for OLED display
+    uint8_t     cat;       // PresetCategory
+    uint8_t     algo;      // index into kFeluAlgos[]
+    float       macro[4];  // normalized 0-1, same convention as feluP[]/FeluParamDef.dflt
+};
+// clang-format off
+static const PresetDef kPresets[] = {
+    // ---- BASS (ANLG/TRIO/FM6/LOFI/VOIC) ----
+    {"SUB BASS",   PRESET_BASS, 0, {0.03f,0.05f,0.00f,0.50f}},  // ANLG: deep clean sub, long sustain
+    {"ACID BASS",  PRESET_BASS, 0, {0.25f,0.70f,0.30f,0.30f}},  // ANLG: resonant squelch
+    {"FAT BASS",   PRESET_BASS, 2, {0.20f,0.30f,0.20f,0.00f}},  // TRIO: detuned low end
+    {"ROUND BASS", PRESET_BASS, 4, {0.30f,0.20f,0.10f,0.10f}},  // FM6: round, little brightness
+    {"GB BASS",    PRESET_BASS, 5, {0.15f,0.40f,0.00f,0.30f}},  // LOFI: gameboy-ish grit
+    {"WOW BASS",   PRESET_BASS, 6, {0.20f,0.50f,0.10f,0.40f}},  // VOIC: vocal-formant low end
+
+    // ---- KEYS (LOFI=DX7 EP base, FM6, PHAS) ----
+    {"EP CLASSIC", PRESET_KEYS, 5, {0.50f,0.00f,0.30f,0.60f}},  // LOFI (base shape IS an EP already)
+    {"LOFI KEYS",  PRESET_KEYS, 5, {0.30f,0.30f,0.20f,0.50f}},
+    {"TINE EP",    PRESET_KEYS, 4, {0.20f,0.60f,0.10f,0.25f}},  // FM6
+    {"SOFT KEYS",  PRESET_KEYS, 3, {0.15f,0.30f,0.20f,0.00f}},  // PHAS
+
+    // ---- ORGAN (WHEL=tonewheel, FM6, TRIO) ----
+    {"SOUL ORGAN", PRESET_ORGAN, 1, {0.60f,0.40f,0.25f,0.30f}}, // WHEL
+    {"GOSPEL ORG", PRESET_ORGAN, 1, {0.75f,0.50f,0.35f,0.35f}},
+    {"DIRTY B3",   PRESET_ORGAN, 1, {0.50f,0.30f,0.15f,0.25f}},
+    {"DRAWBARS",   PRESET_ORGAN, 4, {0.50f,0.65f,0.15f,0.20f}}, // FM6
+    {"ACCORDION",  PRESET_ORGAN, 2, {0.40f,0.15f,0.00f,0.20f}}, // TRIO
+
+    // ---- PAD (ANLG/FM6/PHAS/VOIC/PHYS/NOIS/TRIO) ----
+    {"WARM PAD",   PRESET_PAD, 0, {0.35f,0.10f,0.00f,0.80f}},   // ANLG
+    {"DARK STR",   PRESET_PAD, 0, {0.18f,0.10f,0.00f,0.90f}},
+    {"ATMOS PAD",  PRESET_PAD, 0, {0.12f,0.20f,0.00f,1.00f}},
+    {"GLASS PAD",  PRESET_PAD, 4, {0.15f,0.70f,0.20f,0.40f}},   // FM6
+    {"CZ PAD",     PRESET_PAD, 3, {0.40f,0.50f,0.30f,0.00f}},   // PHAS
+    {"CHOIR AAH",  PRESET_PAD, 6, {0.55f,0.50f,0.45f,0.70f}},   // VOIC
+    {"BOWED MTL",  PRESET_PAD, 7, {0.40f,0.30f,0.00f,0.80f}},   // PHYS
+    {"WIND",       PRESET_PAD, 8, {0.30f,0.15f,0.00f,0.90f}},   // NOIS
+    {"ENSEMBLE",   PRESET_PAD, 2, {0.45f,0.10f,0.00f,0.40f}},   // TRIO
+
+    // ---- LEAD (ANLG/TRIO/VOIC/LOFI/PHAS) ----
+    {"SUPERSAW LD",PRESET_LEAD, 0, {0.60f,0.20f,0.15f,0.20f}},  // ANLG
+    {"SYNC LEAD",  PRESET_LEAD, 2, {0.55f,0.40f,0.30f,0.15f}},  // TRIO
+    {"GAME LEAD",  PRESET_LEAD, 5, {0.50f,0.40f,0.10f,0.25f}},  // LOFI
+    {"TALKBOX",    PRESET_LEAD, 6, {0.50f,0.20f,0.15f,0.30f}},  // VOIC
+    {"CZ LEAD",    PRESET_LEAD, 3, {0.55f,0.20f,0.10f,0.20f}},  // PHAS
+    {"PWM LEAD",   PRESET_LEAD, 0, {0.45f,0.15f,0.00f,0.15f}},  // ANLG
+
+    // ---- PLUCK & BELL (PHYS=plucked model, FM6, ANLG, PHAS) ----
+    {"NYLON PLUCK",PRESET_PLUCK, 7, {0.45f,0.20f,0.00f,0.20f}}, // PHYS
+    {"KALIMBA",    PRESET_PLUCK, 7, {0.35f,0.15f,0.00f,0.15f}},
+    {"MARIMBA",    PRESET_PLUCK, 7, {0.40f,0.10f,0.00f,0.10f}},
+    {"GLASS BELL", PRESET_PLUCK, 4, {0.30f,0.75f,0.20f,0.30f}}, // FM6
+    {"TRAP PLUCK", PRESET_PLUCK, 0, {0.50f,0.25f,0.00f,0.15f}}, // ANLG
+    {"RESO PLUCK", PRESET_PLUCK, 3, {0.25f,0.20f,0.10f,0.00f}}, // PHAS
+
+    // ---- STAB (TRIO=Sloop's main stab engine, ANLG, FM6, PHAS) ----
+    {"MIN STAB",   PRESET_STAB, 2, {0.50f,0.25f,0.20f,0.20f}},  // TRIO
+    {"RAVE STAB",  PRESET_STAB, 2, {0.60f,0.40f,0.40f,0.10f}},
+    {"SYN BRASS",  PRESET_STAB, 0, {0.55f,0.20f,0.25f,0.20f}},  // ANLG
+    {"BRASS SECT", PRESET_STAB, 4, {0.40f,0.60f,0.15f,0.20f}},  // FM6
+    {"CZ BRASS",   PRESET_STAB, 3, {0.50f,0.20f,0.10f,0.30f}},  // PHAS
+
+    // ---- FX / NOISE (NOIS) ----
+    {"RAIN",       PRESET_FX, 8, {0.25f,0.05f,0.00f,1.00f}},    // NOIS
+    {"VINYL HISS", PRESET_FX, 8, {0.40f,0.10f,0.00f,0.60f}},
+    {"RISER",      PRESET_FX, 8, {0.60f,0.30f,0.10f,0.80f}},
+    {"METAL NOISE",PRESET_FX, 8, {0.50f,0.50f,0.00f,0.50f}},
+};
+// clang-format on
+#define PRESET_COUNT (sizeof(kPresets)/sizeof(kPresets[0]))
 
 // MOD2 LFO combined mode: destination × waveform shape
 // B4 cycles 7 modes: Off, Pitch×3 shapes, Filter×3 shapes

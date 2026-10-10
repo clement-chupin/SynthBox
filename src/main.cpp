@@ -217,7 +217,8 @@ enum OverlayType : uint8_t {
     OVERLAY_FX_MOD,  // double-click an active FX slot in OVERLAY_FX to automate one of its params
     OVERLAY_CRUNCH,  // instrument browser for MODE_CRUNCH (B4) — flat list, joystick Y=item
     OVERLAY_FELU_ALGO, // algorithm browser for MODE_FELU (B3) — mirrors OVERLAY_MOD2_ALGO
-    OVERLAY_FX_PUNCH // momentary "punch-in" FX menu (Sloop-style) — see fxTriggerBtn()
+    OVERLAY_FX_PUNCH, // momentary "punch-in" FX menu (Sloop-style) — see fxTriggerBtn()
+    OVERLAY_PRESETS  // MODE_PRESETS' 2-column category/item browser (B3) — mirrors OVERLAY_PKMN
 };
 static OverlayType    s_overlay        = OVERLAY_NONE;
 static unsigned long  s_overlayCloseAt = 0;   // millis() when overlay auto-closes (0=no pending close)
@@ -317,6 +318,14 @@ static uint8_t  feluAlgoIdx      = 0;          // index into kFeluAlgos[]
 static float    feluP[4]         = {0.55f,0.10f,0.0f,0.25f}; // normalized P4-P7 (0-1)
 static float    feluPCache[4]    = {-1,-1,-1,-1};            // change detection
 static bool     feluPotNeedsSync = false;      // force pot re-read after algo change
+
+// MODE_PRESETS state — a curated patch bank browsed by category, applied through FELU's
+// own feluAlgoIdx/feluP[]/feluApplyP4P7() machinery (see kPresets[], config.h), not a
+// separate engine. presetCurIdx is the flat index into kPresets[] currently loaded —
+// -1 means "manually tweaked away from any exact preset" (not used yet, reserved).
+static int16_t  presetCurIdx  = 0;             // flat index into kPresets[]
+static uint8_t  presetBrCat   = 0;             // OVERLAY_PRESETS: selected category (left column)
+static uint8_t  presetBrItem  = 0;             // OVERLAY_PRESETS: selected item within that category (right column)
 
 // ==================== TB-303 STATE ====================
 static float         t303Cutoff      = 500.0f;    // base filter cutoff Hz
@@ -2744,7 +2753,7 @@ static const MenuItem kMenuCatInstr[] = {
     MENU_GRANULAR2, MENU_EXP,
     MENU_EXP2, MENU_EXP3, MENU_POKEMON,
     MENU_LIFE, MENU_SWARM, MENU_GEN, MENU_DJ, MENU_NOOB,
-    MENU_AMBIENT, MENU_NOOB2, MENU_OMNI2, MENU_FELU
+    MENU_AMBIENT, MENU_NOOB2, MENU_OMNI2, MENU_FELU, MENU_PRESETS
 };
 // CRUNCH moved here from kMenuCatInstr — it's a 4-track pattern recorder now (MothOS-
 // style live-record tracker), not a single played instrument, so it belongs alongside
@@ -2756,7 +2765,7 @@ static const MenuItem kMenuCatAut[] = {
     MENU_LIGHT, MENU_LIGHTPLAY, MENU_ABOUT, MENU_SD, MENU_ANIM, MENU_VID, MENU_LANIM, MENU_PCMCLEAN, MENU_USB, MENU_IMPORT, MENU_MIDI
 };
 static const MenuItem* kMenuCatItems[] = { kMenuCatInstr, kMenuCatSeq, kMenuCatAut };
-static const uint8_t kMenuCatSizes[] = { 21, 12, 11 };
+static const uint8_t kMenuCatSizes[] = { 22, 12, 11 };
 
 // ==================== VID STATE ====================
 struct __attribute__((packed)) BvidHeader {
@@ -3502,7 +3511,7 @@ static int8_t fxTriggerBtn(AppMode m) {
     switch (m) {
         case MODE_SYNTH: case MODE_POKEMON: case MODE_I303: case MODE_STONE:
         case MODE_OMNI: case MODE_OMNI2: case MODE_MODULAR: case MODE_FELU:
-        case MODE_AMBIENT: case MODE_GRANULAR2:
+        case MODE_AMBIENT: case MODE_GRANULAR2: case MODE_PRESETS:
             return 0;  // B1
         case MODE_CRUNCH: case MODE_DJ: case MODE_SAMPLE: case MODE_DRUM2:
         case MODE_DRUMS2: case MODE_DRUMS3: case MODE_DR2: case MODE_GROOVE:
@@ -4316,6 +4325,15 @@ static CtrlLabels ctrlLabelsFor(AppMode m) {
                 return {"ALGO", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "FX", "ENV", "ALGO", "OCT"};
             return {"ALGO", algo.p[0].name, algo.p[1].name, algo.p[2].name, algo.p[3].name, "FX", "ENV", "ALGO", "OCT"};
         }
+        case MODE_PRESETS: {
+            // Same control scheme as FELU (which this mode's engine IS, underneath) — P2
+            // sweeps the flat preset list instead of a raw algo list, B3 opens the
+            // category/item browser instead of a flat algo grid.
+            const FeluAlgoDef& algo = kFeluAlgos[feluAlgoIdx];
+            if (fxList[fxSelected].active)
+                return {"BANK", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "FX", "ENV", "BANK", "OCT"};
+            return {"BANK", algo.p[0].name, algo.p[1].name, algo.p[2].name, algo.p[3].name, "FX", "ENV", "BANK", "OCT"};
+        }
         case MODE_LIGHT:
             return {"-", "N", "SPEED", "HUE", "INTENSITY", "-", "-", "-", "-"};
         case MODE_MODULAR:
@@ -4468,6 +4486,7 @@ static void ambApplyPreset(uint8_t idx) {
 void drawScreen(bool blockWait = false);  // forward-decl
 static void mod2AlgoApply();              // forward-decl
 static void feluAlgoApply();              // forward-decl
+static void presetApply(uint16_t idx);    // forward-decl
 
 void switchMode(AppMode newMode) {
     if (currentMode==MODE_USB) usbMscExit();
@@ -4708,7 +4727,8 @@ void switchMode(AppMode newMode) {
                 false, false,                    // NOOB2, OMNI2 (played instruments, not sequencers)
                 true,                             // BREAK (has its own transport/clock — breakPlaying)
                 false,                            // FELU (played instrument, not a sequencer)
-                true, true                        // DRUMS2, DRUMS3 (own transport/clock, like EUCLI)
+                true, true,                        // DRUMS2, DRUMS3 (own transport/clock, like EUCLI)
+                false                             // PRESETS (played instrument, not a sequencer)
             };
             if (!kIsSeq[currentMode]) {
                 audioSetFilter(0.0f, 1.5f);
@@ -4728,7 +4748,7 @@ void switchMode(AppMode newMode) {
           "BATT","DIAG","MOD2","GRANU",
           "MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303","MEDIA","LANIM",
           "EXP","EXP2","EXP3","303S","PKMN","SERUM","GEST",
-          "PURGPCM","USB","STONE","GEST2","IMPORT","LIFE","SWARM","GEN","DJ","GRV","NOOB","EUCLI","CRUNCH","AMBIENT","NOOB2","OMNI2","BREAK","FELU","DRUMS2","DRUMS3"};
+          "PURGPCM","USB","STONE","GEST2","IMPORT","LIFE","SWARM","GEN","DJ","GRV","NOOB","EUCLI","CRUNCH","AMBIENT","NOOB2","OMNI2","BREAK","FELU","DRUMS2","DRUMS3","PRESETS"};
       // This array must have exactly MODE_COUNT entries in AppMode order — the
       // compiler silently pads any missing trailing ones with nullptr (no size
       // mismatch warning), and printf("%s", nullptr) crashes (LoadProhibited).
@@ -4784,6 +4804,9 @@ void switchMode(AppMode newMode) {
     }
     if (newMode==MODE_FELU) {
         feluAlgoApply();
+    }
+    if (newMode==MODE_PRESETS) {
+        presetApply((uint16_t)constrain((int)presetCurIdx, 0, (int)PRESET_COUNT-1));
     }
     if (newMode==MODE_MODULAR && audioReady) {
         modOscTable = 0; modOscBTable = 0; modOscAPos = 0.0f; modOscBPos = 0.3f;
@@ -5216,6 +5239,7 @@ static void dispatchMenuItem(MenuItem item) {
         case MENU_FELU:      switchMode(MODE_FELU);  break;
         case MENU_DRUMS2:    switchMode(MODE_DRUMS2); break;
         case MENU_DRUMS3:    switchMode(MODE_DRUMS3); break;
+        case MENU_PRESETS:   switchMode(MODE_PRESETS); break;
         case MENU_POKEMON:   switchMode(MODE_POKEMON); break;
         case MENU_GEST:      switchMode(MODE_GEST);      break;
         case MENU_PCMCLEAN:  switchMode(MODE_PCMCLEAN);  break;
@@ -5388,6 +5412,25 @@ static void feluAlgoApply() {
     feluApplyP4P7();
 }
 
+// Loads a MODE_PRESETS bank entry — same shape/envelope/macro-apply steps as
+// feluAlgoApply() above, but the 4 macro values come from the curated preset (kPresets[])
+// instead of each algo's own generic default, and feluPCache is force-synced to those
+// exact values so the P4-P7 pots pick up from here (not from wherever they'd last left
+// off on a different preset) rather than snapping the sound the instant a pot is touched.
+static void presetApply(uint16_t idx) {
+    if (idx >= PRESET_COUNT) return;
+    presetCurIdx = (int16_t)idx;
+    const PresetDef& pr = kPresets[idx];
+    feluAlgoIdx = pr.algo;
+    for (int i=0;i<4;i++) { feluP[i] = pr.macro[i]; feluPCache[i] = -1.0f; }
+    feluPotNeedsSync = true;
+    if (!audioReady) return;
+    audioAllNotesOff();
+    audioSetShape(kFeluAlgos[pr.algo].shape);
+    audioSetEnvelope(envTable[currentEnv]);
+    feluApplyP4P7();
+}
+
 // Apply t303Wave audio parameters after t303Wave has been updated.
 static void t303ApplyWave(uint8_t prevWave) {
     if (!audioReady) return;
@@ -5528,6 +5571,14 @@ void overlayKeyPress(uint8_t row, uint8_t col) {
             }
         }
         pkmnApply();
+        s_overlay=OVERLAY_NONE; s_overlayCloseAt=0;
+        return;
+    }
+
+    // PRESETS browser: unlike PKMN, the preset is already live-applied on every
+    // joystick move (Sloop-style immediate preview while browsing) — a key press here
+    // just confirms by closing the overlay, no apply needed.
+    if (s_overlay == OVERLAY_PRESETS) {
         s_overlay=OVERLAY_NONE; s_overlayCloseAt=0;
         return;
     }
@@ -5895,6 +5946,7 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                     case MODE_OMNI2:
                     case MODE_MODULAR:
                     case MODE_FELU:
+                    case MODE_PRESETS:
                     case MODE_AMBIENT: {  // newly wired in — was unreachable from this mode before
                         OverlayType old = s_overlay; s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
                         if (old != OVERLAY_FX) s_overlay = OVERLAY_FX;
@@ -6622,6 +6674,13 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             // (btn==4 can never fire) by not having a 4th function to miss in the first place.
             if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_ENV) s_overlay=OVERLAY_ENV; }
             if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_FELU_ALGO) s_overlay=OVERLAY_FELU_ALGO; }
+            if (btn==3) noteMap.nextOctave();
+            break;
+        case MODE_PRESETS:
+            // Mirrors MODE_FELU's block above verbatim, substituting the new preset
+            // browser overlay for FELU's own algo-picker (B3/btn==2).
+            if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_ENV) s_overlay=OVERLAY_ENV; }
+            if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_PRESETS) s_overlay=OVERLAY_PRESETS; }
             if (btn==3) noteMap.nextOctave();
             break;
         case MODE_MODULAR:
@@ -7385,6 +7444,48 @@ void drawScreen(bool blockWait) {
             if (sel)      { oled.drawBox(41, y, 87, itemH-1); oled.setDrawColor(0); }
             else if (cur) { oled.drawFrame(41, y, 87, itemH-1); }
             oled.drawStr(43, y + 11, kPokemon[i].name);
+            if (sel) oled.setDrawColor(1);
+            n++;
+        }
+        oled.setDrawColor(1);
+        if (s_displayTaskHandle) xTaskNotifyGive(s_displayTaskHandle);
+        return;
+    }
+
+    // PRESETS browser: left = categories, right = presets of selected category.
+    // Mirrors OVERLAY_PKMN above verbatim (every category has >=1 preset, so no
+    // "has any" skip needed).
+    if (s_overlay == OVERLAY_PRESETS) {
+        oled.setFont(u8g2_font_4x6_tf);
+        const uint8_t nCats = (uint8_t)PRESET_CAT_COUNT;
+        const uint8_t catH  = 8;
+        const uint8_t maxCatVis = 128 / catH;
+
+        uint8_t cScroll = (presetBrCat >= maxCatVis) ? (presetBrCat - maxCatVis + 1) : 0;
+        for (uint8_t c = 0; c < nCats; c++) {
+            if (c < cScroll || c >= cScroll + maxCatVis) continue;
+            int y = (int)(c - cScroll) * catH;
+            bool sel = (c == presetBrCat);
+            if (sel) { oled.drawBox(0, y, 38, catH-1); oled.setDrawColor(0); }
+            else      oled.drawFrame(0, y, 38, catH-1);
+            oled.drawStr(1, y + catH - 2, kPresetCatNames[c]);
+            if (sel) oled.setDrawColor(1);
+        }
+        oled.drawVLine(39, 0, 128);
+
+        uint8_t itemH = 16;
+        uint8_t maxItemVis = 128 / itemH;
+        uint8_t iScroll = (presetBrItem >= maxItemVis) ? (presetBrItem - maxItemVis + 1) : 0;
+        uint8_t n = 0;
+        for (uint16_t i = 0; i < PRESET_COUNT; i++) {
+            if (kPresets[i].cat != presetBrCat) continue;
+            if (n < iScroll || n >= iScroll + maxItemVis) { n++; continue; }
+            int y = (int)(n - iScroll) * itemH;
+            bool sel = (n == presetBrItem);
+            bool cur = ((int16_t)i == presetCurIdx);
+            if (sel)      { oled.drawBox(41, y, 87, itemH-1); oled.setDrawColor(0); }
+            else if (cur) { oled.drawFrame(41, y, 87, itemH-1); }
+            oled.drawStr(43, y + 11, kPresets[i].name);
             if (sel) oled.setDrawColor(1);
             n++;
         }
@@ -9586,6 +9687,44 @@ void drawScreen(bool blockWait) {
                          envNames[currentEnv],noteMap.getOctave());
                 oled.drawStr(0,78,buf);
                 // Velocity bar (JX)
+                oled.setFont(u8g2_font_5x7_tf);
+                oled.drawHLine(0,94,128);
+                {
+                    float jx2=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                    int bw=(int)((jx2+1.0f)*0.5f*128.0f);
+                    oled.drawFrame(0,96,128,5);
+                    if(bw>2) oled.drawBox(0,96,bw,5);
+                }
+                break;
+            }
+            case MODE_PRESETS: {
+                // Mirrors MODE_FELU's block above — same feluP[]/kFeluAlgos[feluAlgoIdx]
+                // readout, just headed by the curated preset's own name/category instead
+                // of the raw algo name/description.
+                const FeluAlgoDef& alg = kFeluAlgos[feluAlgoIdx];
+                const PresetDef& pr = kPresets[constrain((int)presetCurIdx,0,(int)PRESET_COUNT-1)];
+                oled.setFont(u8g2_font_6x10_tf);
+                snprintf(buf,sizeof(buf),"PRSET %s", pr.name);
+                oled.drawStr(0,0,buf);
+                oled.drawHLine(0,9,128);
+                drawBtnRow(MODE_PRESETS, 17);
+                oled.setFont(u8g2_font_4x6_tf);
+                snprintf(buf,sizeof(buf),"%s - %s", kPresetCatNames[pr.cat], alg.name);
+                oled.drawStr(0,24,buf);
+                oled.drawHLine(0,30,128);
+                static const char* potLabelsPreset[]={"P4","P5","P6","P7"};
+                for(int i=0;i<4;i++){
+                    float rv = alg.p[i].mn + (alg.p[i].mx-alg.p[i].mn)*feluP[i];
+                    const char* pn = alg.p[i].name;
+                    if      (strcmp(pn,"Cut")==0) snprintf(buf,sizeof(buf),"%s %-3s %4dHz",potLabelsPreset[i],pn,(int)rv);
+                    else if (strcmp(pn,"Dcy")==0) snprintf(buf,sizeof(buf),"%s %-3s %4dms",potLabelsPreset[i],pn,(int)rv);
+                    else if (strcmp(pn,"Chr")==0 || strcmp(pn,"Rvb")==0) snprintf(buf,sizeof(buf),"%s %-3s %3d%%",potLabelsPreset[i],pn,(int)(rv*100));
+                    else           snprintf(buf,sizeof(buf),"%s %-3s %5.2f",potLabelsPreset[i],pn,rv);
+                    oled.drawStr(0, 38 + i*9, buf);
+                }
+                snprintf(buf,sizeof(buf),"Env:%-3s  Oct:%+d",
+                         envNames[currentEnv],noteMap.getOctave());
+                oled.drawStr(0,78,buf);
                 oled.setFont(u8g2_font_5x7_tf);
                 oled.drawHLine(0,94,128);
                 {
@@ -12337,7 +12476,7 @@ static bool notePreviewSafeDuringFxOverlay() {
         case MODE_SYNTH: case MODE_STONE: case MODE_OMNI: case MODE_SAMPLE:
         case MODE_I303:  case MODE_MOD2:  case MODE_MODULAR: case MODE_GRANULAR2:
         case MODE_POKEMON: case MODE_CRUNCH: case MODE_AMBIENT: case MODE_OMNI2:
-        case MODE_FELU:
+        case MODE_FELU: case MODE_PRESETS:
             return true;
         case MODE_DRUM2: return drum2View != 1;   // PAD/ANIM views preview; SEQ view edits steps
         // MODE_DRUMS2/DRUMS3 are sequencer-only now (no PAD/live-play view, see the
@@ -13319,6 +13458,20 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             // Simple POLY only (no Mono/Slide, per the v1 scoping decision) — plays on the
             // shared SYNTH_CH via the same audioNoteOn/audioNoteOff every "synth template"
             // mode uses (MOD2's own Poly branch, above, is the direct precedent).
+            uint8_t note=noteMap.getMidiNote(row,col);
+            activeNotes[row][col]=pressed?note:0;
+            if(pressed){
+                float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
+                float vel=constrain(0.8f+jx*0.6f, 0.05f, 1.5f);
+                audioNoteOn(note, vel);
+            } else {
+                audioNoteOff(note);
+            }
+            break;
+        }
+        case MODE_PRESETS: {
+            // Mirrors MODE_FELU's block above verbatim — same shared engine, just a
+            // different curation layer picking the algo/macros.
             uint8_t note=noteMap.getMidiNote(row,col);
             activeNotes[row][col]=pressed?note:0;
             if(pressed){
@@ -16723,6 +16876,42 @@ void loop() {
                     }
                     break;
                 }
+                case MODE_PRESETS: {
+                    // P2 sweeps the flat preset index instead of FELU's own algo index;
+                    // P4-P7 block below is reused verbatim (same feluP[]/feluPCache[]/
+                    // feluPotNeedsSync engine every preset is just a curated starting point for).
+                    static float lp2_preset=-1.0f;
+                    if(feluPotNeedsSync){ lp2_preset=pots[1].value; feluPotNeedsSync=false; }
+                    if(fabsf(pots[1].value-lp2_preset)>0.005f){
+                        uint16_t np=(uint16_t)(pots[1].value*((float)PRESET_COUNT-0.01f));
+                        if(np!=(uint16_t)presetCurIdx){ presetApply(np); }
+                        lp2_preset=pots[1].value;
+                    }
+                    if (fxList[fxSelected].active) {
+                        applyFxPots(fxSelected);
+                    } else {
+                        bool coldStartPreset = (feluPCache[0] < 0.0f);
+                        bool changed=false;
+                        for(int i=0;i<4;i++){
+                            float pv=pots[3+i].value;
+                            if(fabsf(pv-feluPCache[i])>0.003f){
+                                feluP[i]=pv; feluPCache[i]=pv; changed=true;
+                                if (!coldStartPreset) {
+                                    const FeluParamDef& d = kFeluAlgos[feluAlgoIdx].p[i];
+                                    float rv = d.mn + (d.mx-d.mn)*pv;
+                                    char vb[16];
+                                    if      (strcmp(d.name,"Cut")==0) snprintf(vb,sizeof(vb),"%dHz",(int)rv);
+                                    else if (strcmp(d.name,"Dcy")==0) snprintf(vb,sizeof(vb),"%dms",(int)rv);
+                                    else if (strcmp(d.name,"Chr")==0 || strcmp(d.name,"Rvb")==0) snprintf(vb,sizeof(vb),"%d%%",(int)(rv*100));
+                                    else snprintf(vb,sizeof(vb),"%.2f",rv);
+                                    potPopupShow(d.name, vb);
+                                }
+                            }
+                        }
+                        if(changed) feluApplyP4P7();
+                    }
+                    break;
+                }
                 case MODE_STONE: {
                     // FX overlay open: pots 4-7 belong to the active FX's own params instead
                     // of the sample window — same established pattern every other synth-like
@@ -18016,6 +18205,40 @@ void loop() {
                     if (pkmnBrItem+1 < cnt) { pkmnBrItem++; moved = true; }
                 }
                 if (moved) lastPkmnNav = millis();
+            }
+        }
+
+        // Preset browser (OVERLAY_PRESETS): JX=category, JY=item — unlike PKMN,
+        // live-applies the highlighted preset on every move (Sloop-style immediate
+        // preview while scrolling, not confirm-only).
+        if (s_overlay == OVERLAY_PRESETS) {
+            static unsigned long lastPresetNav = 0;
+            if (millis() - lastPresetNav >= 160) {
+                float nx = cachedJoyX / 64.0f;
+                float ny = cachedJoyY / 64.0f;
+                bool moved = false;
+                // JX: scroll category (every category has >=1 preset, no skip needed)
+                if (nx > 0.3f) {
+                    presetBrCat = (presetBrCat + 1) % PRESET_CAT_COUNT; presetBrItem = 0; moved = true;
+                } else if (nx < -0.3f) {
+                    presetBrCat = (presetBrCat + PRESET_CAT_COUNT - 1) % PRESET_CAT_COUNT; presetBrItem = 0; moved = true;
+                }
+                // JY: scroll item within category
+                if (ny < -0.3f && presetBrItem > 0) { presetBrItem--; moved = true; }
+                else if (ny > 0.3f) {
+                    uint8_t cnt=0; for(uint16_t i=0;i<PRESET_COUNT;i++) if(kPresets[i].cat==presetBrCat) cnt++;
+                    if (presetBrItem+1 < cnt) { presetBrItem++; moved = true; }
+                }
+                if (moved) {
+                    lastPresetNav = millis();
+                    uint8_t n=0;
+                    for (uint16_t i=0; i<PRESET_COUNT; i++) {
+                        if (kPresets[i].cat == presetBrCat) {
+                            if (n == presetBrItem) { presetApply(i); break; }
+                            n++;
+                        }
+                    }
+                }
             }
         }
 
