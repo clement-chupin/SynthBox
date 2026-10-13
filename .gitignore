@@ -18,6 +18,10 @@ simulator/build-windows/
 simulator/.winbuild-toolchain/
 simulator/GrvEP.exe
 
+# Web (Emscripten/WASM) simulator build artifacts — docs/grvep.js and docs/grvep.wasm are
+# the published output and ARE tracked; everything under web/build/ is intermediate.
+web/build/
+
 # Android native (SDL2) build artifacts — see android-native/.gitignore for details
 android-native/app/build/
 android-native/app/.cxx/

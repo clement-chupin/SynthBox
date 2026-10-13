@@ -56,6 +56,14 @@ void main_loop__em()
 // Semaphore for passing most recent audio buffer to amy_update.
 // It's the pointer that's volatile, not the data it points to.
 int16_t *volatile last_audio_buffer = NULL;
+// Set by miniaudio_init() (via MA_INIT_FAIL, see its own comment) when the audio device
+// never came up at all — so amy_render_audio() below knows data_callback() will never
+// fire to set last_audio_buffer, and must stop busy-waiting for it instead of hanging the
+// calling thread forever. On Emscripten that caller is amy_update(), called once per
+// browser animation frame from GrvEP's own main loop() — without this, a failed audio
+// device wouldn't just mean silence, it would freeze the entire page (OLED/keyboard/LEDs
+// included) on the very first frame.
+volatile int audio_device_failed = 0;
 
 void amy_update_tasks() {
 }
@@ -71,6 +79,10 @@ size_t amy_i2s_write(const uint8_t *buffer, size_t nbytes) {
 }
 
 int16_t *amy_render_audio() {
+    if (audio_device_failed) {
+        static int16_t silent_block[AMY_BLOCK_SIZE * AMY_NCHANS] = {0};
+        return silent_block;
+    }
     // For miniaudio, we just return a semaphore buffer.
     while (last_audio_buffer == NULL)
         ;
@@ -172,6 +184,19 @@ ma_uint32 captureCount;
 
 // start 
 
+// On a real desktop/ESP32 target, a totally unusable audio device is a fatal error worth
+// crashing loudly for — but in the browser, miniaudio's Emscripten backend creating an
+// AudioContext/AudioWorkletNode can fail for environment reasons that have nothing to do
+// with the rest of the app (autoplay-gesture timing, a browser's worklet support, etc.),
+// and the original `exit(1)` here was killing the ENTIRE WASM runtime on that failure —
+// including `emscripten_set_main_loop()`, so the OLED/keyboard/LEDs never got a chance to
+// run either, even though none of them need audio at all. Degrade gracefully there instead.
+#ifdef __EMSCRIPTEN__
+#define MA_INIT_FAIL(msg) do { printf(msg); audio_device_failed = 1; return 1; } while(0)
+#else
+#define MA_INIT_FAIL(msg) do { printf(msg); exit(1); } while(0)
+#endif
+
 amy_err_t miniaudio_init() {
     leftover_buf = malloc_caps(sizeof(int16_t)*AMY_BLOCK_SIZE*AMY_NCHANS, amy_global.config.ram_caps_fbl);
 
@@ -179,23 +204,19 @@ amy_err_t miniaudio_init() {
     //        AMY_HAS_AUDIO_IN, amy_global.config.playback_device_id, amy_global.config.capture_device_id);
 
     if (ma_context_init(NULL, 0, NULL, &context) != MA_SUCCESS) {
-        printf("Failed to setup context for device list.\n");
-        exit(1);
+        MA_INIT_FAIL("Failed to setup context for device list.\n");
     }
     if (ma_context_get_devices(&context, &pPlaybackInfos, &playbackCount, &pCaptureInfos, &captureCount) != MA_SUCCESS) {
-        printf("Failed to get device list.\n");
-        exit(1);
+        MA_INIT_FAIL("Failed to get device list.\n");
     }
-    
+
     if(AMY_HAS_AUDIO_IN) {
         if (amy_global.config.playback_device_id >= (int32_t)playbackCount || amy_global.config.capture_device_id >= (int32_t)captureCount) {
-            printf("invalid device\n");
-            exit(1);
+            MA_INIT_FAIL("invalid device\n");
         }
     } else {
         if (amy_global.config.playback_device_id >= (int32_t)playbackCount) {
-            printf("invalid device\n");
-            exit(1);
+            MA_INIT_FAIL("invalid device\n");
         }
     }
 
@@ -231,14 +252,18 @@ amy_err_t miniaudio_init() {
     deviceConfig.periodSizeInFrames = AMY_BLOCK_SIZE;
     
     if (ma_device_init(&context, &deviceConfig, &device) != MA_SUCCESS) {
-        printf("Failed to open playback device.\n");
-        exit(1);
+        MA_INIT_FAIL("Failed to open playback device.\n");
     }
 
     if (ma_device_start(&device) != MA_SUCCESS) {
         printf("Failed to start playback device.\n");
         ma_device_uninit(&device);
+#ifdef __EMSCRIPTEN__
+        audio_device_failed = 1;
+        return 1;
+#else
         exit(1);
+#endif
     }
     for(uint16_t i=0;i<OUTPUT_RING_LENGTH;i++) output_ring[i] = 0;
     return AMY_OK;
