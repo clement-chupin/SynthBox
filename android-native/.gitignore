@@ -1,0 +1,10 @@
+# Build outputs
+app/build/
+build/
+.gradle/
+
+# SDL2 source (large, re-clone with setup_android.sh if missing)
+SDL2/
+
+# Local properties
+local.properties
