@@ -50,6 +50,19 @@ set(AMY_SOURCES
 # ---- U8g2 clib sources ----
 file(GLOB U8G2_SOURCES ${U8G2_CLIB}/*.c)
 
+# ---- Vendored engine sources (SevenistSynth_RitualMachine's framework/engine, see
+# ~/.claude/plans/mutable-nibbling-melody.md). Added alongside AMY_SOURCES, not yet
+# replacing it — main.cpp still has ~9 raw AMY call sites until a later phase relocates
+# them, so both engines compile side by side during the migration. ----
+file(GLOB_RECURSE ENGINE_SOURCES
+    ${ROOT}/engine/core/*.cpp
+    ${ROOT}/engine/dsp/*.cpp
+    ${ROOT}/engine/modules/*.cpp
+    ${ROOT}/engine/mi/*.cpp
+    ${ROOT}/engine/sampler/*.cpp
+    ${ROOT}/engine/offline/*.cpp
+)
+
 # ---- GrvEP original sources (compiled with simulator HAL) ----
 set(GRVEP_SOURCES
     ${ROOT}/src/main.cpp
@@ -77,6 +90,7 @@ add_executable(grvep_sim
     ${GRVEP_SOURCES}
     ${SIM_SOURCES}
     ${AMY_SOURCES}
+    ${ENGINE_SOURCES}
     ${U8G2_SOURCES}
 )
 
@@ -89,6 +103,9 @@ target_include_directories(grvep_sim PRIVATE
     # GrvEP project headers
     ${ROOT}/include
     ${ROOT}/src
+    # Vendored engine headers (included as "engine/core/engine.h" etc. — the repo root
+    # itself is the include root, not engine/ directly)
+    ${ROOT}
     # AMY headers
     ${AMY_SRC}
     # U8g2 headers
@@ -105,6 +122,9 @@ target_include_directories(grvep_sim PRIVATE
 target_compile_definitions(grvep_sim PRIVATE
     SIMULATOR=1
     OOPSIE_LED_FLAG=1
+    # Vendored engine (framework/engine/dsp/config.h): match AMY's own 44.1kHz so the
+    # two engines mix sensibly while both exist side by side during the migration.
+    ENGINE_SR=44100
     # Enables render_wavetable() and the 5 built-in wavetables baked into
     # pcm_samples_tiny.h (111/BRAIDS01/PPG_WA00/SINE2SAW/VIRAL) — used by the modular synth.
     AMY_WAVETABLE=1

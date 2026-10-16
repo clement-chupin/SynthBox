@@ -1,12 +1,13 @@
 #pragma once
 #include "config.h"
-#include <AMY-Arduino.h>
 #include <SD.h>
-
-extern "C" { amy_err_t esp32_setup_i2s(); }
 
 // Core
 void audioInit();
+// Pulls `frames` interleaved stereo samples from the engine — the one function every
+// per-target HAL audio-out callback calls (see engine_hal_*/audio_out_*.cpp). Replaces
+// AMY's old amy_render_audio()/amy_fill_buffer() role.
+void audioEngineRenderBlock(int16_t *stereo, int frames);
 void audioAllNotesOff();
 void audioNoteOn(uint8_t note, float velocity);
 void audioNoteOff(uint8_t note);

@@ -3,7 +3,7 @@
 // Uses the real u8g2 C library for rendering, but with null I2C callbacks.
 // The framebuffer lives in RAM; SDL reads it via getBufferPtr().
 
-#include "../../.pio/libdeps/esp32-s3-devkitc-1/U8g2/src/clib/u8g2.h"
+#include "../../lib/U8g2/src/clib/u8g2.h"
 #include <stdint.h>
 #include <string.h>
 #include <unistd.h>
