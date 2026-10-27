@@ -115,6 +115,15 @@ extern const uint32_t pcm_wavetable_len;
 // Always use fixed point. You can remove this if you want float
 #define AMY_USE_FIXEDPOINT
 
+// Final-output DC-blocking one-pole HPF (~27Hz corner at 44.1kHz — well below any
+// audible bass, see its own comment in amy_fill_buffer()). Was present in the source but
+// never enabled — with nothing else in the signal path blocking DC/sub-audible content,
+// GrvEP's DELAY+REVERB feedback loops (both lowpass-damped by design, so whatever is left
+// of a decaying tail skews toward low frequencies) could leave an inaudible-but-visible
+// low-frequency residue lingering on the spectrogram long after a note's audible sound
+// had died away. Enabled unconditionally since it only touches content below normal bass.
+#define AMY_HPF_OUTPUT
+
 
 // upper bounds for static arrays.
 #define AMY_MAX_CORES 2          
@@ -907,6 +916,17 @@ void amy_execute_deltas();
 int16_t * amy_fill_buffer();
 int16_t * amy_simple_fill_buffer();  // excute_deltas + render + fill_buffer
 uint32_t ms_to_samples(uint32_t ms) ;
+
+// FX Punch "looper" engine (phase 2 — LOOP 1/4-1/32, STUTTER, REVERSE, TAPESTOP, HALFSPD).
+// See the engine's own comment block in amy.c (right above amy_fill_buffer()) for how it
+// works. len_frames for amy_punch_loop_start() is just (seconds * AMY_SAMPLE_RATE) — the
+// caller (GrvEP's fxPunchApply()) works out the musical duration (quarter/eighth/16th/
+// 32nd note from BPM, or a fixed short glitch length for STUTTER).
+void amy_punch_loop_start(uint32_t len_frames);   // LOOP 1/4-1/32, STUTTER
+void amy_punch_reverse_start();                   // REVERSE
+void amy_punch_halfspeed_start();                 // HALFSPD
+void amy_punch_tapestop_start(float tapestop_seconds); // TAPESTOP
+void amy_punch_loop_stop();                       // revert any of the above to live audio
 
 
 

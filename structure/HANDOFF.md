@@ -51,21 +51,19 @@
 
 ## 3. État du dépôt à la date de passation
 
-- Dernier commit : `969361e` (« feat: MODE_EUCLI, MODE_CRUNCH… »). **Tout le travail décrit au
-  §4 est non commité** (~12 fichiers, +1400/−600 lignes autour de `main.cpp`, `audio_engine.*`,
-  `amy.c`, docs, `platformio.ini`, `simulator/hal/AMY-Arduino.h`). `prompt.txt` (non suivi, à la
-  racine) est le brief initial d'EUCLI, laissé tel quel.
-- **Mis à jour en fin de session suivante (entrées AD-AI ci-dessous)** : toujours aucun commit
-  depuis `969361e` — FELU (9 algos), BREAK (fixes BPM=0/RSD-SYNC), la refonte complète du menu
-  (grille 3×5) et du popup potards P4-P7 (jauge demi-cercle, disposition en 4 coins), et la
-  refonte des touches d'altération de 303S2 (SLIDE/ACCENT/OFFBEAT) sont toutes non commitées à
-  ce stade, en plus de ce qui précède. `structure/AGENT.md`/`structure/HANDOFF.md` eux-mêmes
-  sont non suivis (`??` dans `git status`) — à committer en même temps que le reste si/quand le
-  propriétaire demande un commit.
-- Dernières compilations vérifiées : simulateur Linux ✔, ESP32 (`esp32-s3-devkitc-1`) ✔ (≈ 79 %
-  flash, 43 % RAM). **Non revérifiés depuis la refonte FX/AMY** : APK Android, exécutable Windows,
-  build Web. **Non testé sur carte** : la chaîne FX de bus, ni le fait que l'ESP32 utilise
-  désormais la même copie d'AMY que le simulateur (voir §4-A).
+- **Passation du 2026-10-27 : tout est commité et poussé** sur `origin/main`
+  (`git@github.com:clement-chupin/SynthBox.git`), y compris FX Punch phase 2 (moteur
+  `amy_punch_*()`, entrée AT) et le correctif de sortie du menu FX (entrée AZ). L'arbre de
+  travail est propre : un `git status` non vide en reprenant le projet signifie du travail
+  nouveau, pas un reliquat. (Les sessions précédentes gardaient volontairement de gros
+  chantiers non commités ; ce n'est plus le cas à cette date.)
+- Dernières compilations vérifiées (2026-10-27) : simulateur Linux ✔, ESP32
+  (`esp32-s3-devkitc-1`) ✔ (80,1 % flash, 38,9 % RAM), firmware flashé et utilisé sur la carte
+  du propriétaire (port `/dev/ttyACM1`, adaptateur WCH CH343). **Non revérifiés depuis la
+  refonte FX/AMY** : APK Android, exécutable Windows, build Web (voir aussi AY : son réel du
+  build Web jamais vérifié dans un navigateur). **Pas de mesure audio sur carte** de la chaîne
+  FX de bus ni des effets looper phase 2 : seule l'interaction du bouton FX (AZ) a été
+  vérifiée sur matériel.
 - Après avoir vidé `.pio/build/…`, le **premier** `pio run` peut échouer avec une erreur SCons
   (`FortranCommon` / `.sconsign….tmp`) : relancer une seconde fois, c'est transitoire.
 
@@ -444,6 +442,337 @@ AP. **MODE_PRESETS : banque de 45 patchs curatés, posée sur le moteur de FELU*
    résolution catégorie+item→index plat du browser vérifiée. Détails : SOFTWARE.md.
    D'autres presets/moteurs sont anticipés en itérations suivantes, pas dans cette passe.
 
+AQ. **MODE_PRESETS : joystick pilote octave + instrument (comme 303S), notes jouables en
+   même temps** — sur demande explicite (« je veux pouvoir jouer des notes en même temps
+   que je suis dans le mode bank de PRSET [...] je veux que comme pour 303S, [le joystick]
+   impacte l'octave et l'instrument sélectionné »). JX cycle l'index plat de preset
+   (`presetApply()`, debounce 150ms), JY décale l'octave (debounce 300ms), les deux
+   tournant directement sur l'écran principal (pas besoin d'ouvrir `OVERLAY_PRESETS`) donc
+   les notes restent jouables au clavier pendant qu'on tourne le joystick — mirror exact du
+   bloc joystick de MODE_303S. Barre de vélocité JX-driven retirée (JX ne module plus la
+   vélocité, l'axe est repris par le changement d'instrument) au profit d'un vélocité
+   fixe=1.0. **Bug trouvé en testant** : au relâchement d'une touche, le code recalculait
+   la note via `noteMap.getMidiNote()` avec l'octave *courante* plutôt que celle au moment
+   de l'appui — si l'octave change (via JY) pendant qu'une note est tenue, le relâchement
+   envoyait un `audioNoteOff` sur la MAUVAISE hauteur, laissant la voix originale bloquée
+   indéfiniment. Corrigé en stockant la note jouée dans `activeNotes[row][col]` à l'appui
+   et en relâchant exactement celle-là, peu importe les changements d'octave entre-temps.
+   Vérifié par test headless (3 phases : note seule, changement d'instrument qui coupe
+   légitimement la note en cours comme le fait déjà le P2 de FELU, changement d'octave qui
+   NE coupe PAS une note tenue) + confirmation que la note se relâche proprement après le
+   fix (RMS retombe à 0, plus de voix fantôme).
+
+AR. **DRUM2 unifié avec DRUMS2/DRUMS3 : vues PAD/ANIM supprimées, B4 devient bank "PAT"
+   partagé** — sur demande explicite (« pour drums, je veux supprimé les view via B4, que
+   ce soit un bouton de bank/clear [...] renomme [bank] par pat pour pattern [...] pour
+   DRUM2, DRUMS2 et DRUMS3 »), ceci **inverse une décision explicite antérieure** (entrée AO
+   ci-dessus : « tous les drums = DRUMS2+DRUMS3, pas DRUM2 qui garde ses 3 vues
+   d'origine »). DRUM2 perd : la vue PAD (couche expressive ghost/soft/normal/accent à 4
+   niveaux de vélocité, `kDr2RowVar[]`) et la vue ANIM (visualiseur GIF synchronisé aux
+   coups de batterie, `draniBrowse/draniRunning`/overlays par tambour) — son enregistrement
+   quantifié "en jouant" (ex-PAD-view) a été **porté** dans la ligne 0 de la vue SEQ
+   (désormais permanente), exactement comme DRUMS2/3 l'avaient déjà fait pour leur propre
+   ligne 0. Le code de la vue ANIM (`draniLoadFolder`/`convertGifAnimToBvid`/buffers)
+   **n'a pas été supprimé** — devenu injoignable (plus aucun point d'entrée n'ouvre
+   `drum2View==2`, variable elle-même supprimée), mais laissé en l'état plutôt que de
+   l'arracher sans demande explicite. Nouvelle banque 4 slots propre à DRUM2
+   (`drum2PatVel/Row/Mod/PitchOff[4][...]`, `drum2ActivePat`, `drum2PatCycle()`/
+   `drum2PatClear()`) — même mécanisme que DRUMS2/3 (appui court sauvegarde+avance+charge,
+   appui long `DRUM2_B4_LONGPRESS_MS`=600ms efface le slot actif). **Renommage demandé** :
+   `drumSBankCycle()`/`drumSBankClear()` → `drumSPatCycle()`/`drumSPatClear()` (les tableaux
+   `drumSPatVel/Mod/Row[]` portaient déjà ce nom), et le libellé bouton DRUMS2/3 `"BNK/CLR"`
+   → `"PAT/CLR"` ; DRUM2 rejoint directement `ctrlLabelsFor()` des deux autres (un seul
+   `case` partagé désormais). Vérifié par test headless : cycle de banque sur 4 slots
+   (sauvegarde+chargement confirmés), appui long efface le slot actif seul, build ESP32+sim
+   propres. Détails : SOFTWARE.md.
+
+AS. **FX Punch : légende LED à l'activation + fixes colonnes 3-4 (phase 1)** — sur
+   rapport utilisateur (« les 2 premières colonnes ne fonctionnent pas [...] les 2 autres
+   fonctionnent, mais les effets n'impactent pas trop le son [...] gate, echo et wobble
+   fonctionnent bien, mais les autres ne fonctionnent pas [...] je veux qu'à l'activation
+   de ce mode, l'affichage LED change »). Trois correctifs distincts trouvés par lecture de
+   code (pas de bug runtime caché — les causes étaient visibles statiquement) :
+   1. **ALIAS (REP, idx8) quasi inaudible** : seuil de wavefold 0.85 → gain≈1.18x, trop
+      proche de 1 (= quasi no-op). Remplacé par 0.08 → gain≈12.5x, dans l'esprit du gain
+      délibérément extrême de BITCRUSH.
+   2. **LP_SWEEP/HP_SWEEP/PHONE (FILT, idx0) silencieusement écrasés** : `applyFxEffect()`
+      mémorise la Res *par Typ* dans des statics locales à la fonction (`lastFiltTyp`/
+      `filtResByTyp[]`) pour ne pas surprendre l'utilisateur en changeant de Typ à la main
+      — mais ce mécanisme écrasait aussi la Res que `fxPunchApply()` venait juste de poser,
+      dès que le Typ différait de celui actif avant le punch. Même souci pour `lpfSmoothCut`
+      (lissage anti-zipper du cutoff, 50%/10ms) : non resynchronisé au punch, le cutoff
+      réel mettait ~100-200ms à converger au lieu de s'appliquer tout de suite. Fix :
+      statics promues en portée fichier (`s_lastFiltTyp`/`s_filtResByTyp[]`), pré-synchro
+      explicite dans `fxPunchApply()` *et* `fxPunchRevert()` avant d'appeler
+      `applyFxEffect()`. Vérifié par test headless avec préconditions (FILT pré-réglé
+      manuellement sur un Typ différent avant le punch — exactement le cas qui déclenchait
+      le bug) : Res/cutoff restent bien ceux voulus par le punch, et le revert restaure
+      exactement l'état pré-punch (pas la valeur par-Typ générique).
+   3. **Légende LED `OVERLAY_FX_PUNCH`** : les 16 touches (colonnes 4-7 physiques) affichent
+      désormais une couleur par touche (blanc = tenue, teinte distincte sinon) au lieu du
+      rendu LED normal du mode sous-jacent ; colonnes 0-3 éteintes (non utilisées par cet
+      overlay). Ajouté tôt dans `updateLedsAndShow()`, avant le `switch(currentMode)`
+      normal (désactivé tant que l'overlay est ouvert, sinon il écraserait la légende juste
+      après). Détails : SOFTWARE.md.
+
+AT. **FX Punch phase 2 — moteur de capture en ring-buffer pour les 8 effets "looper"
+   (LOOP 1/4-1/32, STUTTER, REVERSE, TAPESTOP, HALFSPD)** — jusqu'ici des cases visibles
+   mais inertes (`PUNCH_NONE`) dans la grille, documentées depuis l'entrée AM comme
+   nécessitant un nouveau moteur de capture (« pas une simple extension »). Implémenté
+   entièrement sur demande explicite, confirmée via question (« implémenter maintenant,
+   tout »). **Architecture** (`amy.c`/`amy.h`, nouveau bloc juste avant `amy_fill_buffer()`,
+   partagé ESP32+simulateur puisque c'est le seul point de rendu commun aux deux cibles) :
+   - `amy_punch_cap_buf` : anneau de 2s (`AMY_PUNCH_CAP_SECONDS`) continuellement rempli
+     avec le mix final post-FX (= ce qui part littéralement vers le DAC), capturé à chaque
+     bloc dans `amy_punch_capture_block()` — jamais interrompu, même pendant qu'un punch
+     écrase la sortie, pour que l'historique reste frais et que le relâchement reprenne le
+     direct sans accroc.
+   - `amy_punch_loop_buf` : copie figée séparée (même taille), utilisée UNIQUEMENT par
+     LOOP/STUTTER — une boucle soutenue plus longtemps que la capacité de l'anneau
+     principal serait sinon corrompue par l'écriture continue qui finit par repasser sur
+     les mêmes échantillons en train d'être rejoués.
+   - Mode `FIXED` (LOOP 1/4-1/8-1/16-1/32, STUTTER) : fenêtre figée à l'appui (durée =
+     note musicale selon le BPM courant pour les LOOP — même convention que GATE1/16 —, ou
+     ~60ms fixes non synchronisés au tempo pour STUTTER), relecture en boucle exacte
+     (vitesse 1.0, pas d'interpolation nécessaire).
+   - Mode `RATE` (REVERSE=-1.0, HALFSPD=0.5, TAPESTOP=1.0 décroissant exponentiellement
+     vers 0 sur ~1.2s comme un moteur de bande qui s'arrête) : lecture à position
+     fractionnaire avec interpolation linéaire directement dans l'anneau vivant, avec un
+     clamp de sécurité qui empêche le curseur de lecture de tomber à plus de
+     `capacité - 1 bloc` derrière (ou se faire rattraper par) le curseur d'écriture — sinon
+     une tenue très longue à vitesse lente/négative finirait par lire des échantillons en
+     train d'être recyclés.
+   - **Allocation** : les deux buffers (~700KB total) sont alloués en PSRAM
+     (`MALLOC_CAP_SPIRAM`, via `malloc_caps()` déjà existant dans AMY) **explicitement**,
+     pas via `amy_global.config.ram_caps_delay` — ce champ existe mais vaut
+     `MALLOC_CAP_DEFAULT` (RAM interne) sur cette carte, pas `MALLOC_CAP_SPIRAM` comme sur
+     TULIP/AMYBOARD ; s'y fier aurait tenté d'allouer ~700KB dans les ~124KB de DIRAM libre
+     et aurait échoué/planté sur matériel réel.
+   - `fxPunchApply()`/`fxPunchRevert()` (main.cpp) : nouveau `punchKindIsLooper()` route les
+     8 nouveaux `PunchKind` directement vers `amy_punch_*()`, en contournant entièrement
+     `fxList[]`/le mécanisme de snapshot (rien à sauvegarder, aucun FX impliqué). La case
+     "pas encore" du rendu OLED/LED a été retirée (toutes les 16 touches sont maintenant
+     actives).
+   - **Vérifié par test headless** (les 8 effets) : tenir une note, laisser ~800ms
+     d'historique se capturer, appliquer le punch PUIS couper la note en direct (le direct
+     devient silencieux) — si le punch marche vraiment, le son doit continuer malgré la
+     coupure en direct (preuve qu'il rejoue bien l'historique figé, pas juste le direct qui
+     passerait à travers). Confirmé pour les 8 : RMS reste non-nul pendant toute la tenue
+     malgré la note coupée en direct, TAPESTOP montre une décélération nette vers le quasi-
+     silence en fin de tenue (signature de son ralentissement exponentiel), et chaque
+     relâchement retombe proprement à ~0 (direct repris, qui est silencieux puisque la note
+     avait été coupée). RAM statique ESP32 inchangée (38.8%) — confirmé que les buffers
+     vont bien en PSRAM dynamique, pas en tableaux statiques DIRAM. Détails : SOFTWARE.md.
+
+AU. **FX Punch : vraie cause racine de LP/HP SWEEP/PHONE/BITCRUSH (fxOrderList, pas juste
+   le clobber Res/cutoff de l'entrée AS) + activation plus rapide avec bascule hold/release
+   vers le menu normal** — rapport utilisateur suivant l'entrée AS (« les FX punch
+   fonctionnent bien, sauf LP et HP sweep, et phone et bitcrush [...] je veux qu'il s'active
+   plus rapidement, que ça switch vers FX punch et vers FX normal si je relâche l'appui, que
+   ça reste sur FX punch si je maintiens appuyé »). **Vraie cause** (le fix Res/cutoff de AS
+   était réel mais ne suffisait pas) : `amy_apply_ordered_fx()` (amy.c) ne déclenche
+   `amy_apply_filt()`/`amy_apply_wavefold_bus0()` que pour les slots présents dans
+   `fxOrderList[]` — un tableau séparé de `fxList[idx].active`, rempli uniquement par
+   `fxOrderAdd()`, appelé uniquement depuis `overlayFxToggle()` (le menu FX normal).
+   `fxPunchApply()` posait `.active=true` + tous les bons params mais n'ajoutait jamais à
+   `fxOrderList` → tant que l'utilisateur n'avait pas indépendamment allumé FILT(0) ou
+   BITCRS(9) au moins une fois via le menu normal, leur DSP ne tournait jamais sur le
+   buffer, silencieusement. ALIAS(8) partage le même wavefold que BITCRS(9) — s'il
+   "marchait" c'était par coïncidence de session (REP déjà allumé par ailleurs), pas par
+   différence de code. GATE/ECHO/WOBBLE ne passent jamais par `fxOrderList` (tick 10ms
+   dédié / position fixe AMY-native), d'où leur immunité totale. **Fix** :
+   `fxPunchApply()`/`fxPunchRevert()` font maintenant le `fxOrderAdd()`/`fxOrderRemove()`
+   symétrique (seulement si le slot n'était pas déjà actif indépendamment). **Activation
+   plus rapide** : `FX_PUNCH_HOLD_MS` 350ms→120ms. **Bascule hold/release** (⚠️ corrigée en
+   cours de route, voir juste après) : `fxPunchExit()` (appelé au relâchement du bouton
+   déclencheur après un hold réussi) revient à l'écran principal du mode (`OVERLAY_NONE`) ;
+   le clic court existant (bascule immédiate du menu FX normal dès l'appui, inchangée)
+   reste la seule porte d'entrée vers le menu FX normal. Vérifié par test headless :
+   assertions directes sur `fxOrderList[]`/`fxOrderCount` (pas une inférence RMS) pour
+   LP_SWEEP/BITCRUSH + le cas "FILT pré-allumé manuellement" (pas de doublon, pas
+   d'extinction au relâchement) ; séquence appui→hold→relâchement avec les valeurs exactes
+   de `s_overlay` à chaque étape. Détails : SOFTWARE.md.
+
+   **⚠️ Corrigé dans la même session, avant tout commit** : la 1ère itération avait fait
+   basculer `fxPunchExit()` vers `OVERLAY_FX` (menu normal) au lieu de `OVERLAY_NONE`, sur
+   une mauvaise lecture de « switch vers FX punch et vers FX normal si je relâche l'appui »
+   — l'utilisateur a corrigé immédiatement : « je veux qu'après un appui long sur FX, on
+   revienne au principal, le seul moyen d'accéder au menu bloquant des FX est un appui
+   court sur FX ». Reverti à `OVERLAY_NONE`. Leçon : quand une formulation utilisateur sur
+   un comportement hold/release est ambiguë entre "revient au menu normal" et "revient à
+   l'écran principal", vérifier plutôt que de choisir par défaut — ici les deux lectures
+   étaient plausibles et seule la bonne a fini par être demandée explicitement.
+
+AV. **MODE_303S : P2 (texture par forme d'onde) s'initialise à 0% à l'entrée du mode, peu
+   importe la position physique du potard** — demande explicite (« initialise le P2 à 0%
+   dans la 303S »). `audioT303Init()` ne touche pas le wavefold/duty — sans ce fix, le son
+   gardait la texture laissée par la session précédente jusqu'à ce que l'utilisateur touche
+   le potard. Le hook d'entrée de `switchMode()` applique maintenant explicitement 0% à
+   travers les mêmes branches par forme d'onde que le dispatch pot de `loop()` (sub-oct
+   wave→`audioSW2SetBlend(0)`, PINK→no-op, PULSE→`audioT303Duty(0.5)`, TRI2/SAW2→
+   `audioT303WavefoldAsym(0)`, autres→`audioT303Wavefold(0)`), puis fait un **pickup** sur
+   `g_lp303swf` (= `pots[1].value` courant) pour que le dispatch pot du tick suivant ne
+   détecte pas un "changement" et ne resnap pas instantanément vers la position réelle du
+   potard — même idiome pickup que P4-P7 (`lp303[]`) juste au-dessus dans le même bloc,
+   mais figeant le son à 0% plutôt qu'en adoptant la valeur du potard. Vérifié par test
+   headless : potard à 80% à l'entrée → `amy_wavefold_gain=1.0` (0% de fold, pas les ~20x
+   qu'aurait donné 80%) ; reste à 1.0 après plusieurs ticks avec le potard **non touché**
+   (pas de resnap) ; tourner le potard à 90% après coup met bien `amy_wavefold_gain≈22.6`
+   (32^0.9), confirmant la reprise normale du suivi une fois le potard effectivement
+   touché. Scopé à MODE_303S uniquement (pas 303S2/I303), demande explicite.
+
+AW. **FX Punch : plusieurs touches tenues en même temps + appui = punch instantané,
+   relâchement rapide = menu normal** — deux demandes dans le même message : « je veux
+   pouvoir appuyer sur plusieurs FX punch en même temps [...] je veux que le menu de FX
+   normal n'apparaisse que si je relâche rapidement le bouton FX, de sorte à que dès que
+   j'appuie sur FX, ce soit le menu FX punch ».
+   - **Multi-punch** : `s_fxPunchActiveOpt` (un seul opt) → `s_fxPunchHeld[16]` (bool par
+     touche). Les 8 effets phase-1 passent d'un snapshot par-opt à un snapshot
+     **par-slot avec comptage de référence** (`FxPunchSlotState{refCount,snapActive,
+     snapParams[4]}` × `FX_COUNT`) — plusieurs touches peuvent viser le même slot
+     fxList[] (ALIAS/BITCRUSH partagent déjà le gain de wavefold, deux sweeps viseraient
+     tous les deux FILT) : snapshot+`fxOrderAdd()` à la 1ère touche sur ce slot
+     (`refCount` 0→1), restauration+`fxOrderRemove()` seulement à la dernière relâchée
+     (`refCount` →0) ; entre les deux, "dernier écrit gagne" sur les params partagés,
+     comportement déjà accepté pour ALIAS/BITCRUSH. Les 8 effets phase-2 looper restent un
+     moteur singleton (`amy_punch_*()`) — une 2e touche looper pendant qu'une 1ère est
+     tenue est ignorée (pas de sens musical à tenir REVERSE+HALFSPD en même temps).
+   - **Appui = punch instantané** : le mécanisme à délai (hold ≥120ms détecté par un poll
+     dans `loop()`) est remplacé par un `fxPunchEnter()` synchrone à l'appui, pour
+     n'importe quel bouton déclencheur FX de n'importe quel mode. Le relâchement classait
+     la durée tenue : court (<120ms) → `OVERLAY_FX` ; tenu → revert + `OVERLAY_NONE`.
+     **⚠️ Remplacé par l'entrée AZ** (ce classement empêchait de sortir du menu FX par un
+     appui court). Ce nouveau bloc, générique et placé avant le
+     `switch(currentMode)` par-mode, `return`-ne immédiatement pour le bouton concerné —
+     remplace le `if(btn==N){...s_overlay=OVERLAY_FX;...}` dupliqué dans chaque dispatch
+     par mode. **`MODE_GROOVE` B2 exempté** : son simple-clic=FX/double-clic=Scale-Arp se
+     décide sur l'appui lui-même (fenêtre 350ms) — un punch instantané et inconditionnel
+     aurait cassé ce double-clic sans discussion ; garde son ancien mécanisme à délai
+     (poll dans `loop()`, désormais restreint à ce seul mode/bouton).
+   - Les deux polls génériques dans `loop()` (B1-group et B2/B3-group) qui appelaient
+     `fxPunchEnter()` après le délai sont supprimés (entrée désormais synchrone sur
+     l'appui) ; un seul poll GROOVE-only subsiste.
+   - Vérifié par test headless : appui→(0 tick)→`OVERLAY_FX_PUNCH` instantané, appui
+     court→`OVERLAY_FX`, appui tenu→`OVERLAY_NONE` ; `MODE_GROOVE` confirmé **non**
+     affecté (simple clic→FX, double-clic→Scale/Arp, comme avant) ; GATE+WOBBLE (slots
+     différents) actifs simultanément sans interférence ; LP_SWEEP+HP_SWEEP (même slot
+     FILT) — `refCount` 0→1→2 puis 2→1 (slot toujours actif, l'autre touche le tient
+     encore) puis 1→0 (restauration complète). Détails : SOFTWARE.md.
+
+AX. **Trois correctifs audio indépendants (rapport utilisateur en une seule session)** :
+   1. **MODE_BREAK — craquements aux changements de portion de sample** : `render_pcm()`
+      (`lib/AMY Synthesizer/src/pcm.c`) est le SEUL type d'oscillateur d'AMY qui applique
+      un `amp` constant pour tout le bloc (128 échantillons) au lieu d'interpoler
+      échantillon par échantillon comme `render_lut()` (sine/saw/triangle/pulse/
+      wavetable). Chaque retrigger de BREAK/GRANULAR2 (nouvelle portion sur le MÊME
+      oscillateur) remet `phase=0` (`pcm_note_on()`) sans aucun fondu contre la valeur
+      précédemment en cours — un saut de valeur brut — et l'attaque d'enveloppe de BREAK
+      (1-2ms) est plus courte qu'un seul bloc de rendu (~2.9ms à 44.1kHz), donc même
+      l'enveloppe ne peut pas masquer le saut. Fix : `render_pcm()` détecte qu'un bloc
+      démarre exactement à `phase==0` (un (re)trigger) et applique un fondu d'amplitude
+      dédié sur les 32 premiers échantillons (~0.7ms, indépendant de l'enveloppe
+      musicale) — trop court pour s'entendre comme un ramollissement de l'attaque, assez
+      long pour casser le saut. S'applique à TOUT PCM (SAMPLE/GRANULAR2/STONE/BREAK), pas
+      seulement BREAK. Vérifié par test headless : `blockAmp` confirmé en rampe linéaire
+      0.03→0.99 sur les 32 échantillons, aussi bien au premier déclenchement qu'au
+      retrigger immédiat du même oscillateur.
+   2. **Résidu basse fréquence inaudible mais visible au spectrogramme, avec DELAY+
+      REVERB+CHORUS actifs** : aucun étage de DC-blocking n'existe dans le chemin de
+      sortie final — un filtre passe-haut un-pole à ~27Hz (`amy_fill_buffer()`,
+      `AMY_HPF_OUTPUT`) existe dans le code source d'AMY mais n'était **jamais défini**
+      (confirmé par grep sur tout le repo). DELAY et REVERB ont tous les deux un chemin
+      de feedback façonné passe-bas par construction (le `filter_coef`/`damping` de
+      chacun atténue les aigus à chaque répétition/recirculation) — donc ce qui reste le
+      plus longtemps dans une traîne qui s'éteint est, par construction, disproportionné-
+      ment basse fréquence, sans qu'aucun filtre en aval ne le retire jamais. Fix :
+      `#define AMY_HPF_OUTPUT` activé dans `amy.h` (inconditionnel, pour toutes les
+      cibles) — coupure ~27Hz, largement sous toute basse audible, donc sans impact sur
+      le son normal. CHORUS confirmé sans feedback à son site d'appel (`feedback_level=0`
+      en dur) — jamais une source indépendante de traîne. Piste secondaire non confirmée
+      (juste plausible) : la multiplication fixed-point `SMULR6()` utilisée par les DEUX
+      boucles de feedback a un arrondi asymétrique autour de 0 qui pourrait créer un
+      "limit cycle" (le résidu ne retombe jamais à zéro machine exact) — pas vérifié par
+      mesure runtime, le fix HPF suffit déjà à retirer ce qui serait inaudible de toute
+      façon.
+   3. **MODE_303S2 (pas MODE_303S !) : le fix "P2 init à 0%" de l'entrée AV ne
+      s'appliquait jamais** — `MENU_303S` n'est câblé dans AUCUN onglet de menu
+      (`kMenuCatInstr/Seq/Aut`), seul `MENU_303S2` l'est (renommé "303S" à l'écran, voir
+      note historique dans SOFTWARE.md) ; `MODE_303S` est donc du code mort, jamais
+      atteignable depuis le menu. Le fix précédent avait été posé sur le bon MÉCANISME
+      mais le MAUVAIS mode. Même fix, porté sur le hook d'entrée `switchMode()` de
+      `MODE_303S2` cette fois (branche non-drill-down uniquement — la branche
+      `gestDrillDown` préserve délibérément la texture existante, commentaire d'origine :
+      "Pot-1 in GEST is not the 303 wavefold knob"). Vérifié par test headless : potard à
+      80% à l'entrée → `amy_wavefold_gain=1.0` (au lieu de ~20x), reste à 1.0 après
+      plusieurs ticks sans toucher le potard.
+
+AY. **3e cible : simulateur web (WebAssembly/Emscripten), `web/` + `docs/`** — sur demande
+   explicite (« les projets felucca/X0X/sloop réussissent à avoir un site web qui permet
+   de faire tourner leur simulateur [...] j'aimerais que tu étudies leur système afin
+   d'avoir nous aussi un site web qui tourne, via HTML et qu'on peut héberger sur
+   github »). Recherche sur `hugelton/Felucca-WebApp` : c'est en fait un éditeur/
+   installeur Web MIDI (SysEx) pour du vrai matériel, PAS un simulateur audio dans le
+   navigateur — moins avancé que ce que `structure/WEB_SIMULATOR.md` décrivait déjà pour
+   GrvEP. Découverte en creusant : cette doc décrit une architecture détaillée mais **qui
+   n'existait pas du tout dans l'arbre** (`web/` absent, `docs/` ne contenait que le
+   guide utilisateur) — un commit très ancien avait ajouté un `docs/index.html` (792
+   lignes) depuis supprimé. Reconstruit entièrement depuis la spec (déléguée à un agent en
+   tâche de fond, worktree isolé, puis vérifiée et corrigée dans cette session avant
+   fusion dans l'arbre principal). Détails de l'implémentation (web_tasks.cpp/Fibers,
+   hal/U8g2lib.h, SD.h, etc.) : voir `structure/WEB_SIMULATOR.md`, substantiellement
+   réécrit.
+
+   **Révision architecturale majeure découverte en compilant réellement** (pas une
+   supposition — confirmée en lisant le code et en testant les flags) : le plan d'origine
+   (single-file, single-threaded, sans pthread/SharedArrayBuffer) était **irréalisable**.
+   La copie vendorée de `miniaudio.h` n'a aucun chemin audio non-worklet en
+   `__EMSCRIPTEN__` — chaque branche passe par `emscripten_create_wasm_audio_worklet_node()`,
+   qui exige de la mémoire partagée entre le thread principal et le thread audio, donc
+   `-pthread`, donc `SharedArrayBuffer`, donc des headers COOP/COEP — que GitHub Pages ne
+   permet de personnaliser d'aucune façon. Contourné avec `docs/coi-serviceworker.js`
+   (vendoré tel quel, `gzuidhof/coi-serviceworker`, MIT) qui injecte ces headers côté
+   client via un service worker, sans configuration serveur — un seul rechargement
+   silencieux de la page au premier chargement. `-sSINGLE_FILE=1` a dû être abandonné
+   (incompatible avec `-sAUDIO_WORKLET`, erreur de build Emscripten explicite) : deux
+   fichiers (`grvep.js`+`grvep.wasm`) au lieu d'un seul, sans impact (fichiers statiques
+   de même origine, pas de CORS). AMY a elle-même un build web amont qui utilise déjà
+   exactement ces flags (`lib/AMY Synthesizer/Makefile`'s `web` target) — précédent qui a
+   confirmé la bonne piste une fois la cause identifiée.
+
+   **Vérifié** : build propre (compile+link) dans le worktree ET après fusion dans l'arbre
+   principal ; test headless sous Node confirmant que `setup()` tourne jusqu'à `"Ready"`,
+   que le clavier/OLED/LEDs/mux fonctionnent tous correctement (mêmes mécanismes que le
+   simulateur SDL2, juste alimentés par JS au lieu de SDL). **Non vérifié** : le rendu
+   audio réel dans un vrai navigateur — aucun Chrome/Chromium/Puppeteer disponible dans cet
+   environnement (tentative d'installation de Puppeteer abandonnée, trop lente/non
+   fiable dans ce sandbox) ; Node n'a de toute façon jamais `window.AudioContext` (ce
+   n'est pas un navigateur), donc l'échec observé à ce point précis sous Node est attendu
+   et ne prouve ni l'échec ni la réussite du chemin AudioContext réel. **Reste à faire
+   avant de considérer cette cible terminée** : ouvrir `docs/index.html` dans un vrai
+   navigateur, cliquer une touche, vérifier dans la console qu'aucune erreur liée à
+   l'AudioContext/cross-origin-isolation n'apparaît et que du son sort effectivement.
+   Flashing firmware via navigateur (WebSerial/ESP Web Tools) explicitement hors scope de
+   cette passe (demande de l'utilisateur, priorité ultérieure).
+
+AZ. **FX Punch : impossible de sortir du menu FX par un appui court (corrige AW)** —
+   rapport sur carte : « pour rentrer dans les FX, un appui court suffit, mais pour en
+   sortir, il faut que je fasse un appui long ». Cause : le relâchement court de AW posait
+   `OVERLAY_FX` sans regarder l'état à l'appui ; depuis le menu FX, un appui court faisait
+   FX → punch → FX, sans sortie possible (sauf en tenant plus de 120 ms, seuil qu'un appui
+   « court » humain chevauche souvent). **Nouvelle règle**, indépendante de la durée :
+   relâchement **sans** punch joué = bascule (ouvre `OVERLAY_FX` s'il était fermé, ferme
+   s'il était ouvert, `OVERLAY_FX_MOD` compté comme ouvert) ; relâchement **avec** punch
+   joué = `OVERLAY_NONE` comme avant. Deux booléens : `s_fxBtnFromFx` (posé à l'appui),
+   `s_fxBtnPunched` (posé par `fxPunchApply()`). `FX_PUNCH_HOLD_MS` ne sert plus qu'au
+   poll de `MODE_GROOVE` B2, non concerné (bascule déjà à l'appui). Vérifié : test headless
+   21/21 (3 groupes de boutons × 7 séquences), puis **sur carte** (log série + confirmation
+   du propriétaire dans plusieurs modes). Détails : SOFTWARE.md, « Révision — sortie du
+   menu FX par appui court ». Note : le 1er flash corrigé a d'abord été signalé « toujours
+   bloqué », puis le 2e (identique sur cette logique, + logs) a marché partout — cause de
+   ce premier échec non élucidée (aucune trace série de ce test) ; si ça réapparaît,
+   capturer le port série **avec pyserial** (`pio device monitor` refuse de tourner sans
+   terminal interactif) et regarder la séquence `BTN raw=… DN/UP`.
+
 ## 5. Pièges et classes de bugs récurrentes (lire avant de toucher au DSP ou aux modes)
 
 **Audio / AMY**
@@ -460,6 +789,16 @@ AP. **MODE_PRESETS : banque de 45 patchs curatés, posée sur le moteur de FELU*
 - **Toute boucle de feedback doit avoir un gain < 1 ou un limiteur doux, plus une garde
   NaN/inf** : deux bugs de « son cassé/volume infini » cette session venaient d'une
   résonance instable (SVF Chamberlin) et d'un gain de boucle > 1 plafonné à ±4.
+- **`fxList[idx].active = true` ne suffit PAS à faire tourner le DSP de FILT(0)/REP(8)/
+  BITCRS(9)/DRIVE(1)/RESECHO(7)/RINGMOD(11)/COMPRESS(12)** — `amy_apply_ordered_fx()`
+  (amy.c) ne les appelle que pour les slots présents dans `fxOrderList[]`, un tableau
+  séparé rempli uniquement par `fxOrderAdd()` (appelé uniquement depuis
+  `overlayFxToggle()`, le menu FX normal). Tout nouveau code qui active un de ces slots
+  par un autre chemin (vu avec FX Punch, entrée AU) doit appeler `fxOrderAdd()`/
+  `fxOrderRemove()` lui-même, sous peine de poser tous les bons paramètres pour rien — le
+  bug est silencieux (pas de crash, pas d'erreur), juste aucun changement audible. Les
+  autres FX (TREMOLO/DELAY-RES/CHORUS/FLANGER/REVERB/EQ) sont soit sur un tick dédié soit à
+  position fixe AMY-native et n'ont pas ce piège.
 - Un FX appliqué **par oscillateur/canal** n'atteint que les plages câblées à la main
   (STONE, MODULAR, DJ, CRUNCH, GRANULAR2 avaient chacune leur helper) → préférer un FX de bus.
 - Bus 1 (TB-303) → mergé dans le bus 0 avant les FX ; ne jamais appeler `config_reverb/echo`
@@ -548,18 +887,11 @@ AP. **MODE_PRESETS : banque de 45 patchs curatés, posée sur le moteur de FELU*
    **explicitement rejetés et supprimés** (voir entrée AE au §4) — si le besoin de "sons
    X0X dédiés" revient, envisager plutôt d'enrichir 303S/303S2 (c'est ce qui a marché pour
    FELU/BREAK : nouveaux algos dans un mode existant) avant de retenter un mode jumeau.
-9. **FX Punch phase 2** (entrée AM au §4) — les 8 effets "looper" de Sloop (loop 1/4-1/32,
-   stutter, reverse, tape stop, half speed) ont besoin d'un moteur de capture du mix en
-   direct (ring buffer + lecture à vitesse/position variable, revert propre au
-   relâchement) qui n'existe pas encore. Les 8 cases correspondantes dans la grille
-   `OVERLAY_FX_PUNCH` sont déjà visibles (marquées d'un petit repère "pas encore") mais
-   inertes — `PunchKind::PUNCH_NONE` dans `kPunchFx[]`, `main.cpp`. Candidat naturel pour
-   réutiliser le précédent de `DJ_OSC`/`SS_OSC` (lecture en ring buffer avec repositionnement
-   sans retrigger), mais appliqué au BUS 0 final plutôt qu'à un preset PCM dédié — à
-   concevoir avant d'implémenter, pas une simple extension de `audioDrumSynthHit()`-style.
-   Aussi non traité : menu FX dans LIFE/GEN/SWARM/TRACKER (point 1 ci-dessus) n'ayant pas
-   d'`OVERLAY_FX` du tout, `fxTriggerBtn()` y retourne -1 — pas de punch possible tant que
-   ce point 1 n'est pas fait non plus.
+9. **FX Punch** — phase 2 (les 8 effets "looper") est **faite** (entrée AT, moteur
+   `amy_punch_*()` dans `amy.c`). Restent : (a) vérification **à l'oreille sur carte** des 8
+   effets looper (CPU/PSRAM du ring buffer de 2 s sur ESP32 non mesurés) ; (b) LIFE/GEN/
+   SWARM/TRACKER n'ont pas d'`OVERLAY_FX` (point 1 ci-dessus), donc `fxTriggerBtn()` y
+   retourne -1 et aucun punch n'y est possible tant que le point 1 n'est pas fait.
 
 ## 7. Comment vérifier (résumé — recettes détaillées dans SIMULATOR.md)
 

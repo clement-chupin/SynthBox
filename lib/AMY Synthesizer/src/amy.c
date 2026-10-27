@@ -2282,6 +2282,155 @@ static void amy_apply_ordered_fx(SAMPLE* buf) {
     }
 }
 
+// ==================== FX Punch "looper" engine (phase 2) ====================
+// LOOP 1/4-1/32, STUTTER, REVERSE, TAPESTOP and HALFSPD (the 8 Sloop-style punch effects
+// that have no existing fxList[] FX to piggyback on, unlike the 8 "phase 1" ones in
+// GrvEP's own main.cpp) all work the same way: continuously capture the final post-FX
+// mix (exactly what's about to hit the DAC) into a ring buffer, then while a punch is
+// held, overwrite output_block[] with a read from that history instead of the live
+// render. The live render (oscillators, bus FX) is NEVER paused or bypassed — only what
+// gets copied into output_block[] changes — so releasing a punch resumes live audio
+// with zero glitch, and capture always has fresh material for the next punch.
+//
+// Two buffers: amy_punch_cap_buf is the continuously-written rolling history (used
+// directly, with variable/negative rate, by REVERSE/HALFSPD/TAPESTOP); amy_punch_loop_buf
+// is a separate frozen snapshot (used by LOOP/STUTTER) so a sustained loop isn't corrupted
+// by the live capture ring wrapping around and overwriting the exact samples being
+// repeated underneath it.
+#define AMY_PUNCH_CAP_SECONDS 2
+#define AMY_PUNCH_CAP_FRAMES (AMY_SAMPLE_RATE * AMY_PUNCH_CAP_SECONDS)
+#ifdef ESP_PLATFORM
+#define AMY_PUNCH_RAM_CAPS MALLOC_CAP_SPIRAM  // ~700KB total for both buffers — PSRAM only,
+#else                                          // never internal DIRAM (see amy_global.config's
+#define AMY_PUNCH_RAM_CAPS MALLOC_CAP_DEFAULT  // own ram_caps_delay, which GrvEP leaves at
+#endif                                         // MALLOC_CAP_DEFAULT/internal RAM on this board)
+
+static int16_t* amy_punch_cap_buf  = NULL;
+static int16_t* amy_punch_loop_buf = NULL;
+static uint32_t amy_punch_cap_write_frame = 0;
+static uint32_t amy_punch_loop_len_frames = 0;
+
+typedef enum { AMY_PUNCHLOOP_NONE = 0, AMY_PUNCHLOOP_FIXED, AMY_PUNCHLOOP_RATE } amy_punchloop_mode_t;
+static amy_punchloop_mode_t amy_punchloop_mode = AMY_PUNCHLOOP_NONE;
+static float    amy_punchloop_read_frame  = 0.0f;  // fractional read position (FIXED: within [0,len); RATE: absolute ring position)
+static float    amy_punchloop_rate        = 1.0f;  // frames advanced per output frame; negative = reverse
+static float    amy_punchloop_rate_decel  = 0.0f;  // >0: TAPESTOP's per-frame multiplicative rate decay
+static uint32_t amy_punchloop_fixed_len   = 0;
+
+static void amy_punch_cap_ensure_alloc() {
+    if (amy_punch_cap_buf != NULL) return;
+    amy_punch_cap_buf  = (int16_t*)malloc_caps(sizeof(int16_t) * AMY_PUNCH_CAP_FRAMES * AMY_NCHANS, AMY_PUNCH_RAM_CAPS);
+    amy_punch_loop_buf = (int16_t*)malloc_caps(sizeof(int16_t) * AMY_PUNCH_CAP_FRAMES * AMY_NCHANS, AMY_PUNCH_RAM_CAPS);
+    if (amy_punch_cap_buf)  memset(amy_punch_cap_buf,  0, sizeof(int16_t) * AMY_PUNCH_CAP_FRAMES * AMY_NCHANS);
+    if (amy_punch_loop_buf) memset(amy_punch_loop_buf, 0, sizeof(int16_t) * AMY_PUNCH_CAP_FRAMES * AMY_NCHANS);
+}
+
+// Called every block, unconditionally (even while a punch is overriding the output) so
+// history stays fresh and releasing a punch always resumes from live, current audio.
+static void amy_punch_capture_block() {
+    if (amy_punch_cap_buf == NULL) return;
+    for (int32_t i = 0; i < AMY_BLOCK_SIZE; i++) {
+        uint32_t wf = (amy_punch_cap_write_frame + (uint32_t)i) % AMY_PUNCH_CAP_FRAMES;
+        for (int32_t c = 0; c < AMY_NCHANS; c++)
+            amy_punch_cap_buf[wf * AMY_NCHANS + c] = output_block[i * AMY_NCHANS + c];
+    }
+    amy_punch_cap_write_frame = (amy_punch_cap_write_frame + AMY_BLOCK_SIZE) % AMY_PUNCH_CAP_FRAMES;
+}
+
+static inline int16_t amy_punch_read_interp(int16_t* buf, float pos, int32_t ch) {
+    while (pos < 0) pos += AMY_PUNCH_CAP_FRAMES;
+    uint32_t i0 = ((uint32_t)pos) % AMY_PUNCH_CAP_FRAMES;
+    uint32_t i1 = (i0 + 1) % AMY_PUNCH_CAP_FRAMES;
+    float frac = pos - floorf(pos);
+    float s0 = buf[i0 * AMY_NCHANS + ch], s1 = buf[i1 * AMY_NCHANS + ch];
+    return (int16_t)(s0 + (s1 - s0) * frac);
+}
+
+// Overwrites output_block[] with the active punch-loop's read-back, if any. No-op (leaves
+// the live-rendered output_block untouched) when no loop/rate punch is active.
+static void amy_punch_override_block() {
+    if (amy_punchloop_mode == AMY_PUNCHLOOP_NONE) return;
+    if (amy_punchloop_mode == AMY_PUNCHLOOP_FIXED) {
+        uint32_t len = amy_punchloop_fixed_len;
+        if (len < 1 || amy_punch_loop_buf == NULL) return;
+        for (int32_t i = 0; i < AMY_BLOCK_SIZE; i++) {
+            uint32_t rf = ((uint32_t)amy_punchloop_read_frame) % len;
+            for (int32_t c = 0; c < AMY_NCHANS; c++)
+                output_block[i * AMY_NCHANS + c] = amy_punch_loop_buf[rf * AMY_NCHANS + c];
+            amy_punchloop_read_frame += 1.0f;
+            if (amy_punchloop_read_frame >= (float)len) amy_punchloop_read_frame -= (float)len;
+        }
+        return;
+    }
+    // AMY_PUNCHLOOP_RATE: REVERSE / HALFSPD / TAPESTOP, reading from the live history ring.
+    if (amy_punch_cap_buf == NULL) return;
+    for (int32_t i = 0; i < AMY_BLOCK_SIZE; i++) {
+        for (int32_t c = 0; c < AMY_NCHANS; c++)
+            output_block[i * AMY_NCHANS + c] = amy_punch_read_interp(amy_punch_cap_buf, amy_punchloop_read_frame, c);
+        amy_punchloop_read_frame += amy_punchloop_rate;
+        if (amy_punchloop_rate_decel > 0.0f) amy_punchloop_rate *= amy_punchloop_rate_decel;  // TAPESTOP
+        // Safety clamp: never let the read cursor fall more than (capacity - 1 block) behind
+        // the live write cursor (in either direction) — a very long hold at a slow/negative
+        // rate could otherwise eventually read samples the write cursor is about to recycle.
+        float age = (float)amy_punch_cap_write_frame - amy_punchloop_read_frame;
+        while (age < 0) age += AMY_PUNCH_CAP_FRAMES;
+        float maxAge = (float)(AMY_PUNCH_CAP_FRAMES - AMY_BLOCK_SIZE);
+        if (age > maxAge) {
+            amy_punchloop_read_frame = (float)amy_punch_cap_write_frame - maxAge;
+            while (amy_punchloop_read_frame < 0) amy_punchloop_read_frame += AMY_PUNCH_CAP_FRAMES;
+        }
+    }
+}
+
+// ---- Public API (amy.h) — called from GrvEP's fxPunchApply()/fxPunchRevert() ----
+void amy_punch_loop_start(uint32_t len_frames) {
+    amy_punch_cap_ensure_alloc();
+    if (amy_punch_cap_buf == NULL || amy_punch_loop_buf == NULL) return;
+    if (len_frames < 1) len_frames = 1;
+    if (len_frames > AMY_PUNCH_CAP_FRAMES) len_frames = AMY_PUNCH_CAP_FRAMES;
+    // Copy the most recent len_frames of history (ending at "now") into the dedicated,
+    // never-overwritten-while-looping snapshot buffer.
+    uint32_t start = (amy_punch_cap_write_frame + AMY_PUNCH_CAP_FRAMES - len_frames) % AMY_PUNCH_CAP_FRAMES;
+    for (uint32_t i = 0; i < len_frames; i++) {
+        uint32_t sf = (start + i) % AMY_PUNCH_CAP_FRAMES;
+        for (int32_t c = 0; c < AMY_NCHANS; c++)
+            amy_punch_loop_buf[i * AMY_NCHANS + c] = amy_punch_cap_buf[sf * AMY_NCHANS + c];
+    }
+    amy_punch_loop_len_frames = len_frames;
+    amy_punchloop_fixed_len = len_frames;
+    amy_punchloop_read_frame = 0.0f;
+    amy_punchloop_rate = 1.0f;
+    amy_punchloop_rate_decel = 0.0f;
+    amy_punchloop_mode = AMY_PUNCHLOOP_FIXED;
+}
+void amy_punch_reverse_start() {
+    amy_punch_cap_ensure_alloc();
+    amy_punchloop_read_frame = (float)amy_punch_cap_write_frame;
+    amy_punchloop_rate = -1.0f;
+    amy_punchloop_rate_decel = 0.0f;
+    amy_punchloop_mode = AMY_PUNCHLOOP_RATE;
+}
+void amy_punch_halfspeed_start() {
+    amy_punch_cap_ensure_alloc();
+    amy_punchloop_read_frame = (float)amy_punch_cap_write_frame;
+    amy_punchloop_rate = 0.5f;
+    amy_punchloop_rate_decel = 0.0f;
+    amy_punchloop_mode = AMY_PUNCHLOOP_RATE;
+}
+void amy_punch_tapestop_start(float tapestop_seconds) {
+    amy_punch_cap_ensure_alloc();
+    amy_punchloop_read_frame = (float)amy_punch_cap_write_frame;
+    amy_punchloop_rate = 1.0f;
+    // Multiplicative per-frame decay so rate reaches ~1% of its starting value after
+    // tapestop_seconds — an exponential "motor spinning down" curve, not linear.
+    float frames = tapestop_seconds * (float)AMY_SAMPLE_RATE;
+    amy_punchloop_rate_decel = (frames > 1.0f) ? powf(0.01f, 1.0f / frames) : 0.0f;
+    amy_punchloop_mode = AMY_PUNCHLOOP_RATE;
+}
+void amy_punch_loop_stop() {
+    amy_punchloop_mode = AMY_PUNCHLOOP_NONE;
+}
+
 int16_t * amy_fill_buffer() {
     AMY_PROFILE_START(AMY_FILL_BUFFER)
     #ifdef __EMSCRIPTEN__
@@ -2481,6 +2630,14 @@ int16_t * amy_fill_buffer() {
     amy_global.total_blocks++;
     amy_global.total_samples = amy_global.total_blocks * AMY_BLOCK_SIZE;
     amy_global.time = amy_global.total_samples / (float)AMY_SAMPLE_RATE;
+
+    // FX Punch "looper" engine: capture this block's live final mix (for the NEXT punch,
+    // or just to keep history fresh), then — only if a loop/reverse/tapestop/halfspeed
+    // punch is currently held — overwrite output_block[] with its read-back. See the
+    // engine's own comment above amy_fill_buffer() for why this never touches the live
+    // render itself.
+    amy_punch_capture_block();
+    amy_punch_override_block();
 
     AMY_PROFILE_STOP(AMY_FILL_BUFFER)
 

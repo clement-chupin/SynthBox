@@ -251,6 +251,17 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
         PHASOR step = F2P((playback_freq / (float)AMY_SAMPLE_RATE) / (float)(1 << PCM_INDEX_BITS));
         const LUTSAMPLE* table = preset->sample_ram;
         uint32_t base_index = INT_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
+        // Declick: a (re)trigger resets phase to exactly 0 (pcm_note_on()) with no
+        // crossfade against whatever this oscillator's buffer was previously outputting
+        // — a hard waveform-value jump that clicks whenever the old and new samples at
+        // that instant don't match (e.g. GRANULAR2/BREAK retriggering the SAME osc with
+        // a new slice preset every beat/subdivision). PCM is rendered at one constant
+        // `amp` per whole block (unlike render_lut's per-sample last_amp->amp
+        // interpolation), so the envelope's own attack can't mask this either — especially
+        // not for a sub-block (<2.9ms) attack like BREAK's 1-2ms. Ramp the first few
+        // samples up from 0 whenever this block starts exactly at phase 0.
+        #define PCM_DECLICK_SAMPLES 32  // ~0.7ms @ 44.1kHz — short enough to stay inaudible as a softened attack, long enough to kill the step
+        bool declicking = (synth[osc]->phase == 0);
         for(uint16_t i=0; i < AMY_BLOCK_SIZE; i++) {
             SAMPLE frac = S_FRAC_OF_P(synth[osc]->phase, PCM_INDEX_BITS);
             LUTSAMPLE b = 0;
@@ -314,10 +325,14 @@ SAMPLE render_pcm(SAMPLE* buf, uint16_t osc) {
                     }
                 }
             }
-            SAMPLE value = buf[i] + MUL4_SS(amp, sample);
-            buf[i] = value;   
+            SAMPLE blockAmp = amp;
+            if (declicking && i < PCM_DECLICK_SAMPLES) {
+                blockAmp = MUL4_SS(amp, F2S((float)(i + 1) / (float)PCM_DECLICK_SAMPLES));
+            }
+            SAMPLE value = buf[i] + MUL4_SS(blockAmp, sample);
+            buf[i] = value;
             if (value < 0) value = -value;
-            if (value > max_value) max_value = value;  
+            if (value > max_value) max_value = value;
         }
         //printf("render_pcm: osc %d preset %d len %d base_ix %d phase %f step %f tablestep %f amp %f\n",
         //       osc, synth[osc]->preset, preset->length, base_index, P2F(synth[osc]->phase), P2F(step), (1 << PCM_INDEX_BITS) * P2F(step), S2F(msynth[osc]->amp));

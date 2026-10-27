@@ -71,6 +71,14 @@ running the simulator.
   `amy_simple_fill_buffer()`). **Always remove the temporary instrumentation before
   finishing** — grep the diff for stray `TEMP DBG`/debug defines before considering a fix
   done.
+- **On real hardware** (board usually on `/dev/ttyACM1`): flash with
+  `pio run -e esp32-s3-devkitc-1 -t upload --upload-port /dev/ttyACM1`. To read the serial
+  log from an agent, **don't use `pio device monitor`** — it refuses to run without an
+  interactive TTY and silently captures nothing. Read the port with pyserial instead
+  (`~/.platformio/penv/bin/python`, open with `dtr=False, rts=False` so it doesn't reset the
+  board), in the background, while the owner reproduces the issue. `handleButton()` already
+  logs every button event (`BTN raw=… mapped=… DN/UP`); add `TEMP DBG` prints for state and
+  remove them afterwards like any other instrumentation.
 - `setup()` runs to completion before `loop()` ever starts — a test that blocks with
   `delay()` inside `setup()` will never see `loop()`-driven ticks (10ms modulation engines,
   sequencer clocks, etc.) run at all. Either drive those ticks manually in a loop inside

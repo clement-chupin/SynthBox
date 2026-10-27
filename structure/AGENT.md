@@ -21,11 +21,12 @@ log of what changed recently, recurring pitfalls, and pending work. If a person 
 "continue where the last session left off" or "take over this project," this is where that
 context lives — read it before forming a plan.
 
-**Important:** a large amount of work is deliberately kept uncommitted between sessions
-(see HANDOFF.md §3 for the exact list of modified files and what each change covers).
-Before doing anything, run `git status` and `git diff` — the working tree is very
-probably ahead of the last commit (`969361e`) by ~1400 lines across `main.cpp`,
-`audio_engine.*`, `amy.c`, docs, and several HAL/simulator files.
+**Important:** as of the 2026-10-27 handoff, everything is committed and pushed to
+`origin/main` — a clean tree is the expected starting point (HANDOFF.md §3). Earlier
+sessions used to keep large chunks of work uncommitted between sessions; if `git status`
+shows changes when you start, treat them as someone's new in-progress work and read
+`git diff` before touching anything. Commits/pushes still only happen on the owner's
+explicit request.
 To get a named snapshot of the current state before an experiment:
 ```bash
 git stash push -u -m "checkpoint before <experiment name>"

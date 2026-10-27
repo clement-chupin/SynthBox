@@ -558,7 +558,6 @@ static uint8_t       drum2SeqMod[DRUM2_PADS][DR2_STEPS] = {};  // step modifier:
 static bool          drum2Playing    = false;
 static uint8_t       drum2Step       = 0;
 static bool          drum2RecArmed   = false;
-static uint8_t       drum2View       = 0;  // 0=pad, 1=seq, 2=anim
 static unsigned long drum2LastStepMs = 0;
 static unsigned long drum2PadFlashMs[DRUM2_PADS]   = {};
 static unsigned long drum2DblPendingAt[DRUM2_PADS] = {}; // scheduled "double hit" timestamp
@@ -580,6 +579,62 @@ static int8_t  drum2SeqPitchOff[DRUM2_PADS][DR2_STEPS] = {};
 static uint8_t drum2PadAltMode[DRUM2_PADS] = {};
 static bool    drum2SelFromAlt = false;  // true if pad was last selected from the alt row
 // drum2Playing/drum2Step/drum2LastStepMs are SHARED with SYSEQ (synced sequencer)
+
+// Pattern bank (4 slots) — B4 short-press cycles, long-press clears the active slot. Same
+// mechanism as DRUMS2/DRUMS3's own bank (there just called drumSPat*, see below), now also
+// given to DRUM2 — sequencer-only (PAD/ANIM views removed), per the user's own request to
+// unify all three drum modes on this one B3=REC/B4=PAT(short)/CLR(long) scheme.
+#define DRUM2_PATS 4
+static uint8_t  drum2PatVel[DRUM2_PATS][DRUM2_PADS][DR2_STEPS] = {};
+static uint8_t  drum2PatRow[DRUM2_PATS][DRUM2_PADS][DR2_STEPS] = {};
+static uint8_t  drum2PatMod[DRUM2_PATS][DRUM2_PADS][DR2_STEPS] = {};
+static int8_t   drum2PatPitchOff[DRUM2_PATS][DRUM2_PADS][DR2_STEPS] = {};
+static bool     drum2PatFilled[DRUM2_PATS] = {};
+static uint8_t  drum2ActivePat = 0;
+static uint32_t drum2B4PressMs = 0;
+static bool     drum2B4LongFired = false;
+#define DRUM2_B4_LONGPRESS_MS 600
+
+static inline void drum2PatSave(uint8_t pat) {
+    memcpy(drum2PatVel[pat], drum2SeqVel, sizeof(drum2SeqVel));
+    memcpy(drum2PatRow[pat], drum2SeqRow, sizeof(drum2SeqRow));
+    memcpy(drum2PatMod[pat], drum2SeqMod, sizeof(drum2SeqMod));
+    memcpy(drum2PatPitchOff[pat], drum2SeqPitchOff, sizeof(drum2SeqPitchOff));
+    bool hasHits = false;
+    for (uint8_t p=0;p<DRUM2_PADS && !hasHits;p++) for (uint8_t s=0;s<DR2_STEPS;s++)
+        if (drum2SeqVel[p][s]) { hasHits=true; break; }
+    drum2PatFilled[pat] = hasHits;
+}
+static inline void drum2PatLoad(uint8_t pat) {
+    memcpy(drum2SeqVel, drum2PatVel[pat], sizeof(drum2SeqVel));
+    memcpy(drum2SeqRow, drum2PatRow[pat], sizeof(drum2SeqRow));
+    memcpy(drum2SeqMod, drum2PatMod[pat], sizeof(drum2SeqMod));
+    memcpy(drum2SeqPitchOff, drum2PatPitchOff[pat], sizeof(drum2SeqPitchOff));
+}
+// B4 short press: save the live pattern into its slot, advance, load the next one (or
+// start empty on a never-used slot) — nothing is ever lost by cycling.
+static void drum2PatCycle() {
+    drum2PatSave(drum2ActivePat);
+    drum2ActivePat = (uint8_t)((drum2ActivePat + 1) % DRUM2_PATS);
+    if (drum2PatFilled[drum2ActivePat]) {
+        drum2PatLoad(drum2ActivePat);
+    } else {
+        memset(drum2SeqVel, 0, sizeof(drum2SeqVel));
+        memset(drum2SeqRow, 0, sizeof(drum2SeqRow));
+        memset(drum2SeqMod, 0, sizeof(drum2SeqMod));
+        memset(drum2SeqPitchOff, 0, sizeof(drum2SeqPitchOff));
+    }
+    memset(drum2DblPendingAt, 0, sizeof(drum2DblPendingAt));
+}
+// B4 long press: clear the active slot only (live buffer + its own stored copy).
+static void drum2PatClear() {
+    memset(drum2SeqVel, 0, sizeof(drum2SeqVel));
+    memset(drum2SeqRow, 0, sizeof(drum2SeqRow));
+    memset(drum2SeqMod, 0, sizeof(drum2SeqMod));
+    memset(drum2SeqPitchOff, 0, sizeof(drum2SeqPitchOff));
+    memset(drum2DblPendingAt, 0, sizeof(drum2DblPendingAt));
+    drum2PatFilled[drum2ActivePat] = false;
+}
 
 // ==================== DRUMS2/DRUMS3 STATE (synthesized 808/909-style kits) ====================
 // Same 8-pad/16-step template as DRUM2 (PAD view to audition+tune, SEQ view to program a
@@ -746,7 +801,7 @@ static inline void drumSPatLoad(uint8_t kit, uint8_t pat) {
 }
 // B4 short press: save the live pattern into its current slot, advance to the next one,
 // load whatever's there (or start empty on a never-used slot).
-static void drumSBankCycle(uint8_t kit) {
+static void drumSPatCycle(uint8_t kit) {
     drumSPatSave(kit, drumSActivePat[kit]);
     drumSActivePat[kit] = (uint8_t)((drumSActivePat[kit] + 1) % DRUMS_PATS);
     if (drumSPatFilled[kit][drumSActivePat[kit]]) {
@@ -759,7 +814,7 @@ static void drumSBankCycle(uint8_t kit) {
 }
 // B4 long press: clear the active slot only (live buffer + its own stored copy), unlike
 // short-press cycling which never destroys data.
-static void drumSBankClear(uint8_t kit) {
+static void drumSPatClear(uint8_t kit) {
     memset(drumSSeqVel[kit], 0, sizeof(drumSSeqVel[kit]));
     memset(drumSSeqMod[kit], 0, sizeof(drumSSeqMod[kit]));
     memset(drumSSeqRow[kit], 0, sizeof(drumSSeqRow[kit]));
@@ -2794,7 +2849,11 @@ static String   mediaAudioPath;
 #define DRANI_FRAME_BYTES 2048
 #define DRANI_HIT_MS 400
 static bool     draniRunning        = false;
-static bool     draniBrowse         = true;    // true = showing SD folder browser (drum2View==2)
+// DRUM2's ANIM view (GIF-synced-to-drum-hits visualizer) that used these buffers was
+// removed along with drum2View when B4 became the pattern-bank button — this subsystem
+// is now dead code (unreachable UI), kept as-is rather than ripped out since that wasn't
+// explicitly asked for.
+static bool     draniBrowse         = true;
 static uint8_t  draniNumOverlays    = 0;
 static EXT_RAM_ATTR uint8_t  draniBaseBuf[DRANI_FRAME_BYTES];
 static EXT_RAM_ATTR uint8_t  draniOverlayBuf[DRANI_MAX_DRUMS][DRANI_FRAME_BYTES];
@@ -3034,35 +3093,59 @@ static int8_t fxLastActivated = -1;
 // same lineage MODE_FELU is inspired by) holds a layer button, then holds one of 16 keys;
 // the effect runs on the whole mix for exactly as long as that key is held and reverts
 // cleanly on release. 8 of the 16 (the "looper" ones — loop 1/4-1/32, stutter, reverse,
-// tape stop, half speed) need a live-mix CAPTURE ring buffer with variable-rate/position
-// playback, which doesn't exist in GrvEP yet — phase 2, PUNCH_NONE below. The other 8 map
+// tape stop, half speed) use a live-mix CAPTURE ring buffer with variable-rate/position
+// playback (amy_punch_*(), amy.c/amy.h — see its own comment block). The other 8 map
 // directly onto existing fxList[] entries, momentarily overriding whichever one they reuse
 // (snapshotting its prior active/params so release restores it exactly, whether that was
 // off or already independently on).
 enum PunchKind : uint8_t {
-    PUNCH_NONE = 0,   // phase 2 (needs the capture engine) — shown in the grid, inert for now
+    PUNCH_NONE = 0,
     PUNCH_LP_SWEEP, PUNCH_HP_SWEEP, PUNCH_PHONE, PUNCH_BITCRUSH,
-    PUNCH_ALIAS, PUNCH_GATE, PUNCH_ECHO, PUNCH_WOBBLE
+    PUNCH_ALIAS, PUNCH_GATE, PUNCH_ECHO, PUNCH_WOBBLE,
+    // Phase 2 — the 8 "looper" effects, built on amy_punch_*() (amy.c/amy.h): a ring-buffer
+    // capture of the live post-FX mix, read back at a fixed window (LOOP/STUTTER) or a
+    // variable/negative rate (REVERSE/TAPESTOP/HALFSPD) instead of going through fxList[].
+    PUNCH_LOOP14, PUNCH_LOOP18, PUNCH_LOOP116, PUNCH_LOOP132,
+    PUNCH_STUTTER, PUNCH_REVERSE, PUNCH_TAPESTOP, PUNCH_HALFSPD
 };
 struct PunchFxDef { const char* label; PunchKind kind; };
 // Same order/layout as Sloop's own 16 keys (SLOOP.md "Punch-in effects") — familiar to
-// anyone who already knows that layout, and keeps the phase-2 slots in their final spot
-// rather than renumbering everything once the capture engine lands.
+// anyone who already knows that layout.
 static const PunchFxDef kPunchFx[16] = {
-    {"LOOP1/4", PUNCH_NONE},     {"LOOP1/8",  PUNCH_NONE},   {"LOOP1/16", PUNCH_NONE},   {"LOOP1/32", PUNCH_NONE},
-    {"STUTTER", PUNCH_NONE},     {"REVERSE",  PUNCH_NONE},   {"TAPESTOP", PUNCH_NONE},   {"HALFSPD",  PUNCH_NONE},
+    {"LOOP1/4", PUNCH_LOOP14},   {"LOOP1/8",  PUNCH_LOOP18}, {"LOOP1/16", PUNCH_LOOP116}, {"LOOP1/32", PUNCH_LOOP132},
+    {"STUTTER", PUNCH_STUTTER},  {"REVERSE",  PUNCH_REVERSE},{"TAPESTOP", PUNCH_TAPESTOP},{"HALFSPD",  PUNCH_HALFSPD},
     {"LP SWEEP",PUNCH_LP_SWEEP}, {"HP SWEEP", PUNCH_HP_SWEEP},{"PHONE",    PUNCH_PHONE},  {"BITCRUSH", PUNCH_BITCRUSH},
     {"ALIAS",   PUNCH_ALIAS},    {"GATE1/16", PUNCH_GATE},   {"ECHO 1/8", PUNCH_ECHO},   {"WOBBLE",   PUNCH_WOBBLE},
 };
-#define FX_PUNCH_HOLD_MS 350
+// True for the 8 "looper" kinds (opt 0-7) — these bypass fxList[]/punchFxSlot() entirely
+// and go straight to the amy_punch_*() ring-buffer engine instead.
+static inline bool punchKindIsLooper(PunchKind k) { return k >= PUNCH_LOOP14 && k <= PUNCH_HALFSPD; }
+// 350ms read as sluggish ("je veux qu'il s'active plus rapidement") — 120ms is still well
+// above accidental-tap territory but feels immediate.
+#define FX_PUNCH_HOLD_MS 120
 static uint32_t s_fxBtnPressMs = 0;   // hold-timer for the B2/B3 FX-trigger group (see fxTriggerBtn())
 static bool     s_fxBtnLongFired = false;
-static int8_t  s_fxPunchActiveOpt = -1;   // 0-15, which grid cell is currently held (-1=none)
-static uint32_t s_fxPunchEffStartMs = 0;  // when the CURRENT punch effect was applied — sweep ramp timing
-static uint8_t s_fxPunchSnapIdx = 255;    // which fxList[] slot was overridden (255=none)
-static bool    s_fxPunchSnapActive = false;
-static float   s_fxPunchSnapParams[4];
+static bool     s_fxBtnFromFx = false;   // OVERLAY_FX (or its FX_MOD sub-editor) was open when the FX-trigger was pressed
+static bool     s_fxBtnPunched = false;  // a punch key was played during this FX-trigger press
+// Multiple punch keys can be held at once ("je veux pouvoir appuyer sur plusieurs FX
+// punch en même temps") — each grid opt tracks its own held state and sweep-ramp start
+// time. The looper engine (amy_punch_*()) is a singleton, so only one looper-kind opt can
+// be held at a time (s_fxPunchLooperOpt); the fxList[]-based kinds instead reference-count
+// per SLOT (not per opt), since several opts can share one slot (ALIAS/BITCRUSH both drive
+// the one wavefold gain; two sweeps could both target FILT) — the snapshot/fxOrderList
+// add is taken on the first opt to touch a slot and undone on the last one to release it.
+static bool     s_fxPunchHeld[16] = {};
+static uint32_t s_fxPunchStartMs[16] = {};   // per-opt — sweep ramp timing (LP/HP_SWEEP)
+static int8_t   s_fxPunchLooperOpt = -1;     // which opt currently owns the looper engine (-1=none)
+struct FxPunchSlotState { uint8_t refCount; bool snapActive; float snapParams[4]; };
+static FxPunchSlotState s_fxPunchSlot[FX_COUNT] = {};
 static float lpfSmoothCut = 8000.0f; // anti-zipper: smoothed cutoff applied each 10ms tick
+// FILT's per-Typ remembered Res (was function-local inside applyFxEffect's FILT case) —
+// promoted to file scope so fxPunchApply()/fxPunchRevert() can pre-sync it before calling
+// applyFxEffect(), otherwise that function's own "restore this Typ's last Res" logic
+// silently overwrites whatever Res value the punch (or its revert) had just set.
+static uint8_t s_lastFiltTyp = 255;
+static float   s_filtResByTyp[4] = {1.5f, 1.5f, 1.5f, 1.5f};
 
 // Activation order: fxOrderList[0] was activated first, fxOrderList[fxOrderCount-1] last.
 // Effects applied in this order, so the last activated filter effect wins.
@@ -3262,13 +3345,11 @@ void applyFxEffect(uint8_t fx, bool silent = false) {
             // extreme Q if left untouched after switching back to LPF. Recalling
             // each Typ's own last Res avoids ever surprising the user with another
             // type's setting bleeding across a Typ switch.
-            static uint8_t lastFiltTyp = 255;
-            static float   filtResByTyp[4] = {1.5f, 1.5f, 1.5f, 1.5f};
-            if (lastFiltTyp == 255) lastFiltTyp = ti;
-            if (ti != lastFiltTyp) {
-                filtResByTyp[lastFiltTyp] = e.params[1];
-                e.params[1] = filtResByTyp[ti];
-                lastFiltTyp = ti;
+            if (s_lastFiltTyp == 255) s_lastFiltTyp = ti;
+            if (ti != s_lastFiltTyp) {
+                s_filtResByTyp[s_lastFiltTyp] = e.params[1];
+                e.params[1] = s_filtResByTyp[ti];
+                s_lastFiltTyp = ti;
             }
             bool ladder = (ti == 3);
             float   cut = e.params[0], res = e.params[1];
@@ -3394,8 +3475,8 @@ void applyFxEffect(uint8_t fx, bool silent = false) {
     }
 }
 
-// Which fxList[] slot a given punch effect momentarily overrides — 255 for PUNCH_NONE
-// (phase 2) or anything unrecognized.
+// Which fxList[] slot a given punch effect momentarily overrides — 255 for the 8 "looper"
+// kinds (which bypass fxList[] entirely, see punchKindIsLooper()) or anything unrecognized.
 static uint8_t punchFxSlot(PunchKind kind) {
     switch (kind) {
         case PUNCH_LP_SWEEP: case PUNCH_HP_SWEEP: case PUNCH_PHONE: return 0;  // FILT
@@ -3408,44 +3489,91 @@ static uint8_t punchFxSlot(PunchKind kind) {
     }
 }
 
-// Opens the punch-in overlay — called on a confirmed hold of whichever button opens
-// OVERLAY_FX in the current mode (see fxTriggerBtn()). No FX is applied yet; that happens
-// per held grid key, see fxPunchApply().
+// Opens the punch-in overlay — called the instant the FX-trigger button is pressed (see
+// fxTriggerBtn()) for every mode except MODE_GROOVE's B2 (which still delays entry behind
+// its own hold-then-poll mechanism so its single/double-click dispatch keeps working — see
+// handleButton()'s own comment). No FX is applied yet; that happens per held grid key, see
+// fxPunchApply(). Idempotent-safe to call while already in punch mode (does NOT clear
+// currently-held opts) — nothing currently calls it that way, but re-asserting the overlay
+// should never lose track of what's already held.
 static void fxPunchEnter() {
     s_overlay = OVERLAY_FX_PUNCH; s_overlayCloseAt = 0;
-    s_fxPunchActiveOpt = -1;
 }
 
-// Momentarily overrides fxList[punchFxSlot(kind)] with this punch effect's own settings,
-// snapshotting whatever that slot's prior active/params were (whether off, or already
-// independently on) so fxPunchRevert() can restore it exactly. Only one punch effect can
-// be held at a time — re-entrant calls while a different opt is already held are ignored
-// (the grid's own release handler always reverts the previous one first in practice, since
-// a physical hand can't hold two grid keys as two separate "opt"s through this path
-// anyway — this is just a defensive no-op, not a real code path).
+// Momentarily overrides fxList[punchFxSlot(kind)] with this punch effect's own settings.
+// Multiple grid keys can be held at once: each fxList[]-based opt reference-counts its
+// underlying SLOT (several opts can share one slot — ALIAS/BITCRUSH both drive the one
+// wavefold gain, two sweeps could both target FILT) — the snapshot (and fxOrderAdd, see
+// its own comment below) is taken only on the first opt to touch a given slot; later opts
+// sharing that same slot just overwrite its params (last-write-wins, same as it always has
+// been for ALIAS/BITCRUSH's shared gain — holding two sweeps together is an inherent
+// one-slot conflict, not something to engineer around). Looper-kind opts
+// (`punchKindIsLooper()`) are different: the amy_punch_*() engine is a singleton, so only
+// ONE can be held at a time — a second looper press while one is already held is ignored.
 static void fxPunchApply(uint8_t opt) {
-    if (opt >= 16 || s_fxPunchActiveOpt >= 0) return;
+    if (opt >= 16 || s_fxPunchHeld[opt]) return;
     PunchKind kind = kPunchFx[opt].kind;
+    s_fxPunchHeld[opt] = true;
+    s_fxBtnPunched = true;
+    s_fxPunchStartMs[opt] = millis();
+    if (punchKindIsLooper(kind)) {
+        if (s_fxPunchLooperOpt >= 0) return;  // engine is a singleton — first looper held wins
+        s_fxPunchLooperOpt = opt;
+        switch (kind) {
+            case PUNCH_LOOP14:  amy_punch_loop_start((uint32_t)(60.0f  / bpm * AMY_SAMPLE_RATE)); break;
+            case PUNCH_LOOP18:  amy_punch_loop_start((uint32_t)(30.0f  / bpm * AMY_SAMPLE_RATE)); break;
+            case PUNCH_LOOP116: amy_punch_loop_start((uint32_t)(15.0f  / bpm * AMY_SAMPLE_RATE)); break;
+            case PUNCH_LOOP132: amy_punch_loop_start((uint32_t)(7.5f   / bpm * AMY_SAMPLE_RATE)); break;
+            case PUNCH_STUTTER: amy_punch_loop_start((uint32_t)(0.06f * AMY_SAMPLE_RATE)); break;  // fixed ~60ms glitch, not tempo-synced
+            case PUNCH_REVERSE:  amy_punch_reverse_start(); break;
+            case PUNCH_HALFSPD:  amy_punch_halfspeed_start(); break;
+            case PUNCH_TAPESTOP: amy_punch_tapestop_start(1.2f); break;  // ~1.2s "motor spinning down"
+            default: break;
+        }
+        return;
+    }
     uint8_t idx = punchFxSlot(kind);
-    if (idx == 255) return;  // PUNCH_NONE (phase 2) or unrecognized — grid shows it, does nothing yet
-    s_fxPunchActiveOpt = opt;
-    s_fxPunchEffStartMs = millis();
-    s_fxPunchSnapIdx = idx;
-    s_fxPunchSnapActive = fxList[idx].active;
-    memcpy(s_fxPunchSnapParams, fxList[idx].params, sizeof(s_fxPunchSnapParams));
+    if (idx == 255) { s_fxPunchHeld[opt] = false; return; }  // unrecognized — grid shows it, does nothing
+    FxPunchSlotState& slot = s_fxPunchSlot[idx];
+    if (slot.refCount == 0) {
+        slot.snapActive = fxList[idx].active;
+        memcpy(slot.snapParams, fxList[idx].params, sizeof(slot.snapParams));
+        // amy_apply_ordered_fx() (amy.c) only calls amy_apply_filt()/amy_apply_wavefold_bus0()
+        // for slots present in fxOrderList[] — fxList[idx].active alone does NOT make FILT/REP/
+        // BITCRS's DSP run at all. fxOrderAdd() is otherwise only ever called from the normal
+        // FX-menu toggle (overlayFxToggle()), so a slot never independently toggled on this
+        // session stays silently absent from fxOrderList forever — this was the actual root
+        // cause of LP_SWEEP/HP_SWEEP/PHONE/BITCRUSH doing nothing despite every param being
+        // set correctly. Mirror the same active<->order invariant overlayFxToggle() keeps, and
+        // only add it if it wasn't already there (an already-active slot is already in order).
+        if (!slot.snapActive) fxOrderAdd(idx);
+    }
+    slot.refCount++;
     fxList[idx].active = true;
     switch (kind) {
         case PUNCH_LP_SWEEP:
             // Starts closed, opens over ~2s while held (see the sweep tick in loop()).
             fxList[0].params[3] = 0; fxList[0].params[1] = 2.5f; fxList[0].params[0] = fxList[0].paramMin[0];
+            // Pre-sync the per-Typ Res memory and the anti-zipper cutoff smoother so
+            // applyFxEffect()/the 10ms tick below don't immediately overwrite/slow-walk
+            // what was just set here (see s_filtResByTyp/lpfSmoothCut's own comments —
+            // without this, LP/HP SWEEP and PHONE could silently snap back to whatever
+            // Res/cutoff the filter had before the punch, or crawl into place over ~100-
+            // 200ms instead of applying instantly).
+            s_filtResByTyp[0] = fxList[0].params[1];
+            lpfSmoothCut = fxList[0].params[0];
             break;
         case PUNCH_HP_SWEEP:
             // HPF's "closed" end is its own max cutoff (everything below it is cut) —
             // starts there, sweeps down to fully open.
             fxList[0].params[3] = 1; fxList[0].params[1] = 2.5f; fxList[0].params[0] = fxList[0].paramMax[0];
+            s_filtResByTyp[1] = fxList[0].params[1];
+            lpfSmoothCut = fxList[0].params[0];
             break;
         case PUNCH_PHONE:
             fxList[0].params[3] = 2; fxList[0].params[0] = 1500.0f; fxList[0].params[1] = 3.0f;  // BPF, telephone band
+            s_filtResByTyp[2] = fxList[0].params[1];
+            lpfSmoothCut = fxList[0].params[0];
             break;
         case PUNCH_BITCRUSH:
             fxList[9].params[0] = 3.0f; fxList[9].params[1] = 0.0f;  // heavy crush, no extra LPF
@@ -3453,7 +3581,10 @@ static void fxPunchApply(uint8_t opt) {
         case PUNCH_ALIAS:
             // No true decimator exists yet — REP's wavefold at a harsh threshold is the
             // closest approximation already in the engine (see the class comment above).
-            fxList[8].params[0] = 0.85f;
+            // 0.85 (gain~1.18x) was nearly a no-op — low enough to not read as an effect
+            // at all; 0.08 (gain~12.5x) is clearly audible, same spirit as BITCRUSH's own
+            // deliberately extreme gain.
+            fxList[8].params[0] = 0.08f;
             break;
         case PUNCH_GATE: {
             float hz = constrain((bpm / 60.0f) * 4.0f, fxList[10].paramMin[0], fxList[10].paramMax[0]);  // 1/16-note rate
@@ -3479,25 +3610,52 @@ static void fxPunchApply(uint8_t opt) {
 // pair is independently active, re-apply it after the revert so it isn't left stomped by
 // the punch effect's own "restore to inactive" call.
 static void fxPunchRevert(uint8_t opt) {
-    if (s_fxPunchActiveOpt != opt) return;
-    uint8_t idx = s_fxPunchSnapIdx;
-    if (idx < FX_COUNT) {
-        fxList[idx].active = s_fxPunchSnapActive;
-        memcpy(fxList[idx].params, s_fxPunchSnapParams, sizeof(s_fxPunchSnapParams));
-        applyFxEffect(idx, true);
-        if (idx == 8 || idx == 9) { if (fxList[8].active) applyFxEffect(8, true); else applyFxEffect(9, true); }
-        if (idx == 13 && fxList[5].active) applyFxEffect(5, true);
-        if (idx == 10 && !fxList[10].active) audioSetVolume(volume);  // TREMOLO's own 10ms tick only restores volume while still active (depth->0), not once active itself goes false
+    if (opt >= 16 || !s_fxPunchHeld[opt]) return;
+    s_fxPunchHeld[opt] = false;
+    PunchKind kind = kPunchFx[opt].kind;
+    if (punchKindIsLooper(kind)) {
+        if (s_fxPunchLooperOpt == opt) {
+            amy_punch_loop_stop();
+            s_fxPunchLooperOpt = -1;
+        }
+        return;
     }
-    s_fxPunchActiveOpt = -1;
-    s_fxPunchSnapIdx = 255;
+    uint8_t idx = punchFxSlot(kind);
+    if (idx >= FX_COUNT) return;
+    FxPunchSlotState& slot = s_fxPunchSlot[idx];
+    if (slot.refCount == 0) return;  // defensive — shouldn't happen if held/refCount stay in sync
+    slot.refCount--;
+    if (slot.refCount > 0) return;  // another held opt still shares this slot — leave it alone
+    fxList[idx].active = slot.snapActive;
+    memcpy(fxList[idx].params, slot.snapParams, sizeof(slot.snapParams));
+    // Undo fxPunchApply()'s fxOrderAdd() — only if the punch itself added it (it wasn't
+    // independently active before), so a slot the user had genuinely turned on via the
+    // normal FX menu stays on and in order after the punch releases.
+    if (!slot.snapActive) fxOrderRemove(idx);
+    if (idx == 0) {
+        // Same pre-sync as fxPunchApply() (see its comment) — otherwise the restored
+        // Res/cutoff can get clobbered by the per-Typ memory or crawl back into place
+        // instead of snapping, right when releasing the punch key.
+        uint8_t snapTi = (uint8_t)constrain((int)roundf(slot.snapParams[3]), 0, 3);
+        s_filtResByTyp[snapTi] = slot.snapParams[1];
+        lpfSmoothCut = slot.snapParams[0];
+    }
+    applyFxEffect(idx, true);
+    if (idx == 8 || idx == 9) { if (fxList[8].active) applyFxEffect(8, true); else applyFxEffect(9, true); }
+    if (idx == 13 && fxList[5].active) applyFxEffect(5, true);
+    if (idx == 10 && !fxList[10].active) audioSetVolume(volume);  // TREMOLO's own 10ms tick only restores volume while still active (depth->0), not once active itself goes false
 }
 
-// Closes the punch overlay entirely — reverts whatever's still held (releasing the grid
-// key normally does this first, but the FX-trigger button can be released first too, e.g.
-// if the hand slides off the grid key without a clean release event).
+// Called when the FX-trigger button itself is released after having held long enough to
+// enter punch mode — reverts whatever's still held (releasing the grid key normally does
+// this first, but the trigger button can be released first too, e.g. if the hand slides
+// off the grid key without a clean release event) and returns to the mode's main screen
+// (`OVERLAY_NONE`), not the normal FX menu — the only way into the normal FX menu is a
+// press-and-release of the FX-trigger button without playing any punch key; a press that
+// did play a punch always returns to main on release, never leaves the normal FX menu open
+// as a side effect.
 static void fxPunchExit() {
-    if (s_fxPunchActiveOpt >= 0) fxPunchRevert((uint8_t)s_fxPunchActiveOpt);
+    for (uint8_t o = 0; o < 16; o++) if (s_fxPunchHeld[o]) fxPunchRevert(o);
     s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
 }
 
@@ -4291,17 +4449,14 @@ static CtrlLabels ctrlLabelsFor(AppMode m) {
                 return {"-", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", "ALT/MAP", "SEQ/PAD"};
             return {"-", "-", "-", "-", "-", "PLAY", "FX", "ALT/MAP", "SEQ/PAD"};
         case MODE_DRUM2:
-            if (anyFxActive())
-                return {"-", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY/BACK", "FX", "REC/BROWSE", "VIEW"};
-            return {"-", "PITCH", "DECAY", "VOLUME", "-", "PLAY/BACK", "FX", "REC/BROWSE", "VIEW"};
         case MODE_DRUMS2:
         case MODE_DRUMS3:
-            // Sequencer-only (no PAD view) — B3 arms quantized recording of row-0's live
-            // preview hits; B4 is dual-purpose (short=cycle pattern bank, long=clear the
-            // active slot).
+            // Sequencer-only (no PAD/ANIM view) — B3 arms quantized recording of row-0's
+            // live preview hits; B4 is dual-purpose (short=cycle pattern, long=clear the
+            // active slot). Unified across all three drum modes.
             if (anyFxActive())
-                return {"-", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", "REC", "BNK/CLR"};
-            return {"-", "PITCH", "DECAY", "VOLUME", "-", "PLAY", "FX", "REC", "BNK/CLR"};
+                return {"-", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", "REC", "PAT/CLR"};
+            return {"-", "PITCH", "DECAY", "VOLUME", "-", "PLAY", "FX", "REC", "PAT/CLR"};
         case MODE_DR2:
             if (anyFxActive())
                 return {"-", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", "LOOP", "COPY"};
@@ -4897,7 +5052,6 @@ void switchMode(AppMode newMode) {
     }
     if (newMode==MODE_DRUM2) {
         if (!drum2Playing) { drum2Step=0; drum2LastStepMs=millis(); }  // keep step if already playing
-        drum2View=1; draniRunning=false; draniBrowse=true;  // always open on sequencer view
         memset(drum2PadFlashMs,   0, sizeof(drum2PadFlashMs));
         memset(drum2DblPendingAt, 0, sizeof(drum2DblPendingAt));
     }
@@ -4917,11 +5071,29 @@ void switchMode(AppMode newMode) {
         if (audioReady) {
             audioT303Init(t303Cutoff, t303EffReso(), t303EffEnvMod(), t303Decay, t303AmyWave(t303Wave));
             audioT303SetFilterType(kT303PatchFilterTypes[t303Patch]);  // Init() resets to LPF24; re-apply the patch
+            // P2 (per-wave texture) initializes to 0% regardless of where the physical pot
+            // sits — audioT303Init() doesn't touch wavefold/duty, so without this the sound
+            // would keep whatever texture was last left applied. Same branches as the P2
+            // pot-dispatch in loop() (see its own comment), just forced to 0 instead of
+            // read from pots[1].value.
             if (t303IsSubOctWave(t303Wave)) {
                 audioSW2Init(t303Cutoff, t303Reso, t303Decay, 1, t303AmyWave(t303Wave));
-                audioSW2SetBlend(pots[1].value);
+                audioSW2SetBlend(0.0f);
+            } else if (t303Wave==T303_PINK_WAVE) {
+                // no-op — P2 has no effect on pink noise
+            } else if (t303Wave==PULSE) {
+                audioT303Duty(0.5f);
+            } else if (t303Wave==T303_TRI2_WAVE || t303Wave==T303_SAW2_WAVE) {
+                audioT303WavefoldAsym(0.0f);
+            } else {
+                audioT303Wavefold(0.0f);  // covers NAP_WAVE and every other remaining wave
             }
         }
+        // Pickup — tracks the pot's CURRENT physical position so the per-tick P2
+        // dispatch doesn't immediately see a "change" and re-apply it, which would snap
+        // the just-forced 0% back to wherever the pot happens to sit. Moving the pot from
+        // here behaves normally, starting from 0%.
+        g_lp303swf = pots[1].value;
         // Shared clock continues if already playing
     }
     if (newMode==MODE_303S2) {
@@ -4952,7 +5124,27 @@ void switchMode(AppMode newMode) {
         if (audioReady && !gestDrillDown) {
             audioT303Init(t303Cutoff,t303EffReso(),t303EffEnvMod(),t303Decay,t303AmyWave(t303Wave));
             audioT303SetFilterType(kT303PatchFilterTypes[t303Patch]);
-            if (t303IsSubOctWave(t303Wave)){ audioSW2Init(t303Cutoff,t303Reso,t303Decay,1,t303AmyWave(t303Wave)); audioSW2SetBlend(pots[1].value); }
+            // P2 (per-wave texture) initializes to 0% regardless of where the physical pot
+            // sits — this mode is what actually shows as "303S" on screen (MENU_303S2;
+            // MENU_303S itself isn't wired into any menu tab, so MODE_303S is unreachable —
+            // the earlier fix there never had any effect on real usage, same bug, wrong
+            // mode). Same branches as this mode's own P2 dispatch in loop(), forced to 0.
+            if (t303IsSubOctWave(t303Wave)) {
+                audioSW2Init(t303Cutoff,t303Reso,t303Decay,1,t303AmyWave(t303Wave));
+                audioSW2SetBlend(0.0f);
+            } else if (t303Wave==T303_PINK_WAVE) {
+                // no-op — P2 has no effect on pink noise
+            } else if (t303Wave==PULSE) {
+                audioT303Duty(0.5f);
+            } else if (t303Wave==T303_TRI2_WAVE || t303Wave==T303_SAW2_WAVE) {
+                audioT303WavefoldAsym(0.0f);
+            } else {
+                audioT303Wavefold(0.0f);  // covers NAP_WAVE and every other remaining wave
+            }
+            // Pickup — tracks the pot's CURRENT physical position so the per-tick P2
+            // dispatch doesn't immediately see a "change" and re-apply it, snapping the
+            // just-forced 0% back to wherever the pot happens to sit.
+            g_lp303s2wf = pots[1].value;
         }
     }
     if (newMode==MODE_I303) {
@@ -5862,18 +6054,42 @@ void handleButton(uint8_t rawBtn, bool pressed) {
         return;
     }
 
-    // Hold-to-punch (B2/B3 group): whichever button opens OVERLAY_FX in this mode, held
-    // ≥FX_PUNCH_HOLD_MS, opens the momentary FX-punch grid — same dual-purpose-button
-    // idiom as MODE_BREAK's B4 just below, generalized across every mode that has an FX
-    // overlay at all (fxTriggerBtn()). Deliberately does NOT `return` on press — several
-    // modes (GROOVE's B2 chief among them) already decide a single-vs-double-click action
-    // on the press itself; letting that run as before and then having the loop() poll
-    // (next to BREAK's own) override it with OVERLAY_FX_PUNCH once the hold threshold
-    // passes keeps every existing short-press/double-click behavior 100% intact. B1's own
-    // hold integrates into the pre-existing btn1PressTime/btn1Handled 600ms-long-press-to-
-    // menu mechanism instead (see the btn==0 block below) — a second independent hold-
-    // timer on the SAME physical button would race it.
-    if (fxTriggerBtn(currentMode) == btn && (btn == 1 || btn == 2) && !menuOpen) {
+    // Instant punch-on-press: pressing the FX-trigger button (whichever one opens
+    // OVERLAY_FX in this mode, fxTriggerBtn()) shows the punch grid IMMEDIATELY instead of
+    // waiting on a hold threshold — "dès que j'appuie sur FX, c'est le menu FX punch".
+    // Releasing then classifies what happens by what was DONE during the press, not by its
+    // duration: if a punch key was played, revert and return to the mode's main screen;
+    // otherwise it's a plain FX-menu toggle (opens OVERLAY_FX, or closes it if it was the
+    // overlay open at press time). A duration threshold here used to send every quick
+    // press to OVERLAY_FX unconditionally, so a short press from inside the FX menu just
+    // bounced FX -> punch -> FX with no way out ("je reste bloqué entre FX et FX punch"),
+    // and presses straddling the threshold made it feel random.
+    // Covers all 3 button groups (B1/B2/B3, whichever fxTriggerBtn() reports) uniformly —
+    // the per-mode dispatch further down never runs for this specific button anymore
+    // (this `return`s), except MODE_GROOVE's B2, exempted below: it already decides a
+    // single-click=FX/double-click=Scale-Arp action on press itself, which an instant,
+    // unconditional punch-on-press would silently break.
+    if (fxTriggerBtn(currentMode) == btn && currentMode != MODE_GROOVE && !menuOpen) {
+        if (pressed) {
+            s_fxBtnPressMs = millis();
+            s_fxBtnFromFx = (s_overlay == OVERLAY_FX || s_overlay == OVERLAY_FX_MOD);
+            s_fxBtnPunched = false;
+            fxPunchEnter();
+        } else {
+            for (uint8_t o = 0; o < 16; o++) if (s_fxPunchHeld[o]) fxPunchRevert(o);
+            bool openFx = !s_fxBtnPunched && !s_fxBtnFromFx;
+            s_overlay = openFx ? OVERLAY_FX : OVERLAY_NONE;
+            s_overlayCloseAt = 0;
+            s_fxBtnPressMs = 0;
+        }
+        return;
+    }
+
+    // MODE_GROOVE's B2 only: old delayed-hold mechanism (loop() has the matching poll
+    // that actually calls fxPunchEnter() once held past the threshold) — kept separate,
+    // deliberately does NOT `return` on press, so GROOVE's own single-click/double-click
+    // dispatch further down still runs on every press exactly as before.
+    if (currentMode == MODE_GROOVE && fxTriggerBtn(currentMode) == btn && !menuOpen) {
         if (pressed) {
             s_fxBtnPressMs = millis();
             s_fxBtnLongFired = false;
@@ -5903,8 +6119,8 @@ void handleButton(uint8_t rawBtn, bool pressed) {
         return;
     }
 
-    // MODE_DRUMS2/DRUMS3 B4: short press = cycle pattern bank (see drumSBankCycle());
-    // held >=DRUMS_B4_LONGPRESS_MS = clear the active slot (drumSBankClear()). Same dual-
+    // MODE_DRUMS2/DRUMS3 B4: short press = cycle pattern bank (see drumSPatCycle());
+    // held >=DRUMS_B4_LONGPRESS_MS = clear the active slot (drumSPatClear()). Same dual-
     // purpose-button idiom as MODE_BREAK's B4 just above.
     if (btn==3 && (currentMode==MODE_DRUMS2 || currentMode==MODE_DRUMS3) && !menuOpen) {
         uint8_t kit = (currentMode==MODE_DRUMS3) ? DRUMS_KIT_909 : DRUMS_KIT_808;
@@ -5912,8 +6128,22 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             drumSB4PressMs[kit] = millis();
             drumSB4LongFired[kit] = false;
         } else {
-            if (!drumSB4LongFired[kit]) drumSBankCycle(kit);
+            if (!drumSB4LongFired[kit]) drumSPatCycle(kit);
             drumSB4PressMs[kit] = 0;
+        }
+        return;
+    }
+
+    // MODE_DRUM2 B4: same dual-purpose bank button as DRUMS2/DRUMS3 above (short press =
+    // drum2PatCycle(), long press = drum2PatClear()) — DRUM2 is now sequencer-only (no more
+    // PAD/ANIM view-cycling on this button), unifying all three drum modes on one scheme.
+    if (btn==3 && currentMode==MODE_DRUM2 && !menuOpen) {
+        if (pressed) {
+            drum2B4PressMs = millis();
+            drum2B4LongFired = false;
+        } else {
+            if (!drum2B4LongFired) drum2PatCycle();
+            drum2B4PressMs = 0;
         }
         return;
     }
@@ -6031,21 +6261,17 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                         break;
                     }
                     case MODE_DRUM2:
-                        if (drum2View == 2 && draniBrowse) {
-                            // B1 in anim browse = navigate up / return to menu
-                            if (sdPath == "/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true; }
-                            else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1), isVidOrImgFile); }
-                        } else {
-                            drum2Playing = !drum2Playing;
-                            if (drum2Playing) { drum2Step=0; drum2LastStepMs=millis(); s303s2Step=0; s303s2LastMs=millis(); }
-                            else {
-                                drum2RecArmed=false;
-                                for(uint8_t i=0;i<syseqActiveCnt;i++) audioNoteOff(syseqActive[i]); syseqActiveCnt=0; syseqActiveIsFull=false;
-                                memset(drum2DblPendingAt,0,sizeof(drum2DblPendingAt));
-                                if (s303CurNote) { audioT303NoteOff(s303CurNote); s303CurNote=0; }
-                                if (s303s2CurNote) { audioT303NoteOff(s303s2CurNote); s303s2CurNote=0; }
-                                t303SlideActive=false; audioT303PitchBend(1.0f); ss2CurSlot=0xFF;
-                            }
+                        // ANIM view (SD browse) removed along with drum2View — B1 is now
+                        // unconditionally play/stop, same as DRUMS2/DRUMS3.
+                        drum2Playing = !drum2Playing;
+                        if (drum2Playing) { drum2Step=0; drum2LastStepMs=millis(); s303s2Step=0; s303s2LastMs=millis(); }
+                        else {
+                            drum2RecArmed=false;
+                            for(uint8_t i=0;i<syseqActiveCnt;i++) audioNoteOff(syseqActive[i]); syseqActiveCnt=0; syseqActiveIsFull=false;
+                            memset(drum2DblPendingAt,0,sizeof(drum2DblPendingAt));
+                            if (s303CurNote) { audioT303NoteOff(s303CurNote); s303CurNote=0; }
+                            if (s303s2CurNote) { audioT303NoteOff(s303s2CurNote); s303s2CurNote=0; }
+                            t303SlideActive=false; audioT303PitchBend(1.0f); ss2CurSlot=0xFF;
                         }
                         break;
                     case MODE_DRUMS2:
@@ -6322,21 +6548,14 @@ void handleButton(uint8_t rawBtn, bool pressed) {
             break;
         case MODE_DRUM2:
             // B1(btn0)=Play handled in the btn==0 block above (must reach second switch via btn==1,2,3)
+            // B4 (bank cycle/clear) is intercepted earlier in handleButton(), before this
+            // switch is even reached — see the dedicated MODE_DRUM2 press/release block.
             if (btn==1) {  // B2: FX overlay
                 OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0;
                 if (old!=OVERLAY_FX) s_overlay=OVERLAY_FX;
             }
-            if (btn==2) {  // B3: Rec (pad/seq) or folder browser toggle (anim)
-                if (drum2View == 2) {
-                    if (draniBrowse) { draniBrowse = false; }
-                    else { draniBrowse = true; if (sdReady) sdListDir(sdPath.c_str(), isVidOrImgFile); }
-                } else {
-                    drum2RecArmed = !drum2RecArmed;
-                }
-            }
-            if (btn==3) {  // B4: cycle views: pad → seq → anim → pad
-                drum2View = (drum2View + 1) % 3;
-                if (drum2View == 2 && sdReady && !draniRunning) sdListDir(sdPath.c_str(), isVidOrImgFile);
+            if (btn==2) {  // B3: Rec arm (ANIM view removed, no more folder-browse toggle here)
+                drum2RecArmed = !drum2RecArmed;
             }
             break;
         case MODE_DRUMS2:
@@ -7339,22 +7558,19 @@ void drawScreen(bool blockWait) {
 
     // FX-punch grid — Sloop-style momentary effects, same 4x4 physical layout as
     // OVERLAY_FX above (16 cells, column-major, same key<->opt mapping) so the muscle
-    // memory transfers directly. The 8 cells with a real effect behind them (see
-    // kPunchFx[]) show solid while held; the 8 "looper" cells (phase 2 — no capture
-    // engine yet) are marked with a small corner tick so they read as "not yet", not as
-    // silently broken.
+    // memory transfers directly. All 16 cells are live now (phase 1 = existing fxList[]
+    // FX, phase 2 = the amy_punch_*() ring-buffer looper engine) — see kPunchFx[].
     if (s_overlay == OVERLAY_FX_PUNCH) {
         const int gcols = 4, grows = 4, gcw = 128 / gcols, gch = 17;
         oled.setFont(u8g2_font_4x6_tf);
         for (int i = 0; i < gcols * grows; i++) {
             int gc = i / grows, gr = i % grows;  // column-major — matches overlayKeyPress's opt mapping
             int x = gc * gcw, y = gr * gch;
-            bool held = (s_fxPunchActiveOpt == i);
+            bool held = s_fxPunchHeld[i];
             oled.drawFrame(x, y, gcw, gch);
             if (held) { oled.drawBox(x + 1, y + 1, gcw - 2, gch - 2); oled.setDrawColor(0); }
             oled.drawStr(x + 2, y + gch - 3, kPunchFx[i].label);
             if (held) oled.setDrawColor(1);
-            if (kPunchFx[i].kind == PUNCH_NONE) oled.drawBox(x + gcw - 4, y + 1, 3, 3);  // "not yet" tick
         }
         oled.drawHLine(0, gch * grows, 128);
         oled.drawStr(0, 127, "hold a key = punch in");
@@ -8541,12 +8757,12 @@ void drawScreen(bool blockWait) {
                 // Pad strip: drawBox(x,bY,w,9) + drawStr(x,bY+7,...) puts chars at bY+2..bY+7 ✓
                 // Vol bar:   drawFrame(x,vY,100,6) + drawStr(104,vY+5,...) → label chars = bar height ✓
 
-                if(drum2View == 1){
-                    // ═══ DR2 SEQ VIEW ════════════════════════════════
+                {
+                    // ═══ DR2 SEQ VIEW (now the only view — PAD/ANIM removed) ═══
                     // Row 0: header (5x7 baseline=7 → chars y=1..8)
                     oled.setFont(u8g2_font_5x7_tf);
-                    snprintf(buf,sizeof(buf),"SEQ %s  %d BPM  [%s]",
-                             drum2Playing?"[>]":"[ ]",bpm,kDrum2Labels[drum2SelPad]);
+                    snprintf(buf,sizeof(buf),"SEQ %s  %d BPM  [%s] P%d",
+                             drum2Playing?"[>]":"[ ]",bpm,kDrum2Labels[drum2SelPad],drum2ActivePat+1);
                     oled.drawStr(0,7,buf);
                     oled.drawHLine(0,9,128);
                     drawBtnRow(MODE_DRUM2, 17);
@@ -8618,117 +8834,6 @@ void drawScreen(bool blockWait) {
                     if(drum2RecArmed){
                         oled.drawRBox(0,84,50,9,2);
                         oled.setDrawColor(0); oled.drawStr(4,91,"REC ARM"); oled.setDrawColor(1);
-                    }
-                }else if(drum2View == 2){
-                    // ═══ DR2 ANIM VIEW ═══════════════════════════════
-                    static const char* kDrAltName[4] = {"NRM","50%","RND","DBL"};
-                    if (draniBrowse) {
-                        // ── SD folder browser ─────────────────────────────────
-                        oled.setFont(u8g2_font_4x6_tf);
-                        char pb[32];
-                        snprintf(pb, sizeof(pb), "ANIM %.22s", sdPath.c_str());
-                        oled.drawStr(0, 7, pb);
-                        oled.drawHLine(0, 9, 128);
-                        drawBtnRow(MODE_DRUM2, 17);
-                        if (!sdReady) {
-                            oled.drawStr(10, 48, "SD not found");
-                        } else {
-                            for (int i = 0; i < 10 && (i + sdScroll) < sdFileCount; i++) {
-                                int idx = i + sdScroll; bool sel = (idx == sdCursor);
-                                char line[29];
-                                if (sdFileIsDir[idx]) snprintf(line, sizeof(line), "%c[%.24s]", sel?'>':' ', sdFiles[idx].c_str());
-                                else                  snprintf(line, sizeof(line), "%c%.26s",    sel?'>':' ', sdFiles[idx].c_str());
-                                oled.drawStr(0, 25 + i * 7, line);
-                                if (sel) oled.drawHLine(0, 26 + i * 7, 128);
-                            }
-                            oled.drawStr(0, 122, "B1=up  B3=close  click=load");
-                        }
-                    } else if (draniRunning) {
-                        // ── Full-screen animation ─────────────────────────────
-                        memcpy(draniDisplayBuf, draniBaseBuf, DRANI_FRAME_BYTES);
-                        uint32_t nowMs = millis();
-                        for (int d = 0; d < draniNumOverlays; d++) {
-                            if (draniDrumHitMs[d] > 0 && nowMs - draniDrumHitMs[d] < DRANI_HIT_MS)
-                                for (int i = 0; i < DRANI_FRAME_BYTES; i++)
-                                    draniDisplayBuf[i] |= draniOverlayBuf[d][i];
-                        }
-                        oled.drawBitmap(0, 0, 16, 128, draniDisplayBuf);
-                    } else {
-                        // ── No folder loaded ──────────────────────────────────
-                        oled.setFont(u8g2_font_4x6_tf);
-                        oled.drawStr(0, 7, "DRUMS ANIM");
-                        oled.drawHLine(0, 9, 128);
-                        drawBtnRow(MODE_DRUM2, 17);
-                        oled.drawStr(10, 50, "No folder loaded");
-                        oled.drawStr(10, 62, "B3 = browse SD");
-                        oled.drawStr(0, 122, "B1=play  B3=fold  B4=Seq");
-                    }
-                }else{
-                    // ═══ DR2 PAD VIEW ════════════════════════════════
-                    // Header (5x7 baseline=7 → chars y=1..8)
-                    oled.setFont(u8g2_font_5x7_tf);
-                    snprintf(buf,sizeof(buf),"DR2 %s  %d BPM",
-                             drum2Playing?"[>]":"[ ]",bpm);
-                    oled.drawStr(0,7,buf);
-                    oled.drawHLine(0,9,128);
-                    drawBtnRow(MODE_DRUM2, 17);
-
-                    // Pad params (5x7 baseline=25 → chars y=19..26)
-                    // If REC armed: inverted box y=18..27, text still at baseline=25
-                    snprintf(buf,sizeof(buf),"[%s]  Pt:%d  Dcy:%.0f",
-                             kDrum2Labels[drum2SelPad],
-                             (int)drum2Pitch[drum2SelPad],
-                             drum2Decay[drum2SelPad]);
-                    if(drum2RecArmed){
-                        oled.drawRBox(0,18,128,10,2);
-                        oled.setDrawColor(0); oled.drawStr(2,25,buf); oled.setDrawColor(1);
-                    }else{
-                        oled.drawStr(0,25,buf);
-                    }
-                    oled.drawHLine(0,28,128);
-
-                    // Step bar: cells 7×9 at y=30..38
-                    for(int s=0;s<DR2_STEPS;s++){
-                        int sx=s*8;
-                        bool cur=drum2Playing&&(s==(int)drum2Step);
-                        bool has=(drum2SeqVel[drum2SelPad][s]>0);
-                        if(cur&&has){ oled.drawBox(sx,30,7,9);oled.setDrawColor(0);oled.drawBox(sx+1,31,5,7);oled.setDrawColor(1);}
-                        else if(cur){ oled.drawBox(sx,30,7,9);}
-                        else if(has){ oled.drawBox(sx+1,31,5,7);}
-                        else{         oled.drawFrame(sx,30,7,9);}
-                    }
-                    oled.drawHLine(0,40,128);
-
-                    // Pad strip: box y=41..49, text baseline=48 → chars y=43..48 ✓
-                    oled.setFont(u8g2_font_4x6_tf);
-                    for(int pi=0;pi<DRUM2_PADS;pi++){
-                        int px=pi*15+2;
-                        bool sel=(pi==drum2SelPad);
-                        if(sel){oled.drawBox(px-2,41,17,9);oled.setDrawColor(0);}
-                        oled.drawStr(px,48,kDrum2Labels[pi]);
-                        oled.setDrawColor(1);
-                    }
-                    oled.drawHLine(0,51,128);
-
-                    // FX (4x6 baseline=58 → chars y=53..58)
-                    snprintf(buf,sizeof(buf),"FX: %s",fxstr);
-                    oled.drawStr(0,58,buf);
-                    oled.drawHLine(0,60,128);
-
-                    // Alt mode (5x7 baseline=68 → chars y=62..69)
-                    oled.setFont(u8g2_font_5x7_tf);
-                    snprintf(buf,sizeof(buf),"Alt: %s",kAltName[drum2PadAltMode[drum2SelPad]]);
-                    oled.drawStr(0,68,buf);
-                    oled.drawHLine(0,70,128);
-
-                    // Pad vol bar y=72..77
-                    oled.setFont(u8g2_font_4x6_tf);
-                    {   int vw=(int)(drum2Volume[drum2SelPad]*100);
-                        oled.drawStr(0,77,"V:");
-                        oled.drawFrame(9,72,88,6);
-                        if(vw>0) oled.drawBox(9,72,min(vw,100)*88/100,6);  // volume can exceed 100% (up to 2x); clamp the bar, not the number
-                        snprintf(buf,sizeof(buf),"%d%%",vw);
-                        oled.drawStr(100,77,buf);
                     }
                 }
                 break;
@@ -9725,14 +9830,12 @@ void drawScreen(bool blockWait) {
                 snprintf(buf,sizeof(buf),"Env:%-3s  Oct:%+d",
                          envNames[currentEnv],noteMap.getOctave());
                 oled.drawStr(0,78,buf);
-                oled.setFont(u8g2_font_5x7_tf);
+                // No velocity bar here (unlike MODE_FELU) — JX drives instrument select
+                // instead of note velocity on this mode, see the dedicated joystick block
+                // in loop() (mirrors MODE_303S); JY index/preset readout is the line above.
+                oled.setFont(u8g2_font_4x6_tf);
                 oled.drawHLine(0,94,128);
-                {
-                    float jx2=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                    int bw=(int)((jx2+1.0f)*0.5f*128.0f);
-                    oled.drawFrame(0,96,128,5);
-                    if(bw>2) oled.drawBox(0,96,bw,5);
-                }
+                oled.drawStr(0,98,"JX:Instr  JY:Oct");
                 break;
             }
             // ---- MODULAR/SERUM — wavetable dual-osc synth, visual editor ----
@@ -11321,7 +11424,27 @@ static SemaphoreHandle_t s_ledSem = nullptr;
 static void updateLedsAndShow()
 {
     for(int i=0;i<NUM_LEDS;i++) leds[i]=CRGB::Black;
-    if(!menuOpen){
+    // FX Punch overlay: override whatever the underlying mode's own LED scheme would show
+    // with a legend of the 16 punch keys (cols 4-7 only — same physical layout the OLED
+    // grid/overlayKeyPress already use) — lets the user see, by touch/LED alone, which
+    // key does what, without needing to read the OLED grid. Cols 0-3 go dark since this
+    // overlay doesn't use them at all.
+    if (s_overlay == OVERLAY_FX_PUNCH) {
+        for (int r=0;r<KBD_NOTE_ROWS;r++) for (int c=4;c<KBD_COLS;c++) {
+            int gr=KBD_ROWS-1-r, gc=KBD_COLS-1-c, idx=gr*KBD_COLS+gc;
+            int li=(idx>=0&&idx<NUM_LEDS+4)?crdToIdx(idx,0):-1;
+            if (li<0||li>=NUM_LEDS) continue;
+            uint8_t opt = (uint8_t)((3 - r) + (7 - c) * 4);
+            bool held = s_fxPunchHeld[opt];
+            uint8_t hue = (uint8_t)(opt * 12);  // distinct-ish color per key
+            if (held) leds[li] = CRGB::White;
+            else      leds[li] = CHSV(hue, 220, keyState[r][c] ? 255 : 140);
+        }
+    }
+    // Skip the mode's own LED scheme while the overlay legend above is showing — otherwise
+    // the mode's switch(currentMode) case below (currentMode doesn't change when an overlay
+    // opens) would immediately overwrite it.
+    if(!menuOpen && s_overlay != OVERLAY_FX_PUNCH){
         switch(currentMode){
             case MODE_LIGHTPLAY: {
                 // Decay all LEDs
@@ -11389,7 +11512,7 @@ static void updateLedsAndShow()
                     uint8_t padIdx = (uint8_t)(KBD_COLS - 1 - c);
                     if (padIdx >= DRUM2_PADS) { leds[li]=CRGB::Black; continue; }
                     uint8_t hue = (uint8_t)(padIdx * 32);
-                    if (drum2View == 1) {
+                    {
                         if (r >= 2) {
                             // Rows 2+3: unified step grid, pitch-based color when offset ≠ 0
                             uint8_t step = (uint8_t)((r == 3 ? 0 : 8) + (KBD_COLS - 1 - c));
@@ -11431,15 +11554,6 @@ static void updateLedsAndShow()
                             else if (padIdx == (uint8_t)drum2SelPad) leds[li] = CHSV(hue, 200, 120);
                             else                                      leds[li] = CHSV(hue, 220,  20);
                         }
-                    } else {
-                        // Pad view: col=pad, row=velocity layers
-                        bool justHit = (now - drum2PadFlashMs[padIdx] < 80);
-                        if (keyState[r][c] || justHit)
-                            leds[li] = CHSV(hue, 180, 255);   // pressed or seq-triggered
-                        else if (padIdx == (uint8_t)drum2SelPad)
-                            leds[li] = CHSV(hue, 200,  80);   // selected pad dim glow
-                        else
-                            leds[li] = CHSV(hue, 220,  25);   // idle
                     }
                 }
                 break;
@@ -12454,7 +12568,6 @@ static inline void playI303Off(uint8_t n) {
 static inline void playDrum(uint8_t pi, float v, uint8_t pitch, float dec) {
     audioDrum2Hit(kDrum2Remap[pi], v, pitch, dec);
     midiDrum(pi, (uint8_t)constrain((int)(v * 127), 1, 127));
-    if (currentMode == MODE_DRUM2 && drum2View == 2 && pi < draniNumOverlays) draniDrumHitMs[pi] = millis();
 }
 
 // Called from audioHandlerTask (Core 1, priority 22).
@@ -12478,10 +12591,9 @@ static bool notePreviewSafeDuringFxOverlay() {
         case MODE_POKEMON: case MODE_CRUNCH: case MODE_AMBIENT: case MODE_OMNI2:
         case MODE_FELU: case MODE_PRESETS:
             return true;
-        case MODE_DRUM2: return drum2View != 1;   // PAD/ANIM views preview; SEQ view edits steps
-        // MODE_DRUMS2/DRUMS3 are sequencer-only now (no PAD/live-play view, see the
-        // user's own request) — key presses always edit steps, never preview, same as
-        // DRUM2's own SEQ view; falls through to `default: return false;` below.
+        // MODE_DRUM2/DRUMS2/DRUMS3 are all sequencer-only now (no PAD/live-play view) —
+        // key presses always edit steps, never preview; falls through to `default: return
+        // false;` below.
         case MODE_303S:  return !s303SeqView;      // PAD view previews; SEQ view edits steps
         case MODE_SS2:   return !ss2SeqView;        // PAD view previews; SEQ view edits steps
         default: return false;
@@ -12767,79 +12879,52 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             break;
         }
         case MODE_DRUM2: {
+            // Sequencer-only now (PAD/ANIM views removed) — row 0 = pick a pad "normally"
+            // (and preview it), row 1 = pick a pad "as alt" and cycle its own step modifier
+            // (NRM->50%->RND->DBL), rows 2-3 = the 16-step grid. Same scheme already ported
+            // to DRUMS2/DRUMS3 (which borrowed it from DRUM2's own PAD+SEQ views originally;
+            // this collapses DRUM2 onto that same single-view shape).
             if (!pressed) break;
-            if (drum2View == 2) {
-                // Anim view: col = drum pad trigger (one key per column)
-                uint8_t padIdx = (uint8_t)(KBD_COLS - 1 - col);
-                if (padIdx < DRUM2_PADS) {
-                    playDrum(padIdx, volume * drum2Volume[padIdx], drum2Pitch[padIdx], drum2Decay[padIdx]);
-                    drum2PadFlashMs[padIdx] = millis();
-                    drum2SelPad = (int8_t)padIdx;
-                }
-                break;
-            }
-            if (drum2View == 1) {
-                if (row >= 2) {
-                    // Rows 2+3: 16-step grid
-                    // placeMod = 0 (NRM) if pad was selected from normal row, else current alt mode
-                    uint8_t step = (uint8_t)((row == 3 ? 0 : 8) + (KBD_COLS - 1 - col));
-                    if (step >= DR2_STEPS) break;
-                    uint8_t placeMod = drum2SelFromAlt ? drum2PadAltMode[drum2SelPad] : 0;
-                    if (drum2SeqVel[drum2SelPad][step] > 0) {
-                        if (drum2SeqMod[drum2SelPad][step] == placeMod) {
-                            // Same mod → toggle OFF (remove)
-                            drum2SeqVel[drum2SelPad][step]      = 0;
-                            drum2SeqRow[drum2SelPad][step]      = 0;
-                            drum2SeqMod[drum2SelPad][step]      = 0;
-                            drum2SeqPitchOff[drum2SelPad][step] = 0;
-                        } else {
-                            // Different mod → replace, keep velocity
-                            drum2SeqMod[drum2SelPad][step] = placeMod;
-                        }
-                    } else {
-                        // Empty → place with placeMod
-                        drum2SeqVel[drum2SelPad][step]      = 100;
-                        drum2SeqRow[drum2SelPad][step]      = 2;
-                        drum2SeqMod[drum2SelPad][step]      = placeMod;
+            if (row >= 2) {
+                uint8_t step = (uint8_t)((row == 3 ? 0 : 8) + (KBD_COLS - 1 - col));
+                if (step >= DR2_STEPS) break;
+                uint8_t placeMod = drum2SelFromAlt ? drum2PadAltMode[drum2SelPad] : 0;
+                if (drum2SeqVel[drum2SelPad][step] > 0) {
+                    if (drum2SeqMod[drum2SelPad][step] == placeMod) {
+                        // Same mod → toggle OFF (remove)
+                        drum2SeqVel[drum2SelPad][step]      = 0;
+                        drum2SeqRow[drum2SelPad][step]      = 0;
+                        drum2SeqMod[drum2SelPad][step]      = 0;
                         drum2SeqPitchOff[drum2SelPad][step] = 0;
+                    } else {
+                        // Different mod → replace, keep velocity
+                        drum2SeqMod[drum2SelPad][step] = placeMod;
                     }
-                } else if (row == 1) {
-                    // Row 1: alt element row — selects pad as "alt", cycles alt mode 1→2→3→1
-                    uint8_t padIdx = (uint8_t)(KBD_COLS - 1 - col);
-                    if (padIdx >= DRUM2_PADS) break;
-                    drum2SelPad     = (int8_t)padIdx;
-                    drum2SelFromAlt = true;
-                    uint8_t cur = drum2PadAltMode[padIdx];
-                    drum2PadAltMode[padIdx] = (cur == 0 || cur >= 3) ? 1 : cur + 1;
                 } else {
-                    // Row 0: normal element row — selects pad as "normal" (NRM placement)
-                    uint8_t padIdx = (uint8_t)(KBD_COLS - 1 - col);
-                    if (padIdx >= DRUM2_PADS) break;
-                    drum2SelPad     = (int8_t)padIdx;
-                    drum2SelFromAlt = false;
-                    if (padIdx == DRUM2_CH || padIdx == DRUM2_OH) {
-                        uint8_t other = (padIdx == DRUM2_CH) ? DRUM2_OH : DRUM2_CH;
-                        amy_event stop = amy_default_event();
-                        stop.osc = DRUM_OSC_BASE + kDrum2Remap[other];
-                        stop.velocity = 0.0f;
-                        amy_add_event(&stop);
-                    }
-                    playDrum(padIdx, 0.70f * drum2Volume[padIdx],
-                             drum2Pitch[padIdx], drum2Decay[padIdx]);
-                    drum2PadFlashMs[padIdx] = millis();
+                    // Empty → place with placeMod
+                    drum2SeqVel[drum2SelPad][step]      = 100;
+                    drum2SeqRow[drum2SelPad][step]      = 2;
+                    drum2SeqMod[drum2SelPad][step]      = placeMod;
+                    drum2SeqPitchOff[drum2SelPad][step] = 0;
                 }
-            } else {
-                // Pad mode: col=7(left)=pad0(KK1) … col=0(right)=pad7(RDE)
-                // Rows vary pitch + decay (ghost/soft/normal/accent) for expressive playing
+            } else if (row == 1) {
+                // Row 1: alt element row — selects pad as "alt", cycles alt mode 1→2→3→1
                 uint8_t padIdx = (uint8_t)(KBD_COLS - 1 - col);
                 if (padIdx >= DRUM2_PADS) break;
-                drum2SelPad = (int8_t)padIdx;
-                uint8_t rv = row < KBD_NOTE_ROWS ? row : 2;
-                const Dr2RowVar& var = kDr2RowVar[rv];
-                float vel = var.vel * drum2Volume[padIdx];
-                uint8_t pitch = (uint8_t)constrain((int)drum2Pitch[padIdx] + var.pitchOff, 0, 127);
-                float dec = drum2Decay[padIdx] > 0 ? drum2Decay[padIdx] * var.decayFact : 0;
-                // Choke
+                drum2SelPad     = (int8_t)padIdx;
+                drum2SelFromAlt = true;
+                uint8_t cur = drum2PadAltMode[padIdx];
+                drum2PadAltMode[padIdx] = (cur == 0 || cur >= 3) ? 1 : cur + 1;
+            } else {
+                // Row 0: normal element row — selects pad as "normal" (NRM placement),
+                // previews it, and (REC armed + playing) quantize-records the hit — same
+                // idiom as DRUMS2/3's own row-0 (no separate PAD view to strike anymore,
+                // so this fixed "normal" velocity/row-variation replaces the old PAD view's
+                // ghost/soft/accent expressive layer).
+                uint8_t padIdx = (uint8_t)(KBD_COLS - 1 - col);
+                if (padIdx >= DRUM2_PADS) break;
+                drum2SelPad     = (int8_t)padIdx;
+                drum2SelFromAlt = false;
                 if (padIdx == DRUM2_CH || padIdx == DRUM2_OH) {
                     uint8_t other = (padIdx == DRUM2_CH) ? DRUM2_OH : DRUM2_CH;
                     amy_event stop = amy_default_event();
@@ -12847,19 +12932,19 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                     stop.velocity = 0.0f;
                     amy_add_event(&stop);
                 }
-                playDrum(padIdx, vel, pitch, dec);
+                playDrum(padIdx, 0.70f * drum2Volume[padIdx],
+                         drum2Pitch[padIdx], drum2Decay[padIdx]);
                 drum2PadFlashMs[padIdx] = millis();
-                // Quantized recording — stores row so playback matches the live hit
                 if (drum2RecArmed && drum2Playing) {
                     unsigned long stepMs = 60000UL / (unsigned long)bpm / 4;
                     unsigned long elapsed = millis() - drum2LastStepMs;
                     uint8_t nearStep = (elapsed > stepMs / 2)
                                      ? (drum2Step + 1) % DR2_STEPS
                                      : drum2Step;
-                    drum2SeqVel[padIdx][nearStep]      = (uint8_t)constrain((int)(vel * 127.f), 1, 127);
-                    drum2SeqRow[padIdx][nearStep]      = rv;
+                    drum2SeqVel[padIdx][nearStep]      = 100;
+                    drum2SeqRow[padIdx][nearStep]      = 2;
                     drum2SeqMod[padIdx][nearStep]      = 0;
-                    drum2SeqPitchOff[padIdx][nearStep] = 0;  // auto-record: no pitch offset
+                    drum2SeqPitchOff[padIdx][nearStep] = 0;
                 }
             }
             break;
@@ -13470,16 +13555,22 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             break;
         }
         case MODE_PRESETS: {
-            // Mirrors MODE_FELU's block above verbatim — same shared engine, just a
-            // different curation layer picking the algo/macros.
-            uint8_t note=noteMap.getMidiNote(row,col);
-            activeNotes[row][col]=pressed?note:0;
+            // Unlike MODE_FELU, the joystick here drives octave/instrument select (see
+            // the dedicated MODE_PRESETS joystick block in loop(), mirrors MODE_303S) —
+            // so it can't also modulate velocity on this same axis; fixed velocity instead.
+            // Release uses the note STORED in activeNotes[] at press time, not a fresh
+            // noteMap.getMidiNote() lookup — JY can shift the octave while a key is still
+            // held (that's the whole point of letting it run concurrently with play), and
+            // recomputing on release would then turn off the wrong (now-current-octave)
+            // pitch, leaving the originally-triggered voice stuck on forever.
             if(pressed){
-                float jx=constrain(cachedJoyX/64.0f,-1.0f,1.0f);
-                float vel=constrain(0.8f+jx*0.6f, 0.05f, 1.5f);
-                audioNoteOn(note, vel);
+                uint8_t note=noteMap.getMidiNote(row,col);
+                activeNotes[row][col]=note;
+                audioNoteOn(note, 1.0f);
             } else {
-                audioNoteOff(note);
+                uint8_t note=activeNotes[row][col];
+                activeNotes[row][col]=0;
+                if(note) audioNoteOff(note);
             }
             break;
         }
@@ -14240,9 +14331,15 @@ void loop() {
         // which logs its own noisy driver-level error lines on every single failure
         // (sd_diskio.cpp's "f_mount failed"/"Select Failed") — fine once, but at a fixed 1s
         // cadence it reads as an infinite error loop for as long as the card stays out.
-        // Back off progressively (capped at 5s) instead, so a prolonged absence stays quiet;
-        // reset to 1s the moment the card is either present or freshly lost, so removal/
-        // reinsertion both stay promptly detected.
+        // More importantly: each failed SD.begin() call is a genuinely BLOCKING call on
+        // this same loop() task (the one driving amy_update()/audio and all input), and the
+        // esp32-arduino core's own internal sdSelectCard()/ff_sd_status() retries inside
+        // ONE failed attempt can themselves take the better part of a second — so this was
+        // audible/visible as a periodic freeze ("le firmware bug et fait des pauses") for
+        // as long as no card was present, not just noisy logging. Back off aggressively
+        // (capped at 60s, not 5s) so a prolonged absence settles to one brief stall a
+        // minute instead of several per minute; reset to 1s the moment the card is either
+        // present or freshly lost, so removal/reinsertion both stay promptly detected.
         static uint32_t sdRetryIntervalMs = 1000;
         uint32_t nowSd = millis();
         // Skip entirely while MODE_USB has the card exposed raw to the host — this probe's
@@ -14282,7 +14379,7 @@ void loop() {
                 Serial.println("SD: card detected");
                 sdListDir(sdPath.length() > 1 ? sdPath.c_str() : "/");
             } else {
-                sdRetryIntervalMs = min(sdRetryIntervalMs + 500, (uint32_t)5000);
+                sdRetryIntervalMs = min(sdRetryIntervalMs + 5000, (uint32_t)60000);
             }
         }
     }
@@ -14366,24 +14463,27 @@ void loop() {
         if (drumSB4PressMs[kit] != 0 && !drumSB4LongFired[kit]
             && (millis() - drumSB4PressMs[kit] >= DRUMS_B4_LONGPRESS_MS)) {
             drumSB4LongFired[kit] = true;
-            drumSBankClear(kit);
+            drumSPatClear(kit);
         }
     }
 
-    // FX-punch hold poll (B2/B3 group, same idiom as above) — B1's own hold is polled
-    // alongside the existing 600ms long-press-to-menu check instead (see nearby).
+    // MODE_DRUM2 B4 long-press poll (same idiom as DRUMS2/DRUMS3 above).
+    if (currentMode==MODE_DRUM2) {
+        if (drum2B4PressMs != 0 && !drum2B4LongFired
+            && (millis() - drum2B4PressMs >= DRUM2_B4_LONGPRESS_MS)) {
+            drum2B4LongFired = true;
+            drum2PatClear();
+        }
+    }
+
+    // FX-punch hold poll — MODE_GROOVE's B2 ONLY: every other FX-capable mode now enters
+    // punch instantly on press (handleButton()'s own unified block), but GROOVE's B2 kept
+    // its own single-click=FX/double-click=Scale-Arp dispatch, so it still needs the old
+    // delayed-hold-then-poll mechanism to reach punch mode at all.
     if (s_fxBtnPressMs != 0 && !s_fxBtnLongFired
-        && (fxTriggerBtn(currentMode) == 1 || fxTriggerBtn(currentMode) == 2)
+        && currentMode == MODE_GROOVE && fxTriggerBtn(currentMode) == 1
         && (millis() - s_fxBtnPressMs >= FX_PUNCH_HOLD_MS)) {
         s_fxBtnLongFired = true;
-        fxPunchEnter();
-    }
-    // FX-punch hold poll (B1 group — OMNI/SYNTH/STONE/etc.) — shorter than the 600ms
-    // long-press-to-menu threshold below, so it always wins the race on that same timer;
-    // sets btn1Handled so the 600ms poll's own `!btn1Handled` guard skips it entirely.
-    if (btn1PressTime != 0 && !btn1Handled && fxTriggerBtn(currentMode) == 0
-        && (millis() - btn1PressTime >= FX_PUNCH_HOLD_MS)) {
-        btn1Handled = true;
         fxPunchEnter();
     }
 
@@ -14545,23 +14645,6 @@ void loop() {
                                 Serial.println("VID: bad header or wrong size");
                             }
                         }
-                    }
-                }
-            }
-            joyLongFired = true;
-        } else if (currentMode==MODE_DRUM2 && drum2View==2 && sdReady && draniBrowse) {
-            if (sdCursor < sdFileCount) {
-                if (sdFiles[sdCursor]=="..") {
-                    if (sdPath=="/") { audioAllNotesOff(); menuOpen=true; menuRow=0; menuCol=0; menuOnTabBar=true; }
-                    else { int ls=sdPath.lastIndexOf('/',sdPath.length()-2); sdListDir(ls<=0?"/":sdPath.substring(0,ls+1), isVidOrImgFile); }
-                } else if (sdFileIsDir[sdCursor]) {
-                    String np=sdPath; if(!np.endsWith("/"))np+="/"; np+=sdFiles[sdCursor];
-                    draniLoadFolder(np);
-                    if (draniRunning) {
-                        sdPath = np;
-                        draniBrowse = false;  // auto-close browser once folder is loaded
-                    } else {
-                        sdListDir(np, isVidOrImgFile);
                     }
                 }
             }
@@ -17415,10 +17498,16 @@ void loop() {
         // from closed to open over the hold, instead of sitting at one fixed value like
         // every other punch effect (Sloop's own two sweep keys work the same way: the
         // longer you hold, the further it opens).
-        if (s_overlay==OVERLAY_FX_PUNCH && s_fxPunchActiveOpt>=0 && audioReady) {
-            PunchKind pk = kPunchFx[s_fxPunchActiveOpt].kind;
-            if (pk==PUNCH_LP_SWEEP || pk==PUNCH_HP_SWEEP) {
-                float t = constrain((millis()-s_fxPunchEffStartMs)/2000.0f, 0.0f, 1.0f);  // 2s sweep
+        if (s_overlay==OVERLAY_FX_PUNCH && audioReady) {
+            // Several punch keys can be held at once now — iterate every held opt; if both
+            // sweeps happen to be held together (same FILT slot), whichever is processed
+            // last here wins for this tick, same "shared slot, last write wins" rule
+            // already accepted for ALIAS/BITCRUSH's shared wavefold gain.
+            for (uint8_t o = 0; o < 16; o++) {
+                if (!s_fxPunchHeld[o]) continue;
+                PunchKind pk = kPunchFx[o].kind;
+                if (pk!=PUNCH_LP_SWEEP && pk!=PUNCH_HP_SWEEP) continue;
+                float t = constrain((millis()-s_fxPunchStartMs[o])/2000.0f, 0.0f, 1.0f);  // 2s sweep
                 float mn = fxList[0].paramMin[0], mx = fxList[0].paramMax[0];
                 fxList[0].params[0] = (pk==PUNCH_LP_SWEEP)
                     ? mn * powf(mx/mn, t)   // LP: closed(low cut) -> open(high cut)
@@ -17834,6 +17923,32 @@ void loop() {
                 int8_t dir2=(jy2>0)?-1:1;
                 t303Oct=(int8_t)constrain(t303Oct+dir2,-3,3);
                 s303s2jOctMs=nowJ; s303s2jOctArm=true;
+            }
+        }
+
+        // PRESETS joystick: X=instrument (flat preset cycle), Y=octave (same debounced
+        // hold-scroll convention as MODE_303S/303S2 above) — runs on the main screen so
+        // notes keep playing on the key grid while the stick is moved; only active with
+        // no overlay open (OVERLAY_PRESETS' own browser already has its own JX/JY nav,
+        // OVERLAY_FX's pots take priority over the joystick while open).
+        if (currentMode==MODE_PRESETS && !menuOpen && s_overlay==OVERLAY_NONE) {
+            static unsigned long presJWvMs=0, presJOctMs=0;
+            static bool presJWvArm=false, presJOctArm=false;
+            float jxP=cachedJoyX/64.0f, jyP=cachedJoyY/64.0f;
+            unsigned long nowP=millis();
+            bool jxHP=(fabsf(jxP)>0.45f), jyHP=(fabsf(jyP)>0.45f);
+            if(!jxHP) presJWvArm=false;
+            if(!jyHP) presJOctArm=false;
+            if(jxHP && (!presJWvArm || nowP-presJWvMs>=150)){
+                int8_t dirP=(jxP>0)?1:-1;
+                uint16_t ni=(uint16_t)((presetCurIdx+(int)PRESET_COUNT+dirP)%(int)PRESET_COUNT);
+                presetApply(ni);  // main screen's header/P4-P7 readout updates live, same as MODE_303S's status line — no separate popup needed
+                presJWvMs=nowP; presJWvArm=true;
+            }
+            if(jyHP && (!presJOctArm || nowP-presJOctMs>=300)){
+                int8_t dirOP=(jyP>0)?-1:1;
+                noteMap.setOctave((int8_t)constrain(noteMap.getOctave()+dirOP,-2,1));
+                presJOctMs=nowP; presJOctArm=true;
             }
         }
 
@@ -18285,7 +18400,6 @@ void loop() {
                        || currentMode==MODE_GRANULAR2
                        || currentMode==MODE_STONE
                        || (currentMode==MODE_VID && !vidPlaying && !mediaAudioPlaying)
-                       || (currentMode==MODE_DRUM2 && drum2View==2 && draniBrowse)
                        || (currentMode==MODE_DJ && djBrowsing)
                        || (currentMode==MODE_BREAK && breakBrowsing);
         if(needsSdNav&&!menuOpen&&sdReady){
