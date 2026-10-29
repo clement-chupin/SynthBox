@@ -632,11 +632,11 @@ bool simWindowInit() {
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
     // Fullscreen window — actual resolution determined by device
-    s_win = SDL_CreateWindow("GrvEP",
+    s_win = SDL_CreateWindow("GrvEP-FUSION",
         SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
         0, 0, SDL_WINDOW_FULLSCREEN_DESKTOP);
 #else
-    s_win = SDL_CreateWindow("GrvEP Simulator",
+    s_win = SDL_CreateWindow("GrvEP-FUSION Simulator",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         WIN_W, WIN_H, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
 #endif

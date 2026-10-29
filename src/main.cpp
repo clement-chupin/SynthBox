@@ -39,7 +39,15 @@ uint8_t activeNotes[KBD_NOTE_ROWS][KBD_COLS] = {};
 SynthShape currentShape = SHAPE_JUNO_PIANO;
 EnvPreset  currentEnv   = ENV_NORMAL;
 uint8_t    arpMode      = 0;
-float      volume       = 0.7f;
+float      volume       = 0.7f;   // effective level = gVolGlobal * the mode's local level (volPotTick())
+
+// P1 (VOL) sets the device's global volume in the main menu and the current mode's own local volume
+// elsewhere; drilled into a sequencer from GEST, it sets that instrument's GEST track volume instead
+// (gestSeqVol[], the same level as P4-P7 on GEST's own screen). A local level of kVolUnity leaves the
+// global level unchanged, so with both at the boot default the pot behaves as before.
+constexpr float kVolUnity = 0.7f;
+static float gVolGlobal = 0.7f;
+static float gVolLocal[MODE_COUNT];          // filled with kVolUnity in setup()
 
 // Arp state (MODE_SYNTH)
 uint8_t arpNotes[32]   = {};  // MIDI notes currently held for arp
@@ -416,11 +424,15 @@ static int8_t        t303Oct         = 0;         // octave offset -1..+1
 // values themselves (those keep showing/storing the user's own pot position; the
 // multiplier is applied only at the point each value is actually sent to the engine, via
 // t303EffReso()/t303EffEnvMod() below). HPF dropped per user feedback ("inutile").
-#define T303_PATCH_COUNT 5
-static const char*   kT303PatchNames[T303_PATCH_COUNT]       = {"24dB", "12dB", "BPF",  "Acid", "Soft"};
-static const uint8_t kT303PatchFilterTypes[T303_PATCH_COUNT] = {FILTER_LPF24, FILTER_LPF, FILTER_BPF, FILTER_LPF24, FILTER_LPF};
-static const float   kT303PatchResoMult[T303_PATCH_COUNT]    = {1.0f, 1.0f, 1.0f, 1.4f, 0.6f};
-static const float   kT303PatchEnvModMult[T303_PATCH_COUNT]  = {1.0f, 1.0f, 1.0f, 1.35f, 0.55f};
+// DISTO (index 5): real-303-style overdrive — see t303CyclePatch()'s own comment on why
+// this engages/disengages the shared T303 voice's waveshaper (audioT303SetDisto()),
+// unlike every other patch here which only touches filter type + reso/envMod multiplier.
+#define T303_PATCH_COUNT 6
+#define T303_PATCH_DISTO 5
+static const char*   kT303PatchNames[T303_PATCH_COUNT]       = {"24dB", "12dB", "BPF",  "Acid", "Soft", "DISTO"};
+static const uint8_t kT303PatchFilterTypes[T303_PATCH_COUNT] = {FILTER_LPF24, FILTER_LPF, FILTER_BPF, FILTER_LPF24, FILTER_LPF, FILTER_LPF24};
+static const float   kT303PatchResoMult[T303_PATCH_COUNT]    = {1.0f, 1.0f, 1.0f, 1.4f, 0.6f, 1.5f};
+static const float   kT303PatchEnvModMult[T303_PATCH_COUNT]  = {1.0f, 1.0f, 1.0f, 1.35f, 0.55f, 1.4f};
 static uint8_t        t303Patch       = 0;
 static bool          t303SustainOn   = false;     // OFF=pluck (clear decay), ON=held at full amp
 static bool          t303SlideOn     = false;
@@ -453,6 +465,10 @@ static inline void t303CyclePatch() {
         // Push the new reso/envMod multiplier immediately too, so switching patches is
         // audible right away even if the user doesn't also touch the Reso/EnvMod pots.
         audioT303Params(t303Cutoff, t303EffReso(), t303EffEnvMod(), t303Decay);
+        // DISTO engages the shared T303 voice's waveshaper (see audioT303SetDisto()'s own
+        // comment) in addition to the filter/reso/envMod above — every other patch here
+        // must disengage it, since it's the same single shared node every patch shares.
+        audioT303SetDisto(t303Patch == T303_PATCH_DISTO, 16.0f, 1.0f);
     }
 }
 
@@ -533,8 +549,17 @@ static unsigned long t303SlideMs     = 0;         // glide start timestamp
 static const uint8_t kDrum2Remap[DRUM2_PADS] = {0, 2, 5, 10, 6, 9, 5, 12};
 // KK1, SN1, HHC, CLP, BNG, OHH, CHH, RDE
 static const char* kDrum2Labels[DRUM2_PADS]  = {"KK1","SN1","HHC","CLP","BNG","OHH","CHH","RDE"};
-static uint8_t       drum2Pitch[DRUM2_PADS]  = {69,69,69,69,69,69,69,69};
-static float         drum2Decay[DRUM2_PADS]  = {1000,1000,1000,1000,1000,1000,1000,1000};
+// GrvEP-fusion: these were a uniform {69,...}/{1000,...} — meaningful as "play the
+// sample basically unpitched, with a generic one-shot release tail" for AMY's PCM
+// playback (DRUM2's original engine), but with no sample playback yet (the new engine
+// synthesizes these from noise/triangle — see audio_engine.cpp's configureDrumVoice),
+// every pad got the exact same tone and a 1-second decay regardless of role, confirmed
+// directly: "les autres drums font le même son grave d'avant." Per-pad now: pitch is a
+// literal MIDI note for the two tonal pads (KK1/BNG) and a filter-cutoff/"tone" knob for
+// the rest (same convention DRUMS2/3 already uses — see config.h's DRUMS_BD comment);
+// decay is tuned per role (short/bright for hats&clap, longer for kick/ride).
+static uint8_t       drum2Pitch[DRUM2_PADS]  = {36, 70, 100, 85, 55, 92, 88, 78};
+static float         drum2Decay[DRUM2_PADS]  = {400, 180, 50, 150, 220, 350, 380, 500};
 // HHC/CHH (both mapped to kDrumPads' HH1 sample, see kDrum2Remap above) default a bit
 // louder than the rest — the raw sample reads noticeably weaker even after peak-normalize.
 static float         drum2Volume[DRUM2_PADS] = {1,1,1.6f,1,1,1,1.6f,1};
@@ -542,9 +567,21 @@ static float         drum2Volume[DRUM2_PADS] = {1,1,1.6f,1,1,1,1.6f,1};
 // back the mutable one) so EUCLI's settings-column long-press reset (euColPressLane) has
 // a stable "default" to reset TO, independent of whatever drum2Pitch/Decay/Volume have
 // been edited to since boot.
-static const uint8_t kDrum2DefaultPitch[DRUM2_PADS]  = {69,69,69,69,69,69,69,69};
-static const float   kDrum2DefaultDecay[DRUM2_PADS]  = {1000,1000,1000,1000,1000,1000,1000,1000};
+static const uint8_t kDrum2DefaultPitch[DRUM2_PADS]  = {36, 70, 100, 85, 55, 92, 88, 78};
+static const float   kDrum2DefaultDecay[DRUM2_PADS]  = {400, 180, 50, 150, 220, 350, 380, 500};
 static const float   kDrum2DefaultVolume[DRUM2_PADS] = {1,1,1.6f,1,1,1,1.6f,1};
+// DRUM2/DRUMS per-pad volume pot: a log (dB) taper, -40..0 dB, off at the very bottom —
+// linear 0..2x put the whole quiet end of the range in the pot's first few percent ("il
+// faudrait une échelle en log"). Tops out at 1x: a hit's level can't go above full
+// (audio_engine.cpp's sendDrumBlob() clamps it), so the old 1..2x half of the pot did
+// nothing audible.
+static float drumVolFromPot(float p) {
+    return p < 0.02f ? 0.0f : powf(10.0f, (p - 1.0f) * 2.0f);
+}
+static void drumVolStr(char* buf, size_t n, float v) {
+    if (v <= 0.0f) snprintf(buf, n, "OFF");
+    else snprintf(buf, n, "%+.0fdB", 20.0f * log10f(v));
+}
 // EUCLI-specific (DRUM2 has no RANDPITCH modifier): the +/- amplitude of the RANDPITCH
 // modifier's randomization, per pad. Always centered on drum2Pitch[pad] — each drum's OWN
 // base pitch, which differs per pad — never a shared/global reference pitch.
@@ -1318,6 +1355,79 @@ static EXT_RAM_ATTR GestSynsPat  g_synsPats [GEST_PATS];
 static EXT_RAM_ATTR GestSampsPat g_sampsPats[GEST_PATS];
 static bool     g_patFilled[GEST_NSEQ][GEST_PATS] = {};
 static uint8_t  gestActPat [GEST_NSEQ] = {};   // currently playing pattern per sequencer
+
+// MODE_303S2 B4 short-press pattern browser: 0=live, 1..4 -> kT303S2RealPatterns[0..3].
+// These are real, documented transcriptions of famous acid basslines (not composed here) —
+// pitch/accent/slide per step as published, source: "Famous 303 Bassline Patterns"
+// (djjondent.blogspot.com, April 2020), itself crediting the tracks' own original
+// programming. Converted to this struct's MIDI-note/T303ALT_* encoding; some steps
+// combine accent+slide (a real bitmask — T303ALT_SLIDE=0x01|T303ALT_ACCENT=0x02=0x03),
+// which the previous GEST-preset reuse never exercised since those were plain, unaccented
+// notes. seq[i] = MIDI note + 1 (0 = rest); alt[i] = T303ALT_* bits (main.cpp:1161-1163).
+static const Gest303Pat kT303S2RealPatterns[4] = {
+    // Josh Wink — "Higher State of Consciousness" (G2/G3/B2, every step accented, several
+    // slides) — one of the most recognizable acid lines in the genre.
+    { {44,56,44,44,44,44,48,44,48,44,44,48,44,44,44,48},
+      {3,2,3,3,2,2,2,2,2,3,2,2,3,3,2,2}, 16, 16 },
+    // Fast Eddie — "Acid Thunder" (x0xb0x transcription: D#2 E2 F#2 G2 C3 B2 D2, mixed
+    // slide/accent, several plain notes too — the most varied of the four).
+    { {40,40,43,41,41,41,44,44,44,49,49,48,39,39,40,40},
+      {1,0,2,1,1,0,3,1,0,1,0,0,1,0,1,0}, 16, 16 },
+    // DJ Tim & Misjah — "Access" (A2/A3, sparse rests, one accent) — Dutch-style acid classic.
+    { {46,0,46,58,46,46,46,0,46,46,58,46,0,46,46,0},
+      {0,0,0,0,2,0,0,0,0,0,0,0,0,0,0,0}, 16, 16 },
+    // New Order — "Confusion" (G1/G2/A#1/A#2, slide-only — the source patch's own Accent
+    // knob was documented at 0%, so no accent appears here, which is itself accurate).
+    { {44,44,44,44,0,32,44,0,47,0,35,35,35,47,0,35},
+      {1,1,0,0,0,0,0,0,0,0,1,0,0,0,0,0}, 16, 16 },
+};
+
+static uint32_t   s303s2B4PressMs     = 0;
+static bool       s303s2B4LongFired   = false;
+#define S303S2_B4_LONGPRESS_MS 600          // same threshold as DRUM2's own B4
+static uint8_t     s303s2B4CurPreset  = 0;
+static Gest303Pat  s303s2LiveSnap     = {};
+static bool        s303s2LiveSnapValid = false;
+
+// B4 short press: cycle live -> preset0 -> preset1 -> preset2 -> preset3 -> live -> ...
+// kT303S2RealPatterns[] is read-only factory content — never written here. The live
+// slot's own content is stashed in s303s2LiveSnap the moment it's left, and restored when
+// cycling back around, so nothing is ever lost by browsing.
+static void s303s2PatCycle() {
+    if (s303s2B4CurPreset == 0) {
+        memcpy(s303s2LiveSnap.seq, s303s2Seq, sizeof(s303s2Seq));
+        memcpy(s303s2LiveSnap.alt, s303s2Alt, sizeof(s303s2Alt));
+        s303s2LiveSnap.count = s303s2Count;
+        s303s2LiveSnap.head  = s303s2Head;
+        s303s2LiveSnapValid  = true;
+    }
+    s303s2B4CurPreset = (uint8_t)((s303s2B4CurPreset + 1) % 5);
+    const Gest303Pat* src = (s303s2B4CurPreset == 0 && s303s2LiveSnapValid)
+                            ? &s303s2LiveSnap
+                            : &kT303S2RealPatterns[s303s2B4CurPreset - 1];
+    memcpy(s303s2Seq, src->seq, sizeof(s303s2Seq));
+    memcpy(s303s2Alt, src->alt, sizeof(s303s2Alt));
+    s303s2Count = src->count;
+    s303s2Head  = src->head;
+    // Sync to the current bar position so the new pattern starts in-place, not from step
+    // 0 — same idiom GEST's own pattern-switch already uses for this exact data.
+    uint8_t qL = (s303s2Count<=1)?1:(s303s2Count<=2)?2:(s303s2Count<=4)?4:(s303s2Count<=8)?8:16;
+    s303s2Step = (uint8_t)(drum2Step % qL);
+    s303s2CurNote = 0;   // don't kill current note — sequencer's own next tick supersedes it
+}
+
+// B4 long press: exact body of the old single-press clear, unchanged, now firing on long-
+// press instead of on every press. Also resets the cycle bookkeeping back to "live" so a
+// subsequent short press doesn't resurface a preset mid-clear.
+static void s303s2PatClear() {
+    memset(s303s2Seq,0,sizeof(s303s2Seq)); memset(s303s2Alt,0,sizeof(s303s2Alt));
+    s303s2Head=0; s303s2Count=0; s303s2Step=0;
+    s303s2SyncPendingAt=0;
+    if (s303s2CurNote){ audioT303NoteOff(s303s2CurNote); s303s2CurNote=0; }
+    s303s2B4CurPreset   = 0;
+    s303s2LiveSnapValid = false;
+}
+
 static uint8_t  gestSelRow = 0;
 static uint8_t  gestSelCol = 0;
 static float    gestSeqVol [GEST_NSEQ] = {1.f,1.f,1.f,1.f};
@@ -1504,6 +1614,18 @@ static bool  djBrowsing = true;   // true = SD browser showing; false = play/tra
 // chunk decodes in the background), so play can't start immediately; checked once per loop()
 // tick (alongside audioDJTick()) and cleared the instant the load actually finishes.
 static bool  djAutoPlayPending = false;
+static String djLastDir = "/";   // the folder of the last track loaded: Browse reopens there (sdPath is shared by every browser)
+// B3 cycles the deck's play mode: 0 FWD, 1 REV (the usual transport), 2 FWD+, 3 REV+ — the
+// "+" modes play only while a cue key is held (gate): pressing a key jumps there and plays,
+// releasing the last held key pauses. Odd = backwards.
+static uint8_t djPlayMode = 0;
+static const char* const kDjPlayModeNames[4] = { "FWD", "REV", "FWD+", "REV+" };
+static inline bool djGateMode() { return djPlayMode >= 2; }
+// The cue keys held in a "+" mode, bit = cue index ((3-row)*8+col). Written by
+// handleNoteKeyAudio() (audioHandlerTask, core 0), turned into deck play/pause by loop()'s
+// djGateService() — the deck's own state is only touched from loop().
+static volatile uint32_t djGateHeld = 0;
+static void djGateService();   // defined just above loop()
 static float djLastP1   = -1.0f;  // pot-pickup baseline for speed (P1)
 
 enum PokemonType : uint8_t {
@@ -2860,6 +2982,7 @@ static EXT_RAM_ATTR uint8_t  draniOverlayBuf[DRANI_MAX_DRUMS][DRANI_FRAME_BYTES]
 static EXT_RAM_ATTR uint8_t  draniDisplayBuf[DRANI_FRAME_BYTES];
 static uint32_t draniDrumHitMs[DRANI_MAX_DRUMS] = {};
 bool    lastClick      = false;
+int     joyRestLevel   = HIGH;    // JOYSW's level when NOT pressed — measured at boot in setup()
 uint32_t joyClickMs   = 0;    // millis() when joystick click started (0=not pressed)
 bool    joyLongFired  = false; // long-click action already triggered this press
 bool    joyBrwActed   = false; // browser short-click already acted this press (blocks long-press)
@@ -2914,12 +3037,19 @@ static uint32_t s_potPopupSuppressUntilMs = 0;
 static int8_t   s_potPopupSlot = -1;              // 0..3 = P4..P7, -1 = nothing touched yet this mode
 static char     s_potPopupSlotVal[4][20] = {"","","","" };
 static float    s_potPopupLastVal[4] = {-1,-1,-1,-1};  // pots[3..6].value as of the previous loop() iteration
+// Per-iteration "which of P4-P7 genuinely moved" + "already assigned a call this
+// iteration" state — see potPopupShow()'s own comment for why a single global "biggest
+// mover" pick (the original design) breaks when the user turns two pots at once.
+static bool     s_potPopupMoved[4]        = {false,false,false,false};
+static bool     s_potPopupClaimed[4]      = {false,false,false,false};
+static bool     s_potPopupMovedComputed   = false;
+static float    s_potPopupShownVal[4]     = {-1,-1,-1,-1};  // pots[3..6].value when each slot was last written
 
 // Re-baselines the "which pot just moved" snapshot and blanks the 4 slot values — called
 // once per mode switch so a just-entered mode never shows a stale value left over from
 // whatever the previous mode's P4-P7 happened to mean.
 static inline void potPopupReset() {
-    for (int i = 0; i < 4; i++) { s_potPopupLastVal[i] = pots[3+i].value; s_potPopupSlotVal[i][0] = '\0'; }
+    for (int i = 0; i < 4; i++) { s_potPopupLastVal[i] = s_potPopupShownVal[i] = pots[3+i].value; s_potPopupSlotVal[i][0] = '\0'; }
     s_potPopupSlot = -1;
     s_potPopupUntilMs = 0;
     s_potPopupSuppressUntilMs = millis() + POT_POPUP_SUPPRESS_MS;
@@ -2929,13 +3059,59 @@ static inline void potPopupReset() {
 // not updated inside potPopupShow() itself.
 static inline void potPopupFrameTick() {
     for (int i = 0; i < 4; i++) s_potPopupLastVal[i] = pots[3+i].value;
+    s_potPopupMovedComputed = false;
 }
-static inline void potPopupShow(const char* /*label*/, const char* valueStr) {
-    int best = 0; float bestD = -1.0f;
-    for (int i = 0; i < 4; i++) {
-        float d = fabsf(pots[3+i].value - s_potPopupLastVal[i]);
-        if (d > bestD) { bestD = d; best = i; }
+
+struct CtrlLabels {
+    const char* p2; const char* p4; const char* p5; const char* p6; const char* p7;
+    const char* b1; const char* b2; const char* b3; const char* b4;
+};
+static CtrlLabels ctrlLabelsFor(AppMode m);
+static inline void potPopupShow(const char* label, const char* valueStr) {
+    // Lazily computed on the first call of this loop() iteration (pots[] has already been
+    // refreshed by readPots() by the time any mode's dispatch code runs, so this is the
+    // earliest point the real per-pot delta is known) — "moved" means genuinely nonzero
+    // since the previous iteration, not the usual mode-local threshold (~0.005-0.01), just
+    // enough margin above float noise to not treat an untouched pot as having moved.
+    if (!s_potPopupMovedComputed) {
+        for (int i = 0; i < 4; i++) {
+            s_potPopupMoved[i] = fabsf(pots[3+i].value - s_potPopupLastVal[i]) > 1e-4f;
+            s_potPopupClaimed[i] = false;
+        }
+        s_potPopupMovedComputed = true;
     }
+    // Which pot this call is for. First by its label: when exactly one of the mode's own
+    // P4-P7 labels (ctrlLabelsFor(), what the popup draws) equals the caller's label, that
+    // slot is the answer, whatever moved. Guessing from movement alone can't be right when
+    // two pots turn at once in a mode that fires every moving pot every iteration (SYNTH's
+    // rawDelta pots): the guesses swapped the two values back and forth between the cells
+    // each frame ("ça clignote ... on passe de 555hz à 36% à 1.0").
+    CtrlLabels L = ctrlLabelsFor(currentMode);
+    const char* labs[4] = {L.p4, L.p5, L.p6, L.p7};
+    bool cand[4];
+    int nMatch = 0;
+    for (int i = 0; i < 4; i++) {
+        cand[i] = label && labs[i] && strcmp(label, labs[i]) == 0;
+        if (cand[i]) nMatch++;
+    }
+    if (nMatch == 0) for (int i = 0; i < 4; i++) cand[i] = true;   // label unknown to the mode's table: any slot
+    // Several candidates (no unique label match, e.g. two "-" pots): the unclaimed one that
+    // moved the most since ITS slot was last shown (s_potPopupShownVal) — every mode fires a
+    // pot's branch once it has moved past the mode's threshold since the branch last fired,
+    // so the calling pot has the largest accumulated travel. Pots that genuinely moved this
+    // iteration first, so a mode's cold-start pickup can't pull an untouched pot forward.
+    int best = -1;
+    float bestD = -1.0f;
+    for (int pass = 0; pass < 2 && best < 0; pass++) {
+        for (int i = 0; i < 4; i++) {
+            if (!cand[i] || (nMatch != 1 && s_potPopupClaimed[i]) || (pass == 0 && !s_potPopupMoved[i] && nMatch != 1)) continue;
+            float d = fabsf(pots[3+i].value - s_potPopupShownVal[i]);
+            if (d > bestD) { bestD = d; best = i; }
+        }
+    }
+    if (best < 0) best = 0;   // every slot already claimed (>4 calls this iteration) — just don't index out of range
+    s_potPopupShownVal[best] = pots[3+best].value;
+    s_potPopupClaimed[best] = true;
     strncpy(s_potPopupSlotVal[best], valueStr, sizeof(s_potPopupSlotVal[best])-1);
     s_potPopupSlotVal[best][sizeof(s_potPopupSlotVal[best])-1] = '\0';
     if (millis() < s_potPopupSuppressUntilMs) { s_potPopupSlot = best; return; }  // data updated, stays hidden
@@ -3094,7 +3270,8 @@ static int8_t fxLastActivated = -1;
 // the effect runs on the whole mix for exactly as long as that key is held and reverts
 // cleanly on release. 8 of the 16 (the "looper" ones — loop 1/4-1/32, stutter, reverse,
 // tape stop, half speed) use a live-mix CAPTURE ring buffer with variable-rate/position
-// playback (amy_punch_*(), amy.c/amy.h — see its own comment block). The other 8 map
+// playback (audioPunch*(), audio_engine.cpp — see its own comment block). BITCRUSH/ALIAS
+// drive a crusher there too (fxPunchCrushUpdate()). The other 6 map
 // directly onto existing fxList[] entries, momentarily overriding whichever one they reuse
 // (snapshotting its prior active/params so release restores it exactly, whether that was
 // off or already independently on).
@@ -3102,7 +3279,7 @@ enum PunchKind : uint8_t {
     PUNCH_NONE = 0,
     PUNCH_LP_SWEEP, PUNCH_HP_SWEEP, PUNCH_PHONE, PUNCH_BITCRUSH,
     PUNCH_ALIAS, PUNCH_GATE, PUNCH_ECHO, PUNCH_WOBBLE,
-    // Phase 2 — the 8 "looper" effects, built on amy_punch_*() (amy.c/amy.h): a ring-buffer
+    // Phase 2 — the 8 "looper" effects, built on audioPunch*() (audio_engine.cpp): a ring-buffer
     // capture of the live post-FX mix, read back at a fixed window (LOOP/STUTTER) or a
     // variable/negative rate (REVERSE/TAPESTOP/HALFSPD) instead of going through fxList[].
     PUNCH_LOOP14, PUNCH_LOOP18, PUNCH_LOOP116, PUNCH_LOOP132,
@@ -3118,19 +3295,26 @@ static const PunchFxDef kPunchFx[16] = {
     {"ALIAS",   PUNCH_ALIAS},    {"GATE1/16", PUNCH_GATE},   {"ECHO 1/8", PUNCH_ECHO},   {"WOBBLE",   PUNCH_WOBBLE},
 };
 // True for the 8 "looper" kinds (opt 0-7) — these bypass fxList[]/punchFxSlot() entirely
-// and go straight to the amy_punch_*() ring-buffer engine instead.
+// and go straight to the audioPunch*() ring-buffer engine instead.
 static inline bool punchKindIsLooper(PunchKind k) { return k >= PUNCH_LOOP14 && k <= PUNCH_HALFSPD; }
-// 350ms read as sluggish ("je veux qu'il s'active plus rapidement") — 120ms is still well
-// above accidental-tap territory but feels immediate.
-#define FX_PUNCH_HOLD_MS 120
+// 350ms originally read as sluggish ("je veux qu'il s'active plus rapidement"), hence the
+// drop to 120ms — but that then made the quick-tap window too tight to reliably land:
+// most FX (DRIVE, REVERB, etc.) have no punch-kind equivalent at all (see punchFxSlot()),
+// so missing the 120ms window while reaching for the adjustable FX menu landed in punch
+// mode with no grid cell that does anything, and releasing reverted straight to the main
+// screen instead of ever reaching the adjustable overlay — reported as "je n'arrive pas à
+// activer et régler des FX en 303S". 300ms is a middle ground between the two complaints.
+#define FX_PUNCH_HOLD_MS 300
 static uint32_t s_fxBtnPressMs = 0;   // hold-timer for the B2/B3 FX-trigger group (see fxTriggerBtn())
 static bool     s_fxBtnLongFired = false;
+static bool     s_fxBtnFromFx = false;   // OVERLAY_FX (or its FX_MOD sub-editor) was open when the FX-trigger was pressed
+static bool     s_fxBtnPunched = false;  // a punch key was played during this FX-trigger press
 // Multiple punch keys can be held at once ("je veux pouvoir appuyer sur plusieurs FX
 // punch en même temps") — each grid opt tracks its own held state and sweep-ramp start
-// time. The looper engine (amy_punch_*()) is a singleton, so only one looper-kind opt can
+// time. The looper engine (audioPunch*()) is a singleton, so only one looper-kind opt can
 // be held at a time (s_fxPunchLooperOpt); the fxList[]-based kinds instead reference-count
-// per SLOT (not per opt), since several opts can share one slot (ALIAS/BITCRUSH both drive
-// the one wavefold gain; two sweeps could both target FILT) — the snapshot/fxOrderList
+// per SLOT (not per opt), since several opts can share one slot (two sweeps and PHONE all
+// target FILT) — the snapshot/fxOrderList
 // add is taken on the first opt to touch a slot and undone on the last one to release it.
 static bool     s_fxPunchHeld[16] = {};
 static uint32_t s_fxPunchStartMs[16] = {};   // per-opt — sweep ramp timing (LP/HP_SWEEP)
@@ -3387,7 +3571,7 @@ void applyFxEffect(uint8_t fx, bool silent = false) {
             break;
         case 4:  // Flanger — params[3] controls max_delay (5-100ms; shorter=comb, longer=chorus)
             if (!silent) Serial.printf("FX4 FLG %s lvl=%.2f dly=%.0fms\n", on?"ON":"off", on?e.params[0]:0.0f, e.params[3]);
-            config_chorus(0, on ? e.params[0] : 0.0f, (uint16_t)e.params[3], e.params[1], e.params[2]);
+            audioSetFlanger(e.params[0], e.params[1], e.params[2], e.params[3], on);
             break;
         case 5: {  // Delay — tempo-synced; param[1] = subdivision index 0..6
             uint8_t si = (uint8_t)constrain((int)roundf(e.params[1]), 0, DELAY_SUBDIV_COUNT-1);
@@ -3459,15 +3643,15 @@ void applyFxEffect(uint8_t fx, bool silent = false) {
             if (!silent) Serial.printf("FX12 COMPRESS %s thr=%.2f ratio=%.1f\n", on?"ON":"off", e.params[0], e.params[1]);
             audioSetCompressor(e.params[0], e.params[1], on);
             break;
-        case 13: {  // RES — the original ResEcho: shares AMY's own echo engine with
-                   // DELAY (config_echo) but exposes FB/Tone as knobs too.
+        case 13: {  // RES — the original ResEcho: own Delay module instance (see
+                   // audioSetResDelay()'s own comment), exposes FB/Tone as knobs too.
             uint8_t si = (uint8_t)constrain((int)roundf(e.params[3]), 0, DELAY_SUBDIV_COUNT-1);
             float dms  = 60000.0f / (float)bpm * kDelaySubdiv[si];
             dms = constrain(dms, 30.0f, 700.0f);
             if (!silent) Serial.printf("FX13 RES %s lvl=%.2f fb=%.2f tone=%.2f %s=%.0fms\n",
                           on?"ON":"off", on?e.params[0]:0.0f, e.params[1], e.params[2],
                           kDelaySubdivName[si], dms);
-            audioSetDelay(on ? e.params[0] : 0.0f, dms, e.params[1], e.params[2]);
+            audioSetResDelay(on ? e.params[0] : 0.0f, dms, e.params[1], e.params[2]);
             break;
         }
     }
@@ -3478,8 +3662,6 @@ void applyFxEffect(uint8_t fx, bool silent = false) {
 static uint8_t punchFxSlot(PunchKind kind) {
     switch (kind) {
         case PUNCH_LP_SWEEP: case PUNCH_HP_SWEEP: case PUNCH_PHONE: return 0;  // FILT
-        case PUNCH_BITCRUSH: return 9;   // BITCRS
-        case PUNCH_ALIAS:    return 8;   // REP
         case PUNCH_GATE:     return 10;  // TREMOLO
         case PUNCH_ECHO:     return 13;  // RES
         case PUNCH_WOBBLE:   return 4;   // FLANGER
@@ -3496,39 +3678,54 @@ static uint8_t punchFxSlot(PunchKind kind) {
 // should never lose track of what's already held.
 static void fxPunchEnter() {
     s_overlay = OVERLAY_FX_PUNCH; s_overlayCloseAt = 0;
+    audioPunchPrepare();  // the looper kinds' history ring — first use only, then kept
+}
+
+// BITCRUSH / ALIAS: a crusher on the final mix (audioPunchCrush()), not an fxList[] slot
+// any more — they used to be REP's wavefold at extreme gain, loud and harsh. Both can be
+// held at once: BITCRUSH = 8 bits + light decimation, ALIAS = 16 bits + ~8.8kHz rate.
+static void fxPunchCrushUpdate() {
+    bool crush = false, alias = false;
+    for (uint8_t o = 0; o < 16; o++) {
+        if (!s_fxPunchHeld[o]) continue;
+        if (kPunchFx[o].kind == PUNCH_BITCRUSH) crush = true;
+        if (kPunchFx[o].kind == PUNCH_ALIAS) alias = true;
+    }
+    audioPunchCrush(crush ? 8 : 16, alias ? 5 : (crush ? 2 : 1));
 }
 
 // Momentarily overrides fxList[punchFxSlot(kind)] with this punch effect's own settings.
 // Multiple grid keys can be held at once: each fxList[]-based opt reference-counts its
-// underlying SLOT (several opts can share one slot — ALIAS/BITCRUSH both drive the one
-// wavefold gain, two sweeps could both target FILT) — the snapshot (and fxOrderAdd, see
-// its own comment below) is taken only on the first opt to touch a given slot; later opts
-// sharing that same slot just overwrite its params (last-write-wins, same as it always has
-// been for ALIAS/BITCRUSH's shared gain — holding two sweeps together is an inherent
-// one-slot conflict, not something to engineer around). Looper-kind opts
-// (`punchKindIsLooper()`) are different: the amy_punch_*() engine is a singleton, so only
+// underlying SLOT (several opts can share one slot — two sweeps and PHONE all target
+// FILT) — the snapshot (and fxOrderAdd, see its own comment below) is taken only on the
+// first opt to touch a given slot; later opts sharing that same slot just overwrite its
+// params (last-write-wins — holding two sweeps together is an inherent one-slot
+// conflict, not something to engineer around). Looper-kind opts
+// (`punchKindIsLooper()`) are different: the audioPunch*() engine is a singleton, so only
 // ONE can be held at a time — a second looper press while one is already held is ignored.
 static void fxPunchApply(uint8_t opt) {
     if (opt >= 16 || s_fxPunchHeld[opt]) return;
     PunchKind kind = kPunchFx[opt].kind;
     s_fxPunchHeld[opt] = true;
+    s_fxBtnPunched = true;
     s_fxPunchStartMs[opt] = millis();
     if (punchKindIsLooper(kind)) {
         if (s_fxPunchLooperOpt >= 0) return;  // engine is a singleton — first looper held wins
         s_fxPunchLooperOpt = opt;
         switch (kind) {
-            case PUNCH_LOOP14:  amy_punch_loop_start((uint32_t)(60.0f  / bpm * AMY_SAMPLE_RATE)); break;
-            case PUNCH_LOOP18:  amy_punch_loop_start((uint32_t)(30.0f  / bpm * AMY_SAMPLE_RATE)); break;
-            case PUNCH_LOOP116: amy_punch_loop_start((uint32_t)(15.0f  / bpm * AMY_SAMPLE_RATE)); break;
-            case PUNCH_LOOP132: amy_punch_loop_start((uint32_t)(7.5f   / bpm * AMY_SAMPLE_RATE)); break;
-            case PUNCH_STUTTER: amy_punch_loop_start((uint32_t)(0.06f * AMY_SAMPLE_RATE)); break;  // fixed ~60ms glitch, not tempo-synced
-            case PUNCH_REVERSE:  amy_punch_reverse_start(); break;
-            case PUNCH_HALFSPD:  amy_punch_halfspeed_start(); break;
-            case PUNCH_TAPESTOP: amy_punch_tapestop_start(1.2f); break;  // ~1.2s "motor spinning down"
+            case PUNCH_LOOP14:  audioPunchLoopStart(60.0f / bpm); break;
+            case PUNCH_LOOP18:  audioPunchLoopStart(30.0f / bpm); break;
+            case PUNCH_LOOP116: audioPunchLoopStart(15.0f / bpm); break;
+            case PUNCH_LOOP132: audioPunchLoopStart(7.5f  / bpm); break;
+            case PUNCH_STUTTER: audioPunchLoopStart(0.06f); break;  // fixed ~60ms glitch, not tempo-synced
+            case PUNCH_REVERSE:  audioPunchReverseStart(); break;
+            case PUNCH_HALFSPD:  audioPunchHalfSpeedStart(); break;
+            case PUNCH_TAPESTOP: audioPunchTapeStopStart(1.2f); break;  // ~1.2s "motor spinning down"
             default: break;
         }
         return;
     }
+    if (kind == PUNCH_BITCRUSH || kind == PUNCH_ALIAS) { fxPunchCrushUpdate(); return; }
     uint8_t idx = punchFxSlot(kind);
     if (idx == 255) { s_fxPunchHeld[opt] = false; return; }  // unrecognized — grid shows it, does nothing
     FxPunchSlotState& slot = s_fxPunchSlot[idx];
@@ -3572,17 +3769,6 @@ static void fxPunchApply(uint8_t opt) {
             s_filtResByTyp[2] = fxList[0].params[1];
             lpfSmoothCut = fxList[0].params[0];
             break;
-        case PUNCH_BITCRUSH:
-            fxList[9].params[0] = 3.0f; fxList[9].params[1] = 0.0f;  // heavy crush, no extra LPF
-            break;
-        case PUNCH_ALIAS:
-            // No true decimator exists yet — REP's wavefold at a harsh threshold is the
-            // closest approximation already in the engine (see the class comment above).
-            // 0.85 (gain~1.18x) was nearly a no-op — low enough to not read as an effect
-            // at all; 0.08 (gain~12.5x) is clearly audible, same spirit as BITCRUSH's own
-            // deliberately extreme gain.
-            fxList[8].params[0] = 0.08f;
-            break;
         case PUNCH_GATE: {
             float hz = constrain((bpm / 60.0f) * 4.0f, fxList[10].paramMin[0], fxList[10].paramMax[0]);  // 1/16-note rate
             fxList[10].params[0] = hz; fxList[10].params[1] = 1.0f;  // full depth
@@ -3612,11 +3798,12 @@ static void fxPunchRevert(uint8_t opt) {
     PunchKind kind = kPunchFx[opt].kind;
     if (punchKindIsLooper(kind)) {
         if (s_fxPunchLooperOpt == opt) {
-            amy_punch_loop_stop();
+            audioPunchStop();
             s_fxPunchLooperOpt = -1;
         }
         return;
     }
+    if (kind == PUNCH_BITCRUSH || kind == PUNCH_ALIAS) { fxPunchCrushUpdate(); return; }
     uint8_t idx = punchFxSlot(kind);
     if (idx >= FX_COUNT) return;
     FxPunchSlotState& slot = s_fxPunchSlot[idx];
@@ -4350,10 +4537,6 @@ static bool pcmCleanStep(uint8_t entriesPerCall = 6) {
 // code), no separate mapping to keep in sync by hand. "-" means genuinely unused OR
 // simply not yet catalogued here — both read the same to keep this honest rather
 // than guessing; extend case-by-case as modes get audited.
-struct CtrlLabels {
-    const char* p2; const char* p4; const char* p5; const char* p6; const char* p7;
-    const char* b1; const char* b2; const char* b3; const char* b4;
-};
 
 // Real parameter name of the currently-selected FX's slot p (0-3), matching exactly
 // what the pot-dispatch code itself checks (fxList[fxSelected].paramNames[p]) before
@@ -4381,6 +4564,8 @@ static CtrlLabels ctrlLabelsFor(AppMode m) {
             const char* b4 = (m==MODE_SYNTH) ? "INSTR": "CLEAR";
             if (currentShape == SHAPE_SAW_FM)
                 return {"SHAPE", "DEPTH", "CUTOFF", "-", "-", b1, b2, b3, b4};
+            if (currentShape == SHAPE_SUPERSAW)
+                return {"SHAPE", "SPREAD", "CUTOFF", "-", "-", b1, b2, b3, b4};
             if (fxList[fxSelected].active)
                 return {"SHAPE", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), b1, b2, b3, b4};
             return {"SHAPE", "-", "-", "-", "-", b1, b2, b3, b4};
@@ -4400,8 +4585,8 @@ static CtrlLabels ctrlLabelsFor(AppMode m) {
                     "FX", "BANK", "BEAT", "OCT"};
         }
         case MODE_I303:
-            // I303's pots have no FX-routing branch at all (unlike 303S/STONE) — P4-P7
-            // always control the 303 engine directly here.
+            if (s_overlay == OVERLAY_FX && fxList[fxSelected].active)
+                return {"WAVE", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "FX", "ARP", "ENV", "WAVE"};
             return {"WAVE", "RESO", "ENVMOD", "SUSTAIN", "CUTOFF", "FX", "ARP", "ENV", "WAVE"};
         case MODE_303S: {
             // B3 is "SLD" in SEQ view (toggles a step's slide flag) and "PATCH" in PAD
@@ -4414,7 +4599,9 @@ static CtrlLabels ctrlLabelsFor(AppMode m) {
             return {"WAVE", "RESO", "ENVMOD", "DECAY", "CUTOFF", "PLAY", "FX", b3, "SEQ/PAD"};
         }
         case MODE_303S2:
-            return {"WAVE", "RESO", "ENVMOD", "DECAY", "CUTOFF", "PLAY", "FX", "PATCH", "CLEAR"};
+            if (s_overlay == OVERLAY_FX && fxList[fxSelected].active)
+                return {"WAVE", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", "PATCH", "PAT/CLR"};
+            return {"WAVE", "RESO", "ENVMOD", "DECAY", "CUTOFF", "PLAY", "FX", "PATCH", "PAT/CLR"};
         case MODE_BREAK:
             // B1/B2/B4 inert while browsing (handleButton()'s own MODE_BREAK case ignores
             // them there) — same "-" convention as MODE_DJ's own djBrowsing labels.
@@ -4539,9 +4726,9 @@ static CtrlLabels ctrlLabelsFor(AppMode m) {
             // ignores them there) — B4 is also dual-purpose (Browse vs Back).
             if (djBrowsing)
                 return {"-", "-", "-", "-", "-", "-", "-", "-", "BACK"};
-            if (fxList[fxSelected].active)
-                return {"SPEED", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", "REV", "BROWSE"};
-            return {"SPEED", "-", "-", "-", "-", "PLAY", "FX", "REV", "BROWSE"};
+            if (s_overlay == OVERLAY_FX && fxList[fxSelected].active)
+                return {"SPEED", fxParamName(0), fxParamName(1), fxParamName(2), fxParamName(3), "PLAY", "FX", kDjPlayModeNames[djPlayMode], "BROWSE"};
+            return {"SPEED", "TAILLE", "LISSE", "VIT", "SENS", "PLAY", "FX", kDjPlayModeNames[djPlayMode], "BROWSE"};   // P4-P7: the stutter; B3 = the current play mode
         default:
             return {"-", "-", "-", "-", "-", "-", "-", "-", "-"};
     }
@@ -4638,6 +4825,102 @@ void drawScreen(bool blockWait = false);  // forward-decl
 static void mod2AlgoApply();              // forward-decl
 static void feluAlgoApply();              // forward-decl
 static void presetApply(uint16_t idx);    // forward-decl
+
+// This array must have exactly MODE_COUNT entries in AppMode order — the
+// compiler silently pads any missing trailing ones with nullptr (no size
+// mismatch warning), and printf("%s", nullptr) crashes (LoadProhibited).
+// That's exactly what caused the STONE/DR2 crashes: this list hadn't been
+// extended when MODE_PCMCLEAN/STONE/DR2 were added, so switchMode() into
+// any of them printed a null string and took down Core 1.
+static const char* kVizMode[MODE_COUNT]={
+    "SYNTH","OMNI","SAMPL","LIGHT","LPLY",
+    "BATT","DIAG","MOD2","GRANU",
+    "MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303","MEDIA","LANIM",
+    "EXP","EXP2","EXP3","303S","PKMN","SERUM","GEST",
+    "PURGPCM","USB","STONE","GEST2","IMPORT","LIFE","SWARM","GEN","DJ","GRV","NOOB","EUCLI","CRUNCH","AMBIENT","NOOB2","OMNI2","BREAK","FELU","DRUMS2","DRUMS3","PRESETS"};
+
+// ==================== GLOBAL / LOCAL VOLUME ====================
+// P1's target for the current context (see gVolGlobal). The pot only takes over a target once it has
+// reached that target's stored value (soft pickup): after switching context the physical pot sits wherever
+// the previous target left it, and jumping to it would be an audible level jump.
+static const AppMode kGestSeqMode[GEST_NSEQ] = {MODE_DRUM2, MODE_303S2, MODE_SYSEQ, MODE_SS2};
+static const char*   kGestSeqNames[GEST_NSEQ] = {"DRUM", "303S", "SYNS", "SAMP"};
+static int gestDrillSeq() {
+    if (!gestDrillDown) return -1;
+    for (int i = 0; i < GEST_NSEQ; i++) if (currentMode == kGestSeqMode[i]) return i;
+    return -1;
+}
+static float* volTarget() {
+    if (menuOpen) return &gVolGlobal;
+    int gi = gestDrillSeq();
+    return gi >= 0 ? &gestSeqVol[gi] : &gVolLocal[currentMode];
+}
+
+static uint32_t s_volPopupUntilMs = 0;
+static bool     s_volCaught = true;
+
+static void volPotTick() {
+    static float* tgt = nullptr;
+    static float lastPot = -1.0f;
+    static float lastEff = -1.0f;
+    float* t = volTarget();
+    float p = pots[0].value;
+    if (t != tgt) {
+        tgt = t;
+        s_volCaught = fabsf(p - *t) < 0.02f;
+        lastPot = p;
+    } else if (fabsf(p - lastPot) > 0.008f) {
+        // Caught once the pot reaches or crosses the stored value between two readings.
+        if (!s_volCaught) s_volCaught = fabsf(p - *t) < 0.02f || (lastPot - *t) * (p - *t) <= 0.0f;
+        if (s_volCaught) *t = p;
+        lastPot = p;
+        s_volPopupUntilMs = millis() + POT_POPUP_HOLD_MS;
+    }
+    // Drilled from GEST, the sequencer plays at GEST's own local level (its track volume is in gestSeqVol[]).
+    float local = gestDrillSeq() >= 0 ? gVolLocal[MODE_GEST] : gVolLocal[currentMode];
+    float eff = gVolGlobal * local / kVolUnity;
+    if (eff != lastEff) {
+        volume = eff;
+        audioSetVolume(currentMode == MODE_POKEMON ? eff * kPokemon[pkmnSelected].gain : eff);
+        audioSetSampleVolume(eff);
+        lastEff = eff;
+    }
+}
+
+// Top banner while P1 moves: which level it sets, its value and a bar. Before pickup the bar also shows
+// the pot's position and the arrow which way to turn to reach the stored value.
+static void drawVolPopup() {
+    if (millis() >= s_volPopupUntilMs) return;
+    float* t = volTarget();
+    char lab[20], val[12];
+    int gi = gestDrillSeq();
+    if (menuOpen)     snprintf(lab, sizeof(lab), "MASTER");
+    else if (gi >= 0) snprintf(lab, sizeof(lab), "GEST %s", kGestSeqNames[gi]);
+    else              snprintf(lab, sizeof(lab), "VOL %s", kVizMode[currentMode]);
+    if (t == &gVolLocal[currentMode] && gi < 0) {
+        if (*t < 0.01f) snprintf(val, sizeof(val), "OFF");
+        else            snprintf(val, sizeof(val), "%+.0fdB", 20.0f * log10f(*t / kVolUnity));
+    } else {
+        snprintf(val, sizeof(val), "%.0f%%", *t * 100.0f);
+    }
+    if (!s_volCaught) {
+        char tmp[12]; snprintf(tmp, sizeof(tmp), "%s%s", pots[0].value < *t ? "^" : "v", val);
+        snprintf(val, sizeof(val), "%s", tmp);
+    }
+    const int h = 16;
+    oled.setDrawColor(0); oled.drawBox(0, 0, 128, h); oled.setDrawColor(1);
+    oled.drawFrame(0, 0, 128, h);
+    oled.setFont(u8g2_font_5x7_tf);
+    oled.drawStr(3, 8, lab);
+    oled.drawStr(125 - oled.getStrWidth(val), 8, val);
+    const int bx = 3, bw = 122, by = 11;
+    oled.drawFrame(bx, by, bw, 3);
+    oled.drawBox(bx, by, (int)(constrain(*t, 0.0f, 1.0f) * bw), 3);
+    if (!s_volCaught) {
+        int px = bx + (int)(constrain(pots[0].value, 0.0f, 1.0f) * (bw - 1));
+        oled.drawVLine(px, by - 2, 7);
+    }
+}
 
 void switchMode(AppMode newMode) {
     if (currentMode==MODE_USB) usbMscExit();
@@ -4894,19 +5177,7 @@ void switchMode(AppMode newMode) {
     s_overlay = OVERLAY_NONE; s_overlayCloseAt = 0;
     potPopupReset();  // new mode's P4-P7 mean something else — don't show a stale value
     currentMode=newMode;
-    { static const char* kVizMode[MODE_COUNT]={
-          "SYNTH","OMNI","SAMPL","LIGHT","LPLY",
-          "BATT","DIAG","MOD2","GRANU",
-          "MIDI","TRKR","DRUMS","SYNS","303S","SAMPS","ANIM","I303","MEDIA","LANIM",
-          "EXP","EXP2","EXP3","303S","PKMN","SERUM","GEST",
-          "PURGPCM","USB","STONE","GEST2","IMPORT","LIFE","SWARM","GEN","DJ","GRV","NOOB","EUCLI","CRUNCH","AMBIENT","NOOB2","OMNI2","BREAK","FELU","DRUMS2","DRUMS3","PRESETS"};
-      // This array must have exactly MODE_COUNT entries in AppMode order — the
-      // compiler silently pads any missing trailing ones with nullptr (no size
-      // mismatch warning), and printf("%s", nullptr) crashes (LoadProhibited).
-      // That's exactly what caused the STONE/DR2 crashes: this list hadn't been
-      // extended when MODE_PCMCLEAN/STONE/DR2 were added, so switchMode() into
-      // any of them printed a null string and took down Core 1.
-      Serial.printf("M:%s\n", newMode<MODE_COUNT?kVizMode[newMode]:"?"); }
+    Serial.printf("M:%s\n", newMode<MODE_COUNT?kVizMode[newMode]:"?");
     if (newMode < MODE_COUNT) printCtrlLabels(newMode);
     if (currentMode==MODE_VID && newMode!=MODE_VID) {
         if (vidFileOpen) { vidFile.close(); vidFileOpen=false; }
@@ -5067,6 +5338,7 @@ void switchMode(AppMode newMode) {
         if (audioReady) {
             audioT303Init(t303Cutoff, t303EffReso(), t303EffEnvMod(), t303Decay, t303AmyWave(t303Wave));
             audioT303SetFilterType(kT303PatchFilterTypes[t303Patch]);  // Init() resets to LPF24; re-apply the patch
+            audioT303SetDisto(t303Patch == T303_PATCH_DISTO, 16.0f, 1.0f);  // ditto for the DISTO patch's waveshaper
             // P2 (per-wave texture) initializes to 0% regardless of where the physical pot
             // sits — audioT303Init() doesn't touch wavefold/duty, so without this the sound
             // would keep whatever texture was last left applied. Same branches as the P2
@@ -5093,8 +5365,10 @@ void switchMode(AppMode newMode) {
         // Shared clock continues if already playing
     }
     if (newMode==MODE_303S2) {
-        // Preserve s303s2Seq/Count/Head for continuity — use B4 (clear) to start fresh
+        // Preserve s303s2Seq/Count/Head for continuity — long-press B4 (clear) to start
+        // fresh, short-press B4 to browse preset patterns (s303s2PatCycle()).
         // Do NOT reset t303Duration/t303Decay — persist the user's last settings
+        s303s2B4CurPreset = 0;  // bookkeeping only — doesn't touch s303s2Seq itself
         if (gestDrillDown) {
             // Infinite encoders: initialize the encoder position to the stored param value.
             // The user can turn immediately from the correct position — no pickup needed.
@@ -5120,6 +5394,7 @@ void switchMode(AppMode newMode) {
         if (audioReady && !gestDrillDown) {
             audioT303Init(t303Cutoff,t303EffReso(),t303EffEnvMod(),t303Decay,t303AmyWave(t303Wave));
             audioT303SetFilterType(kT303PatchFilterTypes[t303Patch]);
+            audioT303SetDisto(t303Patch == T303_PATCH_DISTO, 16.0f, 1.0f);
             // P2 (per-wave texture) initializes to 0% regardless of where the physical pot
             // sits — this mode is what actually shows as "303S" on screen (MENU_303S2;
             // MENU_303S itself isn't wired into any menu tab, so MODE_303S is unreachable —
@@ -5150,6 +5425,7 @@ void switchMode(AppMode newMode) {
         if (audioReady) {
             audioI303Init(t303Cutoff, t303EffReso(), t303EffEnvMod(), t303Decay, t303AmyWave(t303Wave));
             audioT303SetFilterType(kT303PatchFilterTypes[t303Patch]);
+            audioT303SetDisto(t303Patch == T303_PATCH_DISTO, 16.0f, 1.0f);
             float curP2=pots[1].value;
             if(t303IsSubOctWave(t303Wave)){
                 audioSW2Init(t303Cutoff, t303Reso, t303Decay, 6, t303AmyWave(t303Wave));
@@ -5358,6 +5634,7 @@ void switchMode(AppMode newMode) {
         if (audioReady && !gestDrillReturn) {
             audioT303Init(t303Cutoff, t303EffReso(), t303EffEnvMod(), t303Decay, t303AmyWave(t303Wave));
             audioT303SetFilterType(kT303PatchFilterTypes[t303Patch]);
+            audioT303SetDisto(t303Patch == T303_PATCH_DISTO, 16.0f, 1.0f);
         }
     }
     // Force immediate display update so the new mode appears without scrMs of old-mode artifact.
@@ -5398,6 +5675,7 @@ void triggerDrumSound(uint8_t idx) {
 static void dispatchMenuItem(MenuItem item) {
     menuOpen = false;
     menuOnTabBar = true;
+    gestDrillDown = false;   // picked from the menu, not drilled from GEST (VOL and the joystick return key off it)
     switch (item) {
         case MENU_SYNTH:     switchMode(MODE_SYNTH);     break;
         case MENU_OMNI:      switchMode(MODE_OMNI);      break;
@@ -6053,10 +6331,13 @@ void handleButton(uint8_t rawBtn, bool pressed) {
     // Instant punch-on-press: pressing the FX-trigger button (whichever one opens
     // OVERLAY_FX in this mode, fxTriggerBtn()) shows the punch grid IMMEDIATELY instead of
     // waiting on a hold threshold — "dès que j'appuie sur FX, c'est le menu FX punch".
-    // Releasing then classifies what happens: a QUICK release (<FX_PUNCH_HOLD_MS) switches
-    // to the normal FX menu instead (the ONLY way to reach it now, replacing the old
-    // immediate press-time toggle each mode's own dispatch used to do); holding past that
-    // and releasing reverts any still-held punches and returns to the mode's main screen.
+    // Releasing then classifies what happens by what was DONE during the press, not by its
+    // duration: if a punch key was played, revert and return to the mode's main screen;
+    // otherwise it's a plain FX-menu toggle (opens OVERLAY_FX, or closes it if it — or its
+    // FX_MOD sub-editor — was open at press time). A duration threshold here used to send
+    // every quick press to OVERLAY_FX unconditionally, so a short press from inside the FX
+    // menu just bounced FX -> punch -> FX with no way out ("je reste bloqué entre FX et FX
+    // punch"). Same fix as GrvEP (structure/HANDOFF.md there, entry AZ).
     // Covers all 3 button groups (B1/B2/B3, whichever fxTriggerBtn() reports) uniformly —
     // the per-mode dispatch further down never runs for this specific button anymore
     // (this `return`s), except MODE_GROOVE's B2, exempted below: it already decides a
@@ -6065,11 +6346,13 @@ void handleButton(uint8_t rawBtn, bool pressed) {
     if (fxTriggerBtn(currentMode) == btn && currentMode != MODE_GROOVE && !menuOpen) {
         if (pressed) {
             s_fxBtnPressMs = millis();
+            s_fxBtnFromFx = (s_overlay == OVERLAY_FX || s_overlay == OVERLAY_FX_MOD);
+            s_fxBtnPunched = false;
             fxPunchEnter();
         } else {
-            bool wasQuick = (millis() - s_fxBtnPressMs) < FX_PUNCH_HOLD_MS;
             for (uint8_t o = 0; o < 16; o++) if (s_fxPunchHeld[o]) fxPunchRevert(o);
-            s_overlay = wasQuick ? OVERLAY_FX : OVERLAY_NONE;
+            bool openFx = !s_fxBtnPunched && !s_fxBtnFromFx;
+            s_overlay = openFx ? OVERLAY_FX : OVERLAY_NONE;
             s_overlayCloseAt = 0;
             s_fxBtnPressMs = 0;
         }
@@ -6135,6 +6418,19 @@ void handleButton(uint8_t rawBtn, bool pressed) {
         } else {
             if (!drum2B4LongFired) drum2PatCycle();
             drum2B4PressMs = 0;
+        }
+        return;
+    }
+
+    // MODE_303S2 B4: same dual-purpose idiom as MODE_DRUM2's B4 above (short press =
+    // s303s2PatCycle(), long press = s303s2PatClear()).
+    if (btn==3 && currentMode==MODE_303S2 && !menuOpen) {
+        if (pressed) {
+            s303s2B4PressMs = millis();
+            s303s2B4LongFired = false;
+        } else {
+            if (!s303s2B4LongFired) s303s2PatCycle();
+            s303s2B4PressMs = 0;
         }
         return;
     }
@@ -6481,13 +6777,19 @@ void handleButton(uint8_t rawBtn, bool pressed) {
                 // loaded — otherwise there's nothing to go back TO); play view -> open
                 // the browser to pick a different track.
                 if (djBrowsing) { if (audioDJIsLoaded()) djBrowsing = false; }
-                else { djBrowsing = true; if (sdReady) sdListDir("/", isAudioFile); }
+                else { djBrowsing = true; if (sdReady) sdListDir(SD.exists(djLastDir.c_str()) ? djLastDir : String("/"), isAudioFile); }
                 break;
             }
             if (djBrowsing) break;  // B2/B3 only act once a track is loaded and playing
             // B1: play/pause (handled above, alongside LIFE/GEN/NOOB's own pause toggle).
             if (btn==1) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_FX) s_overlay=OVERLAY_FX; }  // B2: FX
-            if (btn==2) audioDJSetReverse(!audioDJGetReverse());  // B3: reverse toggle
+            if (btn==2) {  // B3: play mode FWD -> REV -> FWD+ -> REV+ (see djPlayMode)
+                const bool wasGate = djGateMode();
+                djPlayMode = (uint8_t)((djPlayMode + 1) % 4);
+                audioDJSetReverse(djPlayMode & 1);
+                if (djGateMode() && !wasGate) audioDJPlayPause(false);   // a "+" mode starts silent: the keys play it
+                djGateHeld = 0;
+            }
             break;
         case MODE_POKEMON:
             if (btn==2) { OverlayType old=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old!=OVERLAY_ENV) s_overlay=OVERLAY_ENV; }
@@ -6708,12 +7010,9 @@ void handleButton(uint8_t rawBtn, bool pressed) {
         case MODE_303S2:
             if (btn==1) { OverlayType old2=s_overlay; s_overlay=OVERLAY_NONE; s_overlayCloseAt=0; if(old2!=OVERLAY_FX) s_overlay=OVERLAY_FX; }
             if (btn==2) { t303CyclePatch(); }
-            if (btn==3) {  // B4: clear the sequence (single press — no more split-row toggle to share with)
-                memset(s303s2Seq,0,sizeof(s303s2Seq)); memset(s303s2Alt,0,sizeof(s303s2Alt));
-                s303s2Head=0; s303s2Count=0; s303s2Step=0;
-                s303s2SyncPendingAt=0;
-                if (s303s2CurNote){ audioT303NoteOff(s303s2CurNote); s303s2CurNote=0; }
-            }
+            // B4 (short press = cycle preset patterns, long press = clear) is handled
+            // earlier in this function, in its own dual-purpose-button block alongside
+            // MODE_DRUM2's B4 — see s303s2PatCycle()/s303s2PatClear().
             break;
         case MODE_BREAK:
             if (btn==2 && pressed) {  // B3: open/close the SD browser (any file, any folder)
@@ -7543,6 +7842,7 @@ void drawScreen(bool blockWait) {
         }
         oled.drawStr(0, 127, "keys=on/off hold=LFO B2=close");
         drawPotPopup();
+        drawVolPopup();
         if (s_displayTaskHandle) xTaskNotifyGive(s_displayTaskHandle);
         return;
     }
@@ -8030,8 +8330,9 @@ void drawScreen(bool blockWait) {
                 oled.setFont(u8g2_font_5x7_tf);
                 snprintf(buf,sizeof(buf),"Shape: %s", shapeNames[currentShape]);
                 oled.drawStr(0,27,buf);
-                if(currentShape==SHAPE_SAW_FM){
-                    snprintf(buf,sizeof(buf),"FM Depth: %.0f%%", pots[3].value*100);
+                if(currentShape==SHAPE_SAW_FM || currentShape==SHAPE_SUPERSAW){
+                    const char* depthLbl = (currentShape==SHAPE_SUPERSAW) ? "Spread" : "FM Depth";
+                    snprintf(buf,sizeof(buf),"%s: %.0f%%", depthLbl, pots[3].value*100);
                     oled.drawStr(0,39,buf);
                     float fmCut=500.0f*powf(16.0f,pots[4].value);
                     snprintf(buf,sizeof(buf),"Cut:%.0fHz", fmCut);
@@ -8477,15 +8778,19 @@ void drawScreen(bool blockWait) {
                     // instead of a blank waveform pane so "loading" isn't mistaken for "stuck".
                     // 20000Hz = DJ_PLAYBACK_RATE_HZ/PCM_TARGET_RATE (audio_engine.cpp's
                     // real elapsed-seconds rate for this mode, not visible here).
-                    snprintf(buf, sizeof(buf), "Chargement... %.1fs decodees",
-                             (float)audioDJGetDecodedFrames() / 20000.0f);
+                    if (uint8_t err = audioDJLoadError())
+                        snprintf(buf, sizeof(buf), "Erreur chargement (%s)",
+                                 err == KEY_ERR_FORMAT ? "format" : err == KEY_ERR_ALLOC ? "memoire" : "carte SD");
+                    else
+                        snprintf(buf, sizeof(buf), "Chargement... %.1fs decodees",
+                                 (float)audioDJGetDecodedFrames() / 20000.0f);
                     oled.drawStr(0, 36, buf);
                 }
 
                 // Transport status.
                 int tsLen = snprintf(buf, sizeof(buf), "%s  %s  x%.2f",
                          audioDJIsPlaying() ? "> PLAY" : "|| PAUSE",
-                         audioDJGetReverse() ? (audioDJIsReverseReady() ? "REV" : "REV(...)") : "FWD",
+                         (audioDJGetReverse() && !audioDJIsReverseReady()) ? "REV(...)" : kDjPlayModeNames[djPlayMode],
                          audioDJGetSpeed());
                 // Live indicator for the dynamic/experimental controls (scratch has no state
                 // to show between nudges — only stutter/granular have a visible "is it doing
@@ -11301,7 +11606,6 @@ void drawScreen(bool blockWait) {
                 break;
             }
             case MODE_GEST: {
-                static const char* kGestSeqNames[GEST_NSEQ]={"DRUM","303S","SYNS","SAMP"};
                 oled.setFont(u8g2_font_5x7_tf);
                 snprintf(buf,sizeof(buf),"GEST  %s  BPM:%d  %s",
                     gestPlayMode==GEST_LOOP?"LOOP":"LIVE", bpm, drum2Playing?"[>]":"[ ]");
@@ -11376,6 +11680,7 @@ void drawScreen(bool blockWait) {
 
         drawPotPopup();
     }
+    drawVolPopup();
 
     // sendBuffer() delegated to displayTask (Core 0) — Core 1 is not blocked.
     if (s_displayTaskHandle) xTaskNotifyGive(s_displayTaskHandle);
@@ -12557,7 +12862,12 @@ static inline void playI303Off(uint8_t n) {
     midiNoteOff(n, MIDI_CH_BASS);
 }
 static inline void playDrum(uint8_t pi, float v, uint8_t pitch, float dec) {
-    audioDrum2Hit(kDrum2Remap[pi], v, pitch, dec);
+    // GrvEP-fusion: pi (DRUM2's own logical pad 0-7: KK1/SN1/HHC/CLP/BNG/OHH/CHH/RDE),
+    // not kDrum2Remap[pi] (an AMY PCM-sample index — audio_engine.cpp's new engine
+    // doesn't play samples, so that remap doesn't mean anything to it; passing it
+    // through made SN1 and BNG land on the wrong tonal/noise index by coincidence,
+    // confirmed directly: "KK1 et SN1 font des bruits horrible").
+    audioDrum2Hit(pi, v, pitch, dec);
     midiDrum(pi, (uint8_t)constrain((int)(v * 127), 1, 127));
 }
 
@@ -13840,7 +14150,13 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             // and a scrollable list needs a cursor concept anyway). Playing: each key seeks
             // to that fraction of the track (32 cue points spread across the grid) — see
             // audioDJSeek()'s comment for why this is a real retrigger/seek, not a smooth
-            // scratch.
+            // scratch. In the "+" play modes (djPlayMode) a key plays only while held:
+            // this only records which cue keys are down, loop()'s djGateService() does the rest.
+            if (!djBrowsing && djGateMode()) {
+                const uint32_t bit = 1u << ((KBD_NOTE_ROWS - 1 - row) * KBD_COLS + col);
+                if (pressed) djGateHeld = djGateHeld | bit; else djGateHeld = djGateHeld & ~bit;
+                break;
+            }
             if (!pressed) break;
             if (djBrowsing) {
                 if (sdCursor < sdFileCount) {
@@ -13853,13 +14169,16 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
                         String np = sdPath; if (!np.endsWith("/")) np += "/"; np += sdFiles[sdCursor];
                         sdListDir(np, isAudioFile);
                     } else {
+                        djLastDir = sdPath;
                         audioLoadDJTrack(buildSdFilePath().c_str());
                         djBrowsing = false;
                         djAutoPlayPending = true;  // start playing as soon as the (async) load finishes
                     }
                 }
             } else if (audioDJIsLoaded()) {
-                audioDJSeek((float)(row * KBD_COLS + col) / 31.0f);
+                // Top-left key = the start of the track, reading order like the sequencers
+                // (physical row 0 is the BOTTOM row: (3-row)*8+col, see kTrkNoteGrid's comment).
+                audioDJSeek((float)((KBD_NOTE_ROWS - 1 - row) * KBD_COLS + col) / (float)(KBD_NOTE_ROWS * KBD_COLS - 1));
             }
             break;
         case MODE_LIFE:
@@ -14049,7 +14368,6 @@ static void handleNoteKeyAudio(uint8_t row, uint8_t col, bool pressed)
             { static uint32_t _lastMs=0; static uint8_t _lastRow=0xFF,_lastCol=0xFF;
               uint32_t _now=millis();
               if (seqIdx==_lastRow && pat==_lastCol && _now-_lastMs < 350) {
-                  static const AppMode kGestSeqMode[]={MODE_DRUM2,MODE_303S2,MODE_SYSEQ,MODE_SS2};
                   gestDrillDown=true;
                   gestDrillTarget=kGestSeqMode[seqIdx];  // main loop picks this up
                   _lastMs=0;
@@ -14228,10 +14546,20 @@ void setup() {
     pinMode(PWR_ON_EN,OUTPUT); digitalWrite(PWR_ON_EN,HIGH);
     pinMode(I2S_XSMT,OUTPUT);  digitalWrite(I2S_XSMT,HIGH);
     Serial.begin(115200);
-    Serial.println("=== GrvEP v2 ===");
+    Serial.println("=== GrvEP-FUSION (SevenistSynth_RitualMachine engine) ===");
 
     pinMode(PWR_SENSE,INPUT);
     pinMode(JOYSW,INPUT_PULLUP);
+    // The joystick click's polarity is measured, not assumed: the code used to hard-wire
+    // active-low (!digitalRead, pressed = LOW against the pull-up), but on the board this
+    // was tested on the switch is active-HIGH (an external pull-down holds it LOW at rest,
+    // measured over serial: JOYSW=0 idle, 1 pressed). Every click then fired on RELEASE —
+    // mostly unnoticed, until MODE_DJ's hold-to-stutter started by itself at rest and was
+    // stopped by pressing. Whatever level the pin rests at during boot is "not pressed"
+    // (so don't hold the click while powering on).
+    delay(5);
+    { int high = 0; for (int i = 0; i < 8; i++) { high += digitalRead(JOYSW); delayMicroseconds(200); } joyRestLevel = high >= 4; }
+    Serial.printf("Joystick click rests %s (pressed = %s)\n", joyRestLevel ? "HIGH" : "LOW", joyRestLevel ? "LOW" : "HIGH");
     pinMode(MUX_COM,INPUT);
     setup_leds();
     setupKeyboard();
@@ -14252,6 +14580,10 @@ void setup() {
     msc.onWrite(usbMscWrite);
     msc.onStartStop(usbMscStartStop);
     msc.mediaPresent(false);
+#endif
+
+#if CONFIG_TINYUSB_AUDIO_ENABLED
+    usbAudioCardBegin();  // must run before USB.begin() — see its own declaration's comment
 #endif
 
 #if CONFIG_TINYUSB_MIDI_ENABLED
@@ -14275,6 +14607,7 @@ void setup() {
     noteMap.setOctave(-1);
     for(int i=0;i<7;i++) pots[i].value=0.5f;
     pots[0].value=0.7f;  // volume
+    for (float& v : gVolLocal) v = kVolUnity;
     pots[1].value=0.5f;  // shape (mid range)
     pots[2].value=0.0f;  // envelope (Normal)
     pots[3].value=0.0f; pots[4].value=0.0f; pots[5].value=0.0f; pots[6].value=0.0f;
@@ -14293,6 +14626,31 @@ void setup() {
 
 }
 
+// MODE_DJ "+" play modes: turns the held cue keys (djGateHeld) into deck play/pause. A newly
+// pressed key jumps there and plays (the most recent press wins); releasing the key that is
+// playing hands over to another one still held, or pauses when none is left.
+static void djGateService() {
+    static uint32_t prevHeld = 0;
+    static int8_t owner = -1;                  // the cue key the deck is playing from
+    const uint32_t held = (currentMode == MODE_DJ && !djBrowsing && djGateMode() && audioDJIsLoaded()) ? djGateHeld : 0;
+    if (held == prevHeld) return;
+    const uint32_t pressedNow = held & ~prevHeld;
+    prevHeld = held;
+    const float last = (float)(KBD_NOTE_ROWS * KBD_COLS - 1);
+    if (pressedNow) {
+        owner = (int8_t)(31 - __builtin_clz(pressedNow));
+        audioDJSeek(owner / last);
+        audioDJPlayPause(true);
+    } else if (!held) {
+        owner = -1;
+        audioDJPlayPause(false);
+    } else if (owner < 0 || !(held & (1u << owner))) {
+        owner = (int8_t)(31 - __builtin_clz(held));
+        audioDJSeek(owner / last);
+        audioDJPlayPause(true);
+    }
+}
+
 // ==================== LOOP ====================
 void loop() {
     potPopupFrameTick();  // snapshot pots[] BEFORE readPots() refreshes them — see its own comment
@@ -14303,7 +14661,8 @@ void loop() {
     if (currentMode == MODE_USB) usbMscPoll();
     if (!usbMscActive) {
         audioDJTick();  // chunk-boundary prefetch/handoff — unconditional, not tied to MODE_DJ's UI being on-screen (see audioDJTick()'s own comment)
-        if (djAutoPlayPending && audioDJIsLoaded()) { djAutoPlayPending = false; audioDJPlayPause(true); }
+        if (djAutoPlayPending && audioDJIsLoaded()) { djAutoPlayPending = false; if (!djGateMode()) audioDJPlayPause(true); }
+        djGateService();
         audioSSTick();  // same, for SS2/SAMPLE's large-sample streaming voice
     }
 
@@ -14461,6 +14820,15 @@ void loop() {
         }
     }
 
+    // MODE_303S2 B4 long-press poll (same idiom as DRUM2 above).
+    if (currentMode==MODE_303S2) {
+        if (s303s2B4PressMs != 0 && !s303s2B4LongFired
+            && (millis() - s303s2B4PressMs >= S303S2_B4_LONGPRESS_MS)) {
+            s303s2B4LongFired = true;
+            s303s2PatClear();
+        }
+    }
+
     // FX-punch hold poll — MODE_GROOVE's B2 ONLY: every other FX-capable mode now enters
     // punch instantly on press (handleButton()'s own unified block), but GROOVE's B2 kept
     // its own single-click=FX/double-click=Scale-Arp dispatch, so it still needs the old
@@ -14511,7 +14879,7 @@ void loop() {
     //   Long press  → if held >=600ms, open main menu.
     //   Both can coexist: short-click navigates, and if the user KEEPS holding
     //   past 600ms, the menu opens. joyBrwActed is NOT set, so long-press is free.
-    bool click=!digitalRead(JOYSW);
+    bool click = digitalRead(JOYSW) != joyRestLevel;   // see joyRestLevel: the click's polarity differs between boards
 
     // Arm timer on press-down
     if (click && !lastClick) {
@@ -14719,16 +15087,14 @@ void loop() {
                     String np=sdPath; if(!np.endsWith("/"))np+="/"; np+=sdFiles[sdCursor];
                     sdListDir(np, isAudioFile);
                 } else {
+                    djLastDir = sdPath;
                     audioLoadDJTrack(buildSdFilePath().c_str());
                     djBrowsing = false;
                     djAutoPlayPending = true;  // start playing as soon as the (async) load finishes
                 }
-            } else if (!djBrowsing && audioDJIsLoaded()) {
-                // Stutter/glitch: press-and-hold freezes the playhead and loops a short
-                // BPM-synced window (see audioDJStutterStart()'s own comment) — release below
-                // (the existing !click reset block) resumes from the frozen position.
-                audioDJStutterStart((float)bpm);
             }
+            // Not browsing: the click is the stutter, started below only once it has been
+            // HELD for DJ_STUTTER_HOLD_MS — a quick click does nothing.
             joyLongFired = true;
         } else {
             // Any overlay left open here (FX, FX_MOD, SCALE_ARP, ...) must be explicitly
@@ -14743,6 +15109,12 @@ void loop() {
         }
     }
 
+    // MODE_DJ stutter: freezes the playhead and loops a short window (length/smoothing/rate/
+    // direction from P4-P7) while the click stays held past DJ_STUTTER_HOLD_MS; the release
+    // resumes from the frozen position.
+    if (click && joyClickMs && currentMode==MODE_DJ && !djBrowsing && !menuOpen && audioDJIsLoaded()
+        && !audioDJIsStuttering() && millis() - joyClickMs >= DJ_STUTTER_HOLD_MS)
+        audioDJStutterStart((float)bpm);
     if (!click && lastClick && currentMode==MODE_DJ && !djBrowsing) audioDJStutterEnd();
     if (!click) { joyClickMs = 0; joyLongFired = false; joyBrwActed = false; }
     lastClick=click;
@@ -14869,17 +15241,6 @@ void loop() {
             if (p.hat   & stepBit) audioPlayDrumPad(bank.hatPad, constrain(0.5f*omniRhythmVol, 0.05f, 1.3f));
             if (p.perc  & stepBit) audioPlayDrumPad(p.percPad, constrain(0.75f*omniRhythmVol, 0.05f, 1.3f)); // style-specific: clap/ride/bongo
             omniRhythmStep = (uint8_t)((omniRhythmStep + 1) % OMNI_RHYTHM_STEPS);
-        }
-    }
-
-    // ---- SYNTH JOYSTICK (pitch bend only) ----
-    if(currentMode==MODE_SYNTH&&!menuOpen){
-        static float ljy=99;
-        float jy=cachedJoyY/64.0f;
-        if(fabsf(jy-ljy)>0.03f){
-            float bend=(fabsf(jy)<0.15f)?0:-jy;
-            audioSetPitchBend(powf(2.0f,bend*2.0f/12.0f));
-            ljy=jy;
         }
     }
 
@@ -16070,17 +16431,8 @@ void loop() {
         readPots();
         s_battVSmooth += (muxCache[1] / 4095.0f * 10.4f - s_battVSmooth) * 0.05f;
 
-        // Pot 0 = Volume (always)
-        static float lv=-1;
-        volume=pots[0].value;
-        if(fabsf(volume-lv)>0.01f){
-            float effVol = (currentMode == MODE_POKEMON)
-                         ? volume * kPokemon[pkmnSelected].gain
-                         : volume;
-            audioSetVolume(effVol);
-            audioSetSampleVolume(volume);
-            lv=volume;
-        }
+        // Pot 0 = Volume: global in the main menu, the mode's own level elsewhere
+        volPotTick();
 
         // Pot 1 (P2) = Pokémon selection in MODE_POKEMON
         if (currentMode == MODE_POKEMON) {
@@ -16128,10 +16480,16 @@ void loop() {
                 if (fabsf(pots[3+gi].value - lpGestPots[gi]) > 0.002f) {
                     gestSeqVol[gi] = pots[3+gi].value;
                     lpGestPots[gi] = pots[3+gi].value;
-                    char lblGest[10], potBufGest[12];
-                    snprintf(lblGest,sizeof(lblGest),"SEQVOL%d",gi+1);
-                    snprintf(potBufGest,sizeof(potBufGest),"%.0f%%",gestSeqVol[gi]*100.0f);
-                    potPopupShow(lblGest,potBufGest);
+                    // No potPopupShow() here — GEST already has its own permanent, always-
+                    // visible status line ("P4=D:x% P5=3:x% P6=S:x% P7=A:x%", drawn at
+                    // y=89) showing all 4 volumes continuously. The generic transient
+                    // popup's own footprint (y=84..128) overlapped that same region, so
+                    // touching a pot made the popup's differently-laid-out "4 corner
+                    // cells + gauge" view clear and replace the status line for ~700ms
+                    // before it reappeared — reported as "l'affichage du popup est buggé,
+                    // un potard affecte plusieurs valeurs en même temps" (touching one pot
+                    // visually disturbed the other 3 numbers, which were only ever a
+                    // rendering collision, not an actual value change).
                 }
             }
         }
@@ -16197,66 +16555,89 @@ void loop() {
             switch(currentMode){
                 case MODE_SYSEQ:  // SYSEQ uses same pot layout as SYNTH (shape/FX/env)
                 case MODE_SYNTH: {
-                    static float lp1=0.5f, lp2=-1, lp3fm=-1, lp4fm=-1;  // lp1=0.5 matches initial pots[1] so J:PNO default is not overridden on first loop
+                    static float lp1=0.5f;  // lp1=0.5 matches initial pots[1] so J:PNO default is not overridden on first loop
+                    // SYNTH's own applied cutoff/resonance/FM-depth — tracked here (not
+                    // derived from pots[].value) and adjusted by rawDelta (this frame's
+                    // relative rotation), the same convention fxPotDeltaApply() already
+                    // uses for FX params. The old "map the pot's absolute accumulated
+                    // position straight onto the parameter" design made a pot's first touch
+                    // after a shape change snap the sound to wherever that position happened
+                    // to sit, unrelated to the shape's own actual cutoff/reso/depth —
+                    // reported directly: "quand je touche aux potards des instruments, je
+                    // veux que ça règle relativement la valeur initialisée, pas que ça fasse
+                    // un saut la première fois que j'y touche". Seeded from
+                    // audioGetShapeDefaults() at boot and re-synced on every shape change, so
+                    // the first touch after switching shapes starts from THAT shape's own
+                    // real baseline, not the pot's unrelated position.
+                    static float synCutoffHz=2000.0f, synReso=1.5f, synFmDepth=0.6f;
+                    static bool synInit=false;
+                    if(!synInit){ audioGetShapeDefaults(currentShape,&synCutoffHz,&synReso,&synFmDepth); synInit=true; }
                     // Pot 1 = Shape (always)
                     if(fabsf(pots[1].value-lp1)>0.01f){
                         uint8_t si=(uint8_t)(pots[1].value*((uint8_t)SHAPE_COUNT-0.01f));
                         if(si!=currentShape){
                             currentShape=(SynthShape)si;
                             audioSetShape(currentShape);
-                            // Baseline at current pot position — don't force immediate FM update
-                            lp2=pots[2].value; lp3fm=pots[3].value; lp4fm=pots[4].value;
+                            audioGetShapeDefaults(currentShape,&synCutoffHz,&synReso,&synFmDepth);  // re-sync to the NEW shape's own baseline
                             Serial.printf("SHAPE->%s\n",shapeNames[currentShape]);
                         }
                         lp1=pots[1].value;
                     }
-                    if(currentShape==SHAPE_SAW_FM){
-                        // Pots 3-5: FM depth / filter cutoff / resonance (pot2=BPM now) —
-                        // real, always-on controls regardless of FX state, so they get the
-                        // same pot popup as everywhere else (previously silent — the only
-                        // SYNTH pots that did something outside the FX-active branch).
-                        // coldStartSynFm covers the (unlikely but possible) case where SYNTH
-                        // is entered with SAW_FM already the current shape before lp3fm/lp4fm
-                        // were ever synced this boot — see MODE_EXP's own comment on this
-                        // guard for why both branches firing at once needs explicit handling.
-                        bool coldStartSynFm = (lp3fm < 0.0f);
+                    if(currentShape==SHAPE_SAW_FM || currentShape==SHAPE_SUPERSAW){
+                        // Pots 3-5: depth(FM mod index / supersaw detune+unison spread) /
+                        // filter cutoff / resonance (pot2=BPM now) — real, always-on controls
+                        // regardless of FX state, so they get the same pot popup as
+                        // everywhere else. SUPERSAW shares this branch with SAW_FM (not the
+                        // generic cutoff/reso-only one below): it already runs through the
+                        // same N_OSCX node (OSCX_SSAW, set in audioSetShape()) with its own
+                        // TIMBRE(detune spread)/MORPH(centre voice -> full unison) params —
+                        // audioSetFmParams() already writes both from one `depth` value
+                        // uniformly regardless of which OSCX_ENGINE is active.
+                        // Known, accepted residual: synFmDepth is seeded from TIMBRE's own
+                        // native baseline (audioGetShapeDefaults()), but audioSetFmParams()
+                        // couples TIMBRE and MORPH to that same value — SAW_FM/SUPERSAW's
+                        // actual native MORPH baseline differs from TIMBRE's (e.g. SAW_FM:
+                        // timbre=20000, morph=12000), so DEPTH's first touch still produces
+                        // a small, bounded jump in MORPH specifically (unlike CUTOFF, which
+                        // is exact) — verified via direct audio measurement. Decoupling
+                        // TIMBRE/MORPH to remove this entirely would also change the "more
+                        // dramatic DEPTH range" character fixed earlier this session;
+                        // left as a known trade-off rather than reworked.
+                        const char* depthLabel = (currentShape==SHAPE_SUPERSAW) ? "SPREAD" : "DEPTH";
                         bool fmChanged=false;
-                        if(fabsf(pots[3].value-lp3fm)>0.005f) {
-                            lp3fm=pots[3].value; fmChanged=true;
-                            if (!coldStartSynFm) { char vb[8]; snprintf(vb,sizeof(vb),"%.0f%%",pots[3].value*100.0f); potPopupShow("DEPTH",vb); }
+                        if (fabsf(pots[3].rawDelta) > 0.0001f) {
+                            synFmDepth = constrain(synFmDepth + pots[3].rawDelta, 0.0f, 1.0f);
+                            fmChanged = true;
+                            char vb[8]; snprintf(vb,sizeof(vb),"%.0f%%",synFmDepth*100.0f); potPopupShow(depthLabel,vb);
                         }
-                        if(fabsf(pots[4].value-lp4fm)>0.005f) {
-                            lp4fm=pots[4].value; fmChanged=true;
-                            float cutoffHz = 500.0f * powf(16.0f, pots[4].value);
-                            if (!coldStartSynFm) { char vb[8]; snprintf(vb,sizeof(vb),"%.0fHz",cutoffHz); potPopupShow("CUTOFF",vb); }
+                        if (fabsf(pots[4].rawDelta) > 0.0001f) {
+                            float n = logf(synCutoffHz/500.0f)/logf(16.0f);   // 500..8000 Hz exp, same curve as before
+                            n = constrain(n + pots[4].rawDelta, 0.0f, 1.0f);
+                            synCutoffHz = 500.0f * powf(16.0f, n);
+                            fmChanged = true;
+                            char vb[8]; snprintf(vb,sizeof(vb),"%.0fHz",synCutoffHz); potPopupShow("CUTOFF",vb);
                         }
                         if(fmChanged){
-                            float depth  = pots[3].value;
-                            float cutoff = 500.0f * powf(16.0f, pots[4].value);  // 500..8000 Hz exp
-                            audioSetFmParams(depth, cutoff, 2.0f);
+                            // synReso here matches whatever audioGetShapeDefaults() read back
+                            // from this shape's own kShapeTable entry (was hardcoded 2.0f,
+                            // which for SAW_FM's actual res=8000 baseline is really ~1.73 —
+                            // a small but real mismatch that would've shown up as the
+                            // filter's resonant peak shifting the instant a DEPTH/CUTOFF pot
+                            // was first touched, even with the depth/cutoff values
+                            // themselves correctly preserved).
+                            audioSetFmParams(synFmDepth, synCutoffHz, synReso);
                         }
                     } else {
                         // Pots 3-6 = active FX params
                         if(fxList[fxSelected].active){
                             applyFxPots(fxSelected);
                         } else {
-                            // No FX, not SAW_FM: P4-P7 genuinely control nothing (see
-                            // ctrlLabelsFor's own "-" for this state) — but turning one
-                            // should still confirm the touch with a neutral popup instead
-                            // of total silence, per the user's own request. Shows the raw
-                            // 0-100% pot position under "-" (matching ctrlLabelsFor), no
-                            // audio change at all.
-                            static float lpInert[4] = {-1,-1,-1,-1};
-                            bool coldStartInert = (lpInert[0] < 0.0f);
-                            for (int p = 0; p < 4; p++) {
-                                if (fabsf(pots[3+p].value - lpInert[p]) > 0.01f) {
-                                    lpInert[p] = pots[3+p].value;
-                                    if (!coldStartInert) {
-                                        char vb[8]; snprintf(vb,sizeof(vb),"%.0f%%",pots[3+p].value*100.0f);
-                                        potPopupShow("-", vb);
-                                    }
-                                }
-                            }
+                            // No FX, not SAW_FM/SUPERSAW: P4-P7 control nothing, the shape keeps its own
+                            // kShapeTable filter. They used to set that filter's cutoff/reso, but labelled
+                            // CUTOFF/RESO with no FX on it read as a FILT FX left active ("ça indique par
+                            // défaut cutoff et reso, comme si un filtre était activé alors que non").
+                            for (int p = 0; p < 4; p++)
+                                if (fabsf(pots[3+p].rawDelta) > 0.0001f) potPopupShow("-", "-");
                         }
                     }
                     break;
@@ -16291,21 +16672,30 @@ void loop() {
                         djLastP1 = pots[1].value;
                         audioDJSetSpeed(0.25f * powf(16.0f, pots[1].value));
                     }
-                    if (fxList[fxSelected].active) {
+                    // P4-P7 = the stutter's settings (held joystick click, see DJ_STUTTER_HOLD_MS):
+                    // the deck has no other use for them. The active FX's params only take them
+                    // over while the FX menu itself is open, so the FX stays adjustable here.
+                    if (s_overlay == OVERLAY_FX && fxList[fxSelected].active) {
                         applyFxPots(fxSelected);
                     } else if (!djBrowsing) {
-                        // No FX, and not in the file browser (where P4-P7 aren't shown at
-                        // all — see ctrlLabelsFor's own djBrowsing case): neutral touch-
-                        // confirmation popup, same as MODE_SYNTH's own inert case.
-                        static float lpInertDj[4] = {-1,-1,-1,-1};
-                        bool coldStartInertDj = (lpInertDj[0] < 0.0f);
+                        static const float kDjStutBeats[] = { 0.125f, 0.25f, 0.5f, 1.0f, 2.0f, 4.0f };
+                        static const char* const kDjStutNames[] = { "1/32", "1/16", "1/8", "1/4", "1/2", "1" };
+                        static float lpStut[4] = {-1,-1,-1,-1};
+                        bool coldStartStut = (lpStut[0] < 0.0f);
+                        int div = (int)(pots[3].value * 5.999f);              // P4: length, BPM-synced (a fraction of a beat)
+                        float smooth = pots[4].value;                          // P5: crossfade at the loop's seam
+                        float rate = 0.5f * powf(4.0f, pots[5].value);         // P6: x0.5..x2 the deck speed, centre = x1
+                        bool rev = pots[6].value >= 0.5f;                      // P7: forward / backward
+                        audioDJSetStutterParams(60.0f / fmaxf((float)bpm, 1.0f) * kDjStutBeats[div] / 4.0f, smooth, rate, rev);
                         for (int p = 0; p < 4; p++) {
-                            if (fabsf(pots[3+p].value - lpInertDj[p]) > 0.01f) {
-                                lpInertDj[p] = pots[3+p].value;
-                                if (!coldStartInertDj) {
-                                    char vb[8]; snprintf(vb,sizeof(vb),"%.0f%%",pots[3+p].value*100.0f);
-                                    potPopupShow("-", vb);
-                                }
+                            if (fabsf(pots[3+p].value - lpStut[p]) > 0.01f) {
+                                lpStut[p] = pots[3+p].value;
+                                if (coldStartStut) continue;
+                                char vb[12];
+                                if (p == 0)      potPopupShow("TAILLE", kDjStutNames[div]);
+                                else if (p == 1) { snprintf(vb, sizeof(vb), "%.0f%%", smooth * 100.0f); potPopupShow("LISSE", vb); }
+                                else if (p == 2) { snprintf(vb, sizeof(vb), "x%.2f", rate); potPopupShow("VIT", vb); }
+                                else             potPopupShow("SENS", rev ? "ARRIERE" : "AVANT");
                             }
                         }
                     }
@@ -16459,6 +16849,18 @@ void loop() {
                     break;
                 }
                 case MODE_303S2: {
+                    // FX overlay open: pots 3-6 adjust the selected FX's params, same
+                    // guard MODE_303S already has — this mode was missing it entirely
+                    // (confirmed directly: without this check, P4-P7 always drove
+                    // Reso/EnvMod/Duration/Cutoff below even with the FX overlay open,
+                    // so an FX could never actually be dialed in here).
+                    if (s_overlay == OVERLAY_FX) {
+                        if (fxList[fxSelected].active) {
+                            applyFxPots(fxSelected);
+                        }
+                        for (int p = 0; p < 4; p++) lp303[p] = pots[3+p].value;
+                        break;
+                    }
                     // Same pots as 303S
                     {
                         if(fabsf(pots[1].value-g_lp303s2wf)>0.005f){
@@ -16515,6 +16917,17 @@ void loop() {
                     break;
                 }
                 case MODE_I303: {
+                    // FX overlay open: pots 3-6 adjust the selected FX's params — same
+                    // guard MODE_303S already has, missing here entirely (same bug as
+                    // MODE_303S2 above: without it, P4-P7 always drove Reso/EnvMod/
+                    // Sustain/Cutoff below, so an FX could never actually be adjusted).
+                    if (s_overlay == OVERLAY_FX) {
+                        if (fxList[fxSelected].active) {
+                            applyFxPots(fxSelected);
+                        }
+                        for (int p = 0; p < 4; p++) lp303[p] = pots[3+p].value;
+                        break;
+                    }
                     // P2: same wave texture as 303S (PINK: no effect)
                     {
                         static float lpI303wf=-1.0f;
@@ -16588,9 +17001,9 @@ void loop() {
                         char pb[20]; snprintf(pb,sizeof(pb),"%.0fms",drum2Decay[drum2SelPad]); potPopupShow("DECAY",pb);
                     }
                     if(fabsf(pots[5].value-lpD2[2])>0.004f){
-                        drum2Volume[drum2SelPad]=pots[5].value*2.0f;  // 0-2x headroom, see GEST2's own comment
+                        drum2Volume[drum2SelPad]=drumVolFromPot(pots[5].value);
                         lpD2[2]=pots[5].value;
-                        char pb[20]; snprintf(pb,sizeof(pb),"%.0f%%",drum2Volume[drum2SelPad]*100.0f); potPopupShow("VOLUME",pb);
+                        char pb[20]; drumVolStr(pb,sizeof(pb),drum2Volume[drum2SelPad]); potPopupShow("VOLUME",pb);
                     }
                     break;
                 }
@@ -16623,9 +17036,9 @@ void loop() {
                         char pb[20]; snprintf(pb,sizeof(pb),"%.0fms",drumSDecay[kit][sp]); potPopupShow("DECAY",pb);
                     }
                     if(fabsf(pots[5].value-lpDs[kit][2])>0.004f){
-                        drumSVolume[kit][sp]=pots[5].value*2.0f;
+                        drumSVolume[kit][sp]=drumVolFromPot(pots[5].value);
                         lpDs[kit][2]=pots[5].value;
-                        char pb[20]; snprintf(pb,sizeof(pb),"%.0f%%",drumSVolume[kit][sp]*100.0f); potPopupShow("VOLUME",pb);
+                        char pb[20]; drumVolStr(pb,sizeof(pb),drumSVolume[kit][sp]); potPopupShow("VOLUME",pb);
                     }
                     break;
                 }
@@ -17487,12 +17900,13 @@ void loop() {
             // Several punch keys can be held at once now — iterate every held opt; if both
             // sweeps happen to be held together (same FILT slot), whichever is processed
             // last here wins for this tick, same "shared slot, last write wins" rule
-            // already accepted for ALIAS/BITCRUSH's shared wavefold gain.
+            // already accepted for any two punch keys sharing one fxList[] slot.
             for (uint8_t o = 0; o < 16; o++) {
                 if (!s_fxPunchHeld[o]) continue;
                 PunchKind pk = kPunchFx[o].kind;
                 if (pk!=PUNCH_LP_SWEEP && pk!=PUNCH_HP_SWEEP) continue;
-                float t = constrain((millis()-s_fxPunchStartMs[o])/2000.0f, 0.0f, 1.0f);  // 2s sweep
+                // One bar (4 beats) at the current tempo — 2s at 120 BPM.
+                float t = constrain((millis()-s_fxPunchStartMs[o])*bpm/240000.0f, 0.0f, 1.0f);
                 float mn = fxList[0].paramMin[0], mx = fxList[0].paramMax[0];
                 fxList[0].params[0] = (pk==PUNCH_LP_SWEEP)
                     ? mn * powf(mx/mn, t)   // LP: closed(low cut) -> open(high cut)
@@ -18374,9 +18788,26 @@ void loop() {
         }
 
         // Global pitch bend via JY — SYNTH / HYBRID (MODULAR/MOD2 handle it themselves)
+        // This was the ONLY code path actually reaching the speaker: a second, separate
+        // "SYNTH JOYSTICK (pitch bend only)" block used to sit much earlier in loop(), gated
+        // the same way (currentMode==MODE_SYNTH && !menuOpen) — since this one runs later in
+        // the same loop() iteration, unconditionally (no change-detection gate), it silently
+        // clobbered whatever the earlier block had just set, every single frame. Fixing the
+        // earlier block's own range (reported: "mon bend maximum atteint la note +2 au lieu
+        // de la note +1") had no audible effect for exactly that reason — removed the dead
+        // duplicate rather than fixing two copies of the same thing.
         if((currentMode==MODE_SYNTH||currentMode==MODE_MOD2)&&!menuOpen&&audioReady&&s_overlay!=OVERLAY_INSTR){
             float jy=cachedJoyY/64.0f;
-            float bend=(fabsf(jy)<0.15f)?0.0f:-jy*2.0f;  // ±2 semitones, centre deadzone
+            // SYNTH: +-1 semitone (reported too wide at the old +-2 for every mode here).
+            // MOD2 untouched (+-2) — the user only asked about SYNTH specifically; nothing
+            // reported MOD2's own range as a problem.
+            float maxSemis = (currentMode==MODE_SYNTH) ? 1.0f : 2.0f;
+            float bend=(fabsf(jy)<0.15f)?0.0f:-jy*maxSemis;
+            // jy isn't clamped upstream (getJoyY()'s calibration assumes +-64 at full
+            // deflection, but real joystick travel/calibration drift can overshoot that on a
+            // given unit) — clamped here so the bend genuinely can't exceed maxSemis
+            // regardless of the raw reading.
+            if (bend > maxSemis) bend = maxSemis; else if (bend < -maxSemis) bend = -maxSemis;
             audioSetPitchBend(powf(2.0f,bend/12.0f));
         }
 

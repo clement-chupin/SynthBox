@@ -351,7 +351,15 @@ public:
         // interpolated linearly in between, which moves smoothly (no stepping). Anything that is not close to a straight line over the block
         // (audio-rate FM of the cutoff, sample & hold) is detected and keeps the exact per-sample computation.
         bool glide = false;
-        const bool moving = mc || prev != cut_s_;
+        // mc non-null only means a cutoff-mod cable is CONNECTED, not that it's actually
+        // changing this block — a sustained envelope holds flat for most of a note's
+        // life, same case Osc's own cv/mp inputs already guard with an endpoint check
+        // (varying = ... cv[0] != cv[n-1]). Filter lacked that: any node with a permanent
+        // ENV->FLT_CUTOFF cable (buildMainGraph's filter-envelope coupling, present for
+        // all 35 SYNTH shapes) took the expensive per-sample coefs() path for a note's
+        // entire sustain, not just its attack/decay — measured on ESP32-S3 at 1517us for
+        // an 8-voice block against a 725.6us budget, over 2x over, purely from this.
+        const bool moving = (mc && mc[0] != mc[frames - 1]) || prev != cut_s_;
         if (!moving) {
             coefs(c, pitch_to_inc(cut_s_, a4_));
         } else {

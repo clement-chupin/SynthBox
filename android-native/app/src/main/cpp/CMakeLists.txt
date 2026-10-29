@@ -52,6 +52,7 @@ file(GLOB U8G2_SOURCES "${U8G2_CLIB}/*.c")
 set(GRVEP_SOURCES
     "${GRVEP_ROOT}/src/main.cpp"
     "${GRVEP_ROOT}/src/audio_engine.cpp"
+    "${GRVEP_ROOT}/src/smp_import.cpp"
     "${GRVEP_ROOT}/src/NoteMap.cpp"
 )
 

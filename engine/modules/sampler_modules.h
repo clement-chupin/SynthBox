@@ -60,6 +60,13 @@ struct PadBlob {
     int32_t tail = 0;                           // fade after a stop, in samples
     q15 gain_l = 0, gain_r = 0;                 // level x pan
     float a1 = 1.0f, a2 = 0.0f, a3 = 0.0f, k = 1.0f;   // low-pass SVF coefficients (dsp/svf.h, SvfCoefF), filter = 1
+    // GrvEP-fusion addition (not in the upstream engine): 1 = play backwards (from `start` when > 0, else from the end). A blob
+    // re-sent while the pad sounds updates `tune` and `reverse` live on its voice (MODE_DJ's speed fader and scratch, see
+    // Sampler::set_live()); every other field still only applies at the next push.
+    uint8_t reverse = 0;
+    // GrvEP-fusion addition: > 0 = an exponential decay from the start, -60 dB after this many output samples, when the voice is
+    // freed — the drum modes' Decay (their samples loop a sustained body, this gives the length). 0 = none.
+    int32_t decay = 0;
 };
 // A push from the pads' sequencer (engine/core/sequencer.h PadSeqEvent, by set_blob: its size tells it from a PadBlob): the pad starts
 // at once whatever its grid setting says, at (level + 1) / 16 of its level; a Toggle pad starts too (it is not switched off by the

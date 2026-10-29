@@ -67,6 +67,7 @@ file(GLOB_RECURSE ENGINE_SOURCES
 set(GRVEP_SOURCES
     ${ROOT}/src/main.cpp
     ${ROOT}/src/audio_engine.cpp
+    ${ROOT}/src/smp_import.cpp
     ${ROOT}/src/NoteMap.cpp
     # Replaced: keyboard.cpp, mux.cpp, oled.cpp, Leds.cpp, midi_usb.cpp
 )

@@ -1,9 +1,17 @@
-# GrvEP
+# GrvEP-fusion
 
-- **Exécutable Windows prêt à l'emploi** : [releases/GrvEP-windows.exe](releases/GrvEP-windows.exe) — aucune installation, double-clic pour lancer.
-- **Exécutable Linux prêt à l'emploi** : [releases/GrvEP-linux](releases/GrvEP-linux) — nécessite SDL2 installé (`apt install libsdl2-2.0-0` sur Debian/Ubuntu), `chmod +x` puis lancer.
-- **APK Android** : [releases/GrvEP.apk](releases/GrvEP.apk) — non signé, `adb install -r` ou activer les sources inconnues.
-- **Vidéo de présentation** : [Instagram](https://www.instagram.com/p/DdB59hfBGcy/)
+> **Fork de [GrvEP](https://github.com/clement-chupin/SynthBox), en cours de fusion avec le
+> moteur DSP (graphe, pas event-based) d'un projet d'ami, `SevenistSynth_RitualMachine`,
+> pour le même matériel.** Le but : garder l'UI/UX de GrvEP, remplacer AMY mode par mode
+> par ce nouveau moteur, en profitant de son contenu bien plus riche (Mutable Instruments
+> Braids/Plaits, filtres/saturations supplémentaires, FX inédits...). **Migration en
+> cours, pas terminée** — voir `~/.claude/plans/mutable-nibbling-melody.md` pour le plan
+> détaillé et l'état exact de chaque mode. Les deux moteurs tournent actuellement en
+> parallèle (audio mixé, voir [CLAUDE.md](CLAUDE.md)). Pas encore de binaires de release
+> propres à ce fork (`releases/` ci-dessous vient encore de GrvEP d'origine) — build depuis
+> les sources pour l'instant.
+
+- **Vidéo de présentation (projet d'origine)** : [Instagram](https://www.instagram.com/p/DdB59hfBGcy/)
 
 ![GrvEP](./images/image.png)
 
@@ -24,12 +32,12 @@ contexte projet condensé (les 4 cibles de build, le piège des deux copies d'AM
 synchroniser à la main, la méthodologie de test) et [structure/](structure/) pour la
 documentation d'architecture détaillée.
 
-Le même code applicatif (`src/`) tourne sur quatre cibles :
+Le même code applicatif (`src/` + le moteur vendu dans `engine/`) tourne sur quatre cibles :
 
 - **ESP32-S3** — le matériel réel, via [PlatformIO](https://platformio.org/).
 - **Simulateur desktop Linux/Windows** — une reconstruction de la carte (écran, clavier, joystick, LEDs) en SDL2, pour développer/tester sans le matériel.
 - **APK Android** — le même simulateur SDL2, compilé nativement en C++ pour Android (pas de wrapper web).
-- **Web (WebAssembly)** — le même simulateur compilé via Emscripten (voir [structure/WEB_SIMULATOR.md](structure/WEB_SIMULATOR.md)).
+- **Web (WebAssembly)** — le même simulateur compilé via Emscripten (`cd web && ./build.sh`, voir [structure/WEB_SIMULATOR.md](structure/WEB_SIMULATOR.md)) — essayable directement dans le navigateur, voir `docs/index.html`.
 
 ## Nouveautés récentes
 

@@ -38,6 +38,14 @@ public:
     void set_loop_extra(int32_t lstart, int32_t xfade, bool post) { lstart_ = lstart; xfade_ = xfade; xpost_ = post; }
     bool playing() const { return active_ || want_start_; }
     uint32_t position() const { return static_cast<uint32_t>(pos_ >> 32); }
+    // GrvEP-fusion addition: tune / direction changes on a sounding voice (MODE_DJ's speed fader and scratch). begin() folds
+    // tune_ into tune_total_ once per start, so a plain SMPR_TUNE set_param only reaches the next start; this applies the
+    // difference at once. A direction flip keeps the playhead where it is; the stream follows from the next update().
+    void set_live(int32_t tune, bool reverse) {
+        if (active_) { tune_total_ += tune - tune_; dir_ = reverse ? -1 : 1; }
+        tune_ = tune;
+        reverse_ = reverse;
+    }
     bool init(Memory &m) override {
         bank_ = m.bank;
         if (!bank_) return true;                                           // no sampler service: the module stays silent
@@ -290,7 +298,10 @@ private:
             lxf_ = x;
         }
         dir_ = reverse_ ? -1 : 1;
-        pos_ = (reverse_ ? static_cast<int64_t>(frames_ > 0 ? frames_ - 1 : 0) : static_cast<int64_t>(start)) << 32;
+        // GrvEP-fusion: a reverse start with a trim start (fstart > 0) plays backwards from there (MODE_DJ reversing mid-track)
+        // instead of always from the last frame.
+        const bool rev_from = reverse_ && fstart_ > 0;
+        pos_ = (reverse_ && !rev_from ? static_cast<int64_t>(frames_ > 0 ? frames_ - 1 : 0) : static_cast<int64_t>(start)) << 32;
 
         int32_t root = zone && zone->root >= 0 ? zone->root * kSemi : (root_ >= 0 ? root_ : h.root_note * kSemi);
         root_pitch_ = root;
@@ -521,6 +532,7 @@ public:
         if (b.pad >= kPadCount) return;
         pads_[b.pad] = b;
         if (b.slot < 0) { for (Voice &x : voice_) if (x.pad == b.pad) cut(x); want_[b.pad] = 0; }    // the sample was taken away
+        else if (Voice *x = sounding(b.pad)) x->smp->set_live(b.tune, b.reverse != 0);                  // GrvEP-fusion: live tune / direction
     }
     void process(const ProcessCtx &ctx, const Ports &p) override {
         const int n = ctx.frames;
@@ -560,12 +572,14 @@ public:
                 env += v.env_step;
                 if (env >= 32767) { env = 32767; if (v.env_step > 0) v.env_step = 0; }
                 if (env < 0) env = 0;
-                const int32_t x = (static_cast<int32_t>(buf[i]) * env) >> 15;
+                int32_t x = (static_cast<int32_t>(buf[i]) * env) >> 15;
+                if (v.dk < 1.0f) { x = static_cast<int32_t>(static_cast<float>(x) * v.dg); v.dg *= v.dk; }
                 acc_l[i] += (x * gl) >> 15;
                 acc_r[i] += (x * gr) >> 15;
             }
             v.gl = tl; v.gr = tr; v.env = env;
             if (env == 0 && v.env_step < 0) { free_voice(v); continue; }        // faded out
+            if (v.dk < 1.0f && v.dg < 0.001f) { free_voice(v); continue; }        // GrvEP-fusion: PadBlob.decay reached -60 dB
             if (!v.smp->playing()) {                                             // reached the end of its sample
                 if (!v.stopping) ended[n_ended++] = v.pad;
                 free_voice(v);
@@ -593,6 +607,7 @@ private:
         int32_t env = 32767, env_step = 0;                                       // q15 envelope and its step per sample
         int32_t gl = 0, gr = 0;                                                  // the gains reached at the end of the last block
         int32_t lvl = 32768;                                                     // the push's level (Q15: 32768 = the pad's own; a sequenced hit: less)
+        float dg = 1.0f, dk = 1.0f;                                              // GrvEP-fusion: PadBlob.decay's gain and its step per sample
         SvfStateF svf;
         VoiceState vs;
     };
@@ -662,6 +677,8 @@ private:
         free_voice(*v);
         v->pad = pad;
         v->order = ++order_;
+        v->dg = 1.0f;
+        v->dk = b.decay > 0 ? std::pow(0.001f, 1.0f / static_cast<float>(b.decay)) : 1.0f;
         v->smp->set_param(SMPR_SAMPLE, b.slot);
         v->smp->set_param(SMPR_FSTART, at_loop ? b.lstart : b.start);          // a grid launch may start at the loop start
         v->smp->set_loop_extra(b.loop == 1 ? b.lstart : -1, b.xfade, b.xpost != 0);
@@ -669,6 +686,7 @@ private:
         v->smp->set_param(SMPR_LOOP, b.loop == 2 ? -1 : 0);                     // the file's loop points, or none (then maybe the region)
         v->smp->set_param(SMPR_REGION, b.loop == 1 ? 1 : 0);
         v->smp->set_param(SMPR_TUNE, b.tune);
+        v->smp->set_param(SMPR_REVERSE, b.reverse);                             // GrvEP-fusion
         v->smp->reset();                                                         // starts at its next process()
         v->svf = SvfStateF{};
         const bool mid = (at_loop ? b.lstart : b.start) > 0;

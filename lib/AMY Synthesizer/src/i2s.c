@@ -10,6 +10,13 @@
 
 #include "amy.h"
 
+// GrvEP-fusion: forward decl so esp_fill_audio_buffer_task() (defined further down, well
+// before mixInEngineBlock()'s own definition near amy_render_audio()) can call it — see
+// that definition's comment for why it must run here, not in amy_render_audio().
+static void mixInEngineBlock(int16_t *buf);
+// Same reasoning: esp_fill_audio_buffer_task() also calls this one directly (see its own
+// call site) — defined in audio_engine.cpp (C++), hence extern, not static.
+extern void usbAudioCardTick(const int16_t *stereoBlock, int frames);
 
 #ifdef ESP_PLATFORM
 #include <esp_task.h>
@@ -329,6 +336,8 @@ void esp_fill_audio_buffer_task() {
         output_sample_type *block = amy_fill_buffer();
 	AMY_PROFILE_STOP(AMY_ESP_FILL_BUFFER)
 
+        mixInEngineBlock(block);  // see its definition's comment — must happen here, before the I2S write below
+        usbAudioCardTick(block, AMY_BLOCK_SIZE);
         last_audio_buffer = block;
         
         // Notify amy_update() that a block is ready (so it can return from amy_render_audio).
@@ -392,6 +401,38 @@ void amy_update_tasks() {
         esp_poll_midi();
     } else{
         // Rendering is happening on separate thread, nothing to do.
+    }
+}
+
+// GrvEP-fusion: mixes the vendored SevenistSynth_RitualMachine engine's own render
+// (src/audio_engine.cpp's facade — audioNoteOn/Off/SetEnvelope/etc. now drive it instead
+// of AMY directly) into AMY's block. Mirrors the equivalent fix in
+// libminiaudio-audio.c's data_callback() (desktop/Android/Web) — that file isn't
+// compiled for ESP32 at all, so this is a separate, ESP32-only edit, not a duplicate.
+//
+// MUST run inside esp_fill_audio_buffer_task(), not amy_render_audio(): the real I2S
+// DMA write (amy_i2s_write()) happens directly inside that background task, right after
+// amy_fill_buffer() — amy_render_audio() only runs later, on the main thread, as a
+// notify/sync handshake for amy_update()'s own callers (write_samples_fn, etc.), well
+// after the buffer has already gone out over I2S. Mixing there (the first version of
+// this fix) measured real signal in the buffer — the mix itself was correct — but by
+// the time it ran, the DAC had already received the unmixed, AMY-only block: confirmed
+// by the fact it was silent on real hardware despite the simulator (whose data_callback
+// mixes before the equivalent of this write) working correctly.
+extern void audioEngineRenderBlock(int16_t *stereo, int frames);
+// usbAudioCardTick() (declared at the top of this file) feeds the final mixed block to a
+// real USB Audio Class microphone device (see audio_engine.cpp's own comment on it for the
+// full design) — it needs to run at this same spot for the same reason mixInEngineBlock()
+// does: this is the only place that sees the block before the real I2S write below.
+static void mixInEngineBlock(int16_t *buf) {
+    if (!buf) return;
+    static int16_t engineBuf[AMY_BLOCK_SIZE * AMY_NCHANS];
+    audioEngineRenderBlock(engineBuf, AMY_BLOCK_SIZE);
+    for (int i = 0; i < AMY_BLOCK_SIZE * AMY_NCHANS; i++) {
+        int32_t mixed = (int32_t)buf[i] + (int32_t)engineBuf[i];
+        if (mixed > 32767) mixed = 32767;
+        else if (mixed < -32768) mixed = -32768;
+        buf[i] = (int16_t)mixed;
     }
 }
 

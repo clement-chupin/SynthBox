@@ -456,8 +456,9 @@ static const AmbientPresetDef kAmbientPresets[] = {
 #define DJ_GRAIN_GAP_MS_MAX       400.0f // inter-grain gap at amount=0 (just above the "no grains" threshold)
 #define DJ_GRAIN_GAP_MS_MIN       40.0f  // inter-grain gap at amount=1 (full deflection)
 #define DJ_STUTTER_MIN_SEC        0.03f
-#define DJ_STUTTER_MAX_SEC        0.5f
+#define DJ_STUTTER_MAX_SEC        2.0f   // one beat at 30 BPM (P4 sets up to a beat, see MODE_DJ's pots)
 #define DJ_STUTTER_MIN_FRAMES     32     // floor so a stutter window is never degenerate/near-zero
+#define DJ_STUTTER_HOLD_MS        250    // the joystick click must be held this long before the stutter starts
 
 // ==================== SS2 large-sample streaming ====================
 // SS2 slots (and, sharing the same underlying key storage, MODE_SAMPLE keys) normally

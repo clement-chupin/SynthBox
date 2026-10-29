@@ -1,22 +1,118 @@
-# GrvEP — context for Claude
+# GrvEP-fusion — context for Claude
 
-GrvEP is a portable groovebox/synthesizer firmware for an ESP32-S3: 30+ modes (drum
-sequencers, subtractive/FM/wavetable/TB-303/granular/sampler synths, and a family of
-generative modes — cellular automaton, boid swarm, theremin, ball physics...), SD-card
-sample playback, OLED, a 4×8 key grid, joystick, 7 potentiometers, addressable LEDs.
+**This is a fork of GrvEP** (same portable groovebox/synthesizer firmware for an ESP32-S3:
+30+ modes, SD-card sample playback, OLED, 4×8 key grid, joystick, 7 potentiometers,
+addressable LEDs), forked specifically to merge in a friend's own graph-based DSP engine
+(from `SevenistSynth_RitualMachine`, same hardware) underneath GrvEP's own UI/UX, replacing
+AMY mode by mode. **The migration is in progress, not finished** — read
+`~/.claude/plans/mutable-nibbling-melody.md` for the full phased plan and current status
+before assuming either engine's role in a given mode. As of this writing: both AMY and the
+new engine run side by side (see "Two synth engines" below); `audioNoteOn/Off/SetEnvelope/
+SetVolume/SetShape/SetPitchBend/AllNotesOff` (the ~8 most-used `audio_engine.h` functions)
+are wired to the new engine's one placeholder graph; everything else (~160 functions) is
+still a no-op stub, filled in phase by phase.
 
 The same application code (`src/`) runs on four targets. **Read this whole file before
-touching build config or AMY's DSP code** — the single AMY copy described below is the single
-most likely thing to trip up a fresh session.
+touching build config, AMY's DSP code, or the vendored engine** — the vendoring/dual-engine
+setup described below is the single most likely thing to trip up a fresh session.
+
+## Two synth engines, on purpose, for now
+
+- **AMY** (`lib/AMY Synthesizer/src/`) — the original engine, event-based, still fully
+  initialized and running (`audioInit()` in `src/audio_engine.cpp` calls `amy_start()`
+  exactly as GrvEP always did). `main.cpp`'s `loop()` still unconditionally calls
+  `amy_update()` every tick, and ~9 raw `amy_add_event` call sites (drum-pad hi-hat chokes,
+  mostly) still talk to it directly. **Do not remove AMY's init** even from a mode you're
+  not touching — `loop()` depends on it being alive regardless (confirmed the hard way: a
+  Phase-1 rewrite that skipped `amy_start()` crashed real hardware with a null-pointer
+  `StoreProhibited` the instant `amy_render()` ran against never-allocated AMY state).
+- **The vendored engine** (`engine/` — `SevenistSynth_RitualMachine`'s `framework/engine/`,
+  copied verbatim) — graph-based (`GraphDesc`/`Engine::load()`), not event-based. One
+  instance (`g_mainEngine` in `audio_engine.cpp`) with one fixed placeholder graph (saw →
+  filter → env → vca) backs the facade's core functions today; more instances/graphs land
+  per the plan's phases. Canonical minimal usage pattern:
+  `SevenistSynth_RitualMachine/apps/template/src/synth.cpp`.
+- **Both engines' audio is mixed, not routed exclusively** — `audioEngineRenderBlock()`
+  (declared `extern "C"` in `audio_engine.h`/defined in `audio_engine.cpp`) is called and
+  saturating-added into AMY's own output buffer at the exact point AMY itself finishes
+  rendering a block, in **two separate places** (one per audio backend):
+  - `lib/AMY Synthesizer/src/libminiaudio-audio.c`'s `data_callback()` — desktop sim,
+    Android, and Web all share this file and this one edit.
+  - `lib/AMY Synthesizer/src/i2s.c`'s `amy_render_audio()` — real ESP32 hardware's I2S
+    path; this file isn't compiled for the other three targets at all, so it needed its
+    own, separate mixing edit (confirmed via `nm`/the linker map, not assumed).
+  **Any future change to how either engine produces audio must keep both mixing points in
+  sync** — fixing one and not the other reproduces exactly the "no sound on hardware, fine
+  in the simulator" bug this setup already hit once.
+
+## Sample playback from SD (keys, preview, MODE_DJ) — the engine's own streaming sampler
+
+The sample keys (MODE_SAMPLE/SS2), the browser preview and MODE_DJ's deck all play through
+the vendored engine's SampleBank + Pads (same engine instance as the drums), see the
+"SD streaming" section at the end of `src/audio_engine.cpp`:
+- A WAV/MP3 is converted **once, on the board** into the engine's `.smp` format
+  (`src/smp_import.*`), cached in `/grvsmp/cache/<hash>.smp` and reused while the source
+  keeps its size. Upstream's ESP32 app has no such import (it expects `.smp` cooked on a PC);
+  ours mirrors its simulator's convert-on-first-use. `.smp` is mono 16-bit: ~5.3 MB per minute.
+- **One loader task** (`smpLoaderTask`) does all of the sampler's SD work: conversions and
+  `SampleBank::pump()`. Keep `SampleBank::load()/unload()` on that task too (upstream calls them
+  from its card task, never concurrently with `pump()`).
+- Small `GrvEP-fusion` additions in `engine/modules/sampler_modules.*` (live tune/direction on a
+  sounding pad, `PadBlob.reverse`) and `SampleBank::kMaxSamples` 32→64 — marked in the source.
+- Measured on the board (2026-10-28): converting is ~2.4x real time for an MP3 (a 2:22 track
+  takes ~60 s: 2/3 Helix decoding on core 0 next to the audio render, 1/3 SD writes), once per
+  file; a cached file loads in ~1 s. SD writes fail at random a few times per long conversion and
+  FatFs then fails every later call on that FILE — `flushBlock()` reopens the file to retry.
+- Internal heap after boot is only ~11.6 KB (it was **2.6 KB** until three function-static
+  6 KB `GraphDesc`s moved to one PSRAM scratch, `scratchGraph()`): every `fopen` needs a small
+  internal-RAM lock and aborts when there is none. The Helix MP3 decoder's ~8.6 KB of small
+  allocations are pushed to PSRAM (`heap_caps_malloc_extmem_enable()` around
+  `MP3InitDecoder()`). The PSRAM itself is small (the pads heap only gets its 768 KB fallback,
+  ~440 KB stay free).
+- **The engine's command queue is single-producer and only `ENGINE_CMD_RING=32` deep; a full
+  queue drops commands silently.** This facade is called from both `loop()` and main.cpp's
+  `audioHandlerTask`, so every post to the Pads engine goes through `padsSetBlob()`/
+  `padsSetParam()` (a mutex) — and never burst dozens of commands at once (e.g. only stop the
+  pads that `pads_playing()` says are sounding).
+
+## RAM is tight on real hardware — measure, don't guess
+
+Vendoring the new engine's own static state (the `Engine` object itself, dominated by its
+`ENGINE_CMD_RING` command queue, plus whatever placeholder heap `audioInit()` gives it) all
+land in the ESP32-S3's ~320KB of internal DRAM, the same budget `main.cpp`'s own 18K lines
+and AMY's own state already use most of. This has already broken two different things in
+practice, both only on real hardware (the simulator has effectively unlimited RAM and won't
+catch either):
+- Too large a static buffer (256KB) overflowed DRAM outright at link time (a hard build
+  failure, easy to catch).
+- Too *small* a buffer (16KB, over-corrected from the above) let the firmware link and
+  boot fine, but silently failed `Engine::load()` (`Err::NoMem`, not fatal, no crash) — and
+  **separately**, starved a later `xTaskCreatePinnedToCore()` call in `main.cpp`'s `setup()`
+  (whose return value is never checked) of enough free heap, which manifested as a frozen
+  OLED with no other symptom at all. Two different failure modes from the same root cause,
+  neither obvious from the symptom alone.
+- Current working values (verified via the linker map, `pio run`'s own RAM%, and an
+  `ESP.getFreeHeap()` probe around the task-creation call — see git history on
+  `src/audio_engine.cpp`/`platformio.ini` for the exact investigation): `fastMem[48*1024]`
+  in `audioInit()`, `-DENGINE_CMD_RING=32` in `platformio.ini`. Before changing either,
+  rebuild for ESP32 and check `pio run`'s own `RAM: [...] X% (used N bytes from 327680
+  bytes)` line, not just "it compiles" — then flash and check `ESP.getFreeHeap()` actually
+  stays healthy after `setup()`'s task creation, not just that the build succeeded.
 
 ## The four build targets
 
 | Target | Source | Build |
 |---|---|---|
-| **ESP32-S3** (real hardware) | `src/` via PlatformIO | `pio run -e esp32-s3-devkitc-1` |
-| **Linux/Windows desktop simulator** | `src/` + `simulator/` via SDL2 | `cd simulator && ./build.sh` (Linux) or `./build_windows.sh` (cross-compile a Windows .exe) |
-| **Android APK** | `src/` + the same SDL2 simulator, native C++ | `./build_native_apk.sh` (first run: `cd android-native && ./setup_android.sh`) |
-| **Web (WASM/Emscripten)** | `src/` + `simulator/` via Emscripten | see `structure/WEB_SIMULATOR.md` |
+| **ESP32-S3** (real hardware) | `src/` + `engine/` via PlatformIO | `pio run -e esp32-s3-devkitc-1` |
+| **Linux/Windows desktop simulator** | `src/` + `engine/` + `simulator/` via SDL2 | `cd simulator && ./build.sh` (Linux) or `./build_windows.sh` (cross-compile a Windows .exe) |
+| **Android APK** | `src/` + `engine/` + the same SDL2 simulator, native C++ | `./build_native_apk.sh` (first run: `cd android-native && ./setup_android.sh`) |
+| **Web (WASM/Emscripten)** | `src/` + `engine/` + `web/` via Emscripten | `cd web && ./build.sh`, see `structure/WEB_SIMULATOR.md` |
+
+`platformio.ini`'s `src_dir` is the repo root (not the default `src`) specifically so its
+`build_src_filter` can pull in both `src/` and `engine/` as one firmware image — mirrors
+`SevenistSynth_RitualMachine/apps/ritual_machine/platformio.ini`'s own `src_dir = ../..`
+for the identical split. `simulator/CMakeLists.txt` and `web/CMakeLists.txt` each have
+their own `ENGINE_SOURCES` glob doing the same job for their targets.
 
 Full commands (flashing, monitor, `--install`, release builds, etc.) are in the root
 `README.md`.
@@ -31,7 +127,16 @@ files via `simulator/CMakeLists.txt` (`AMY_SRC`) and `simulator/hal/AMY-Arduino.
 sibling checkout is needed anymore. (It used to be two hand-synced copies — this repo's
 plus `../other_projects/amy` — which had drifted apart, e.g. the ESP32 one lacked the
 bus1->bus0 merge, so bus-0 FX never reached the TB-303 there.) Any DSP change is made
-once, in `lib/AMY Synthesizer/src/`.
+once, in `lib/AMY Synthesizer/src/`. **This fork also touches two files in this vendored
+copy** (`libminiaudio-audio.c`, `i2s.c`) to mix in the new engine's output — see "Two synth
+engines" above; keep that in mind before assuming this directory is untouched/pristine AMY.
+
+The **new vendored engine** lives at `engine/` (repo root, a sibling of `src/`, copied
+verbatim from `SevenistSynth_RitualMachine/framework/engine/` — see "Two synth engines"
+above). Unlike AMY, it has no ESP32/ARM-specific build quirks beyond one optional assembly
+file (`engine/dsp/fft_s3.S`); it's portable C++17 and compiles the same way on all four
+targets without a HAL shim layer of its own (Phase 1's scope deliberately stopped at the
+audio layer — GrvEP's own input/display/LED drivers are untouched).
 
 Buffer layout note: the per-bus `fbl[]` buffers are **planar** (`[L,L,L...][R,R,R...]`,
 channel `c` at `buf + c*AMY_BLOCK_SIZE`) in this copy, despite a stale "interleaved"
@@ -67,10 +172,16 @@ running the simulator.
   force a mode/state and fire the sequence of actions you want to test, verify via
   `Serial.printf`/`fprintf(stderr, ...)` output (redirect stdout/stderr to a file, `grep`
   it) and, for anything audio-observable, an RMS/peak tap inserted temporarily into the
-  audio callback (`simulator/.../libminiaudio-audio.c`'s `data_callback`, right after
-  `amy_simple_fill_buffer()`). **Always remove the temporary instrumentation before
-  finishing** — grep the diff for stray `TEMP DBG`/debug defines before considering a fix
-  done.
+  audio callback — `lib/AMY Synthesizer/src/libminiaudio-audio.c`'s `data_callback`
+  (desktop/Android/Web) right after `amy_simple_fill_buffer()`, **and separately**
+  `lib/AMY Synthesizer/src/i2s.c`'s `amy_render_audio()` for real ESP32 hardware (not
+  compiled for the other three targets — a tap in one says nothing about the other). On
+  real hardware without a serial monitor attached to a TTY, read `/dev/ttyACM*`/
+  `/dev/ttyUSB*` directly with `pyserial` instead of `pio device monitor` (which refuses
+  piped/non-interactive stdin) — toggle RTS low→high→low first to force a clean reset so
+  the baud-rate framing lines up with the bootloader's own banner. **Always remove the
+  temporary instrumentation before finishing** — grep the diff for stray `TEMP DBG`/debug
+  defines before considering a fix done.
 - `setup()` runs to completion before `loop()` ever starts — a test that blocks with
   `delay()` inside `setup()` will never see `loop()`-driven ticks (10ms modulation engines,
   sequencer clocks, etc.) run at all. Either drive those ticks manually in a loop inside

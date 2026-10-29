@@ -125,6 +125,15 @@ void amy_print_devices() {
 #define OUTPUT_RING_LENGTH (OUTPUT_RING_FRAMES*AMY_NCHANS)
 
 
+// GrvEP-fusion: the vendored SevenistSynth_RitualMachine engine (src/audio_engine.cpp's
+// facade) renders its own audio separately from AMY — audioNoteOn/Off/SetEnvelope/etc.
+// now drive it instead of AMY directly, so without this, those calls produced no audible
+// output at all (AMY was still rendering, just never receiving note events for the modes
+// already migrated). Mixed in here, right where AMY's own block is produced, so every
+// non-ESP32 target (desktop/Android/Web, all sharing this file) gets it in one place; the
+// ESP32 real-hardware path needs the equivalent edit in i2s.c/esp_render_on_cores().
+extern void audioEngineRenderBlock(int16_t *stereo, int frames);
+
 int16_t output_ring[OUTPUT_RING_LENGTH];
 
 uint16_t ring_write_ptr = AMY_BLOCK_SIZE*AMY_NCHANS; // start after one AMY frame
@@ -154,6 +163,18 @@ static void data_callback(ma_device* pDevice, void* pOutput, const void* pInput,
             last_audio_buffer = buf;
             // reset the input pointer for future input data
             in_ptr = 0;
+            // Mix in the fusion engine's own block (see audioEngineRenderBlock's own
+            // comment above) — saturating add, same width as AMY's own output.
+            {
+                static int16_t engineBuf[AMY_BLOCK_SIZE * AMY_NCHANS];
+                audioEngineRenderBlock(engineBuf, AMY_BLOCK_SIZE);
+                for (int i = 0; i < AMY_BLOCK_SIZE * AMY_NCHANS; i++) {
+                    int32_t mixed = (int32_t)buf[i] + (int32_t)engineBuf[i];
+                    if (mixed > 32767) mixed = 32767;
+                    else if (mixed < -32768) mixed = -32768;
+                    buf[i] = (int16_t)mixed;
+                }
+            }
             // copy this output to a ring buffer
             for(uint16_t amy_frame=0;amy_frame<AMY_BLOCK_SIZE;amy_frame++) {
                 for(uint8_t c=0;c<AMY_NCHANS;c++) {

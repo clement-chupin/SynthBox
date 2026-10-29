@@ -98,6 +98,20 @@ public:
         const uint32_t prof_t0 = esp_cpu_get_cycle_count();
 #endif
         const int n = ctx.frames;
+        // level has no modulation cable (set_param only, see OSCX_LEVEL above), so when
+        // it's 0 the output is unconditionally silent regardless of pitch/gate/timbre/
+        // morph — safe to skip the engine dispatch entirely (KARP/MODAL in particular are
+        // real per-sample DSP, not free) rather than compute it just to multiply by zero.
+        // A graph that keeps this node wired in but muted for most shapes (e.g. GrvEP-
+        // fusion's SYNTH: only SAW_FM/SUPERSAW actually use OSCX) was paying full cost on
+        // every voice every block regardless — measured on ESP32-S3 at 2357us for an
+        // 8-voice block against a 725.6us budget, over 3x over, with every voice fully
+        // muted (OSCX_KARP's default Karplus-Strong string model, PSRAM-resident buffer).
+        if (level_ == 0) {
+            for (int i = 0; i < n; i++) p.out[0][i] = 0;
+            gate_ = p.in[1][n - 1] > 16384;   // keep edge-detection in sync for when it's unmuted
+            return;
+        }
         const q15 *cv = p.in[0], *gate = p.in[1], *mp = p.mod[OSCX_PITCH];
         const q15 *mt = p.mod[OSCX_TIMBRE], *mm = p.mod[OSCX_MORPH];
         const q15 timbre = clamp_unit(timbre_ + (mt ? mt[0] : 0)), morph = clamp_unit(morph_ + (mm ? mm[0] : 0));

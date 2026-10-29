@@ -60,7 +60,7 @@ struct SamplerStats {
 
 class SampleBank {
 public:
-    static constexpr int kMaxSamples = 32;
+    static constexpr int kMaxSamples = 64;   // GrvEP-fusion: 32 upstream; GrvEP needs 7 drums + 32 sample keys + DJ + preview
     static constexpr int kMaxStreams = 32;
     static constexpr int kMaxJobs = 64;
     static constexpr int kMaxInstruments = 8;

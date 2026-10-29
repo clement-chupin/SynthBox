@@ -144,7 +144,7 @@ bool simSpectrogramInit() {
     // Fixed position (not SDL_WINDOWPOS_UNDEFINED): left of the EQ window, both along
     // the screen's top edge — some window managers resolve UNDEFINED to the same spot
     // for every window, stacking every simulator window exactly on top of each other.
-    s_win = SDL_CreateWindow("GrvEP - Spectrogramme",
+    s_win = SDL_CreateWindow("GrvEP-FUSION - Spectrogramme",
         20, 20,
         SPEC_W, SPEC_H, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     if (!s_win) return false;

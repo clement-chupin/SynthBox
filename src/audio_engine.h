@@ -4,10 +4,12 @@
 
 // Core
 void audioInit();
-// Pulls `frames` interleaved stereo samples from the engine — the one function every
-// per-target HAL audio-out callback calls (see engine_hal_*/audio_out_*.cpp). Replaces
-// AMY's old amy_render_audio()/amy_fill_buffer() role.
-void audioEngineRenderBlock(int16_t *stereo, int frames);
+// Pulls `frames` interleaved stereo samples from the new engine and MIXES them into
+// AMY's own output — called from lib/AMY Synthesizer/src/libminiaudio-audio.c's
+// data_callback() (desktop/Android/Web) and src/*/i2s.c-equivalent on ESP32, right after
+// AMY's own amy_simple_fill_buffer()/amy_render_audio(). extern "C": called from AMY's
+// plain-C audio driver, which can't see C++-mangled symbols.
+extern "C" void audioEngineRenderBlock(int16_t *stereo, int frames);
 void audioAllNotesOff();
 void audioNoteOn(uint8_t note, float velocity);
 void audioNoteOff(uint8_t note);
@@ -15,6 +17,12 @@ void audioSetEnvelope(const EnvParams &env);
 void audioSetPitchBend(float ratio);
 void audioSetShape(SynthShape shape);
 void audioSetShapeOnSynth(SynthShape shape, uint8_t synthCh);  // like audioSetShape but on a specific AMY synth channel
+// Reads back the cutoff/resonance/FM-depth baseline audioSetShape() actually applies for
+// this shape (kShapeTable, converted to the same Hz/1..4/0..1 conventions main.cpp's own
+// pot formulas use) — lets a pot-dispatch site re-sync its own tracked value to the shape's
+// real current state on a shape change, instead of snapping to the pot's unrelated absolute
+// position on first touch. Any out-pointer may be null.
+void audioGetShapeDefaults(SynthShape shape, float *cutoffHz, float *resonance, float *fmDepth);
 void audioTrackerInit();           // initialize one AMY synth channel per tracker synth track
 void audioTrackerNoteOn(uint8_t trackIdx, uint8_t midiNote, float vel);
 void audioTrackerNoteOff(uint8_t trackIdx, uint8_t midiNote);
@@ -33,7 +41,21 @@ void audioStopAllSamples();  // velocity=0 on all PCM oscillators (call when lea
 // Effects (bus 0)
 void audioSetReverb(float level, float liveness, float damping, float xover_hz);
 void audioSetChorus(float level, float lfo_freq, float depth);
+// FLANGER FX: previously routed through AMY's config_chorus() — confirmed dead, since
+// nothing in this build's render path (audioEngineRenderBlock()) ever calls AMY's own
+// render/mix functions any more (replaced entirely by the new engine — see that
+// function's own comment). Now a real engine Flanger module instance. max_delay_ms is
+// remapped onto the module's actual safe delay-line room (~22ms, see its own init())
+// rather than passed through 1:1 — the UI's 5-100ms range would otherwise send delay
+// requests past the physical buffer, which DelayLine::read()'s single-wrap correction
+// does not bounds-check (a real out-of-bounds read, not just a sound artifact).
+void audioSetFlanger(float level, float lfo_freq, float depth, float max_delay_ms, bool on);
 void audioSetDelay(float level, float delay_ms, float feedback, float filter_coef);
+// RES FX (fxList slot 13, "the original ResEcho"): own Delay module instance, separate
+// from DELAY's (slot 5) — same signature/semantics as audioSetDelay() but must not
+// share its state, matching this project's existing "the two sound genuinely
+// different, not a redundant rename" intent (see fxList[]'s own comment on RES).
+void audioSetResDelay(float level, float delay_ms, float feedback, float filter_coef);
 // RESECHO FX: a SEPARATE delay+resonant-filter-in-feedback engine (not shared with
 // the plain DELAY FX above). wild (0..1) tames or unleashes THIS engine's own
 // resonance/feedback (0=gentle, 1=full experimental) — see audioSetResoEcho()'s own
@@ -161,6 +183,9 @@ bool audioDJIsLoaded();
 // this (not audioDJIsLoaded()) to gate "is the deck usable yet" UI/input, so Play/seek/
 // speed become available almost immediately instead of waiting out the full decode.
 bool audioDJCanPlayYet();
+// KEY_ERR_* when the last audioLoadDJTrack() failed (unreadable/unsupported file, SD error, out of memory), else
+// KEY_ERR_NONE — without it a failed load just looked like an endless "Chargement...".
+uint8_t audioDJLoadError();
 // Frames decoded so far for the load currently in flight (0 once a new load starts).
 uint32_t audioDJGetDecodedFrames();
 // Increments once per successful NEW track load (not on every chunk swap — see
@@ -238,6 +263,20 @@ float audioDJGetGrainAmount();
 void audioDJStutterStart(float bpmForSync);
 void audioDJStutterEnd();
 bool audioDJIsStuttering();
+// The stutter's settings (MODE_DJ's P4-P7): loop length in seconds (0 = the default, a quarter beat of the BPM passed
+// to audioDJStutterStart()), smoothing 0..1 (crossfade at the loop's seam, up to half the loop), the loop's playback
+// rate (x the deck speed, pitch follows) and direction. Applied at once to a stutter in progress: length/smoothing
+// restart the loop at its start point, rate/direction change the sounding voice in place.
+// FX Punch on the final mix (main.cpp's fxPunchApply()): a history ring (allocated by
+// audioPunchPrepare(), when the punch overlay opens) replayed while a punch is held.
+void audioPunchPrepare();
+void audioPunchLoopStart(float seconds);   // LOOP 1/4..1/32, STUTTER: repeat the last `seconds`
+void audioPunchReverseStart();
+void audioPunchHalfSpeedStart();
+void audioPunchTapeStopStart(float seconds);
+void audioPunchStop();
+void audioPunchCrush(int bits, int hold);  // bit depth (16 = off) and sample-and-hold length (1 = off)
+void audioDJSetStutterParams(float lengthSec, float smooth01, float rate, bool reverse);
 
 // ---- USB Mass Storage mode support (MODE_USB, main.cpp) ----
 // Nothing may touch SD (background grain decode, the .pcm16 cache builder) while the SD card
@@ -357,6 +396,7 @@ void audioT303Feedback(float fb);                                           // n
 void audioT303Duty(float duty);                                             // PULSE duty 0.5→0.01 for continuous wave morphing
 void audioT303Wavefold(float depth);                                        // wavefolder depth 0→1 symmetric — drives signal into triangle fold (1x→8x)
 void audioT303WavefoldAsym(float depth);                                    // wavefolder depth 0→1 positive-only (TRI2: fold peaks, preserve bass)
+void audioT303SetDisto(bool on, float drv, float mix);                      // 6th t303Patch (DISTO) — hard-driven symmetric saturation override for T3_SHAPE, see .cpp
 void audioT303SetFilterType(uint8_t filterType);                            // "patch"/algo select — filter_type only, light touch (no reconfigure)
 
 // ==================== SxF (sous-octaves : SWF/SQF/SNF, wave types pour 303S/I303) ====================
@@ -396,3 +436,10 @@ void audioModularAllNotesOff();
 void audioModularSetFilter(float cutoffHz, float resonance);
 void audioModularSetEnvelope(const EnvParams &env);
 void audioModularSetPitchBend(float ratio);
+
+// Real USB Audio Class microphone device (ESP32 only, no-op elsewhere). Call once from
+// setup(), before USB.begin() (matches the Arduino core's own AudioCard.ino example's init
+// order). The real-time per-block feed is usbAudioCardTick(), called directly from i2s.c
+// (own forward declaration there, like the i2s.c-only mixInEngineBlock()) — not declared
+// here since nothing outside i2s.c calls it.
+void usbAudioCardBegin();

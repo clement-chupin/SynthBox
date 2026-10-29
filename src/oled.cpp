@@ -10,6 +10,6 @@ void setupOled()
     oled.sendF("ca", 0xD3, -32);
     oled.clearBuffer();
     oled.setFont(u8g2_font_6x10_tf);
-    oled.drawStr(20, 60, "GrvEP Synth...");
+    oled.drawStr(10, 60, "GrvEP-FUSION...");
     oled.sendBuffer();
 }

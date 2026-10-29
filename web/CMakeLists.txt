@@ -41,10 +41,25 @@ set(AMY_SOURCES
 # ---- U8g2 clib sources ----
 file(GLOB U8G2_SOURCES ${U8G2_CLIB}/*.c)
 
+# ---- Vendored engine sources (SevenistSynth_RitualMachine's framework/engine, see
+# ~/.claude/plans/mutable-nibbling-melody.md) — mirrors simulator/CMakeLists.txt's own
+# ENGINE_SOURCES addition. Added alongside AMY_SOURCES, not replacing it (main.cpp still
+# has raw AMY call sites until a later phase relocates them). The engine's own code has
+# no Emscripten-specific requirement — it's plain portable C++17 DSP. ----
+file(GLOB_RECURSE ENGINE_SOURCES
+    ${ROOT}/engine/core/*.cpp
+    ${ROOT}/engine/dsp/*.cpp
+    ${ROOT}/engine/modules/*.cpp
+    ${ROOT}/engine/mi/*.cpp
+    ${ROOT}/engine/sampler/*.cpp
+    ${ROOT}/engine/offline/*.cpp
+)
+
 # ---- GrvEP original sources (compiled with the web HAL) ----
 set(GRVEP_SOURCES
     ${ROOT}/src/main.cpp
     ${ROOT}/src/audio_engine.cpp
+    ${ROOT}/src/smp_import.cpp
     ${ROOT}/src/NoteMap.cpp
     # Replaced: keyboard.cpp, mux.cpp, oled.cpp, Leds.cpp, midi_usb.cpp, mp3dec.cpp
 )
@@ -67,6 +82,7 @@ add_executable(grvep_web
     ${GRVEP_SOURCES}
     ${WEB_SOURCES}
     ${AMY_SOURCES}
+    ${ENGINE_SOURCES}
     ${U8G2_SOURCES}
 )
 
@@ -79,6 +95,8 @@ target_include_directories(grvep_web PRIVATE
     # GrvEP project headers
     ${ROOT}/include
     ${ROOT}/src
+    # Vendored engine headers (included as "engine/core/engine.h" etc.)
+    ${ROOT}
     # AMY headers
     ${AMY_SRC}
     # U8g2 headers
@@ -103,6 +121,9 @@ target_compile_definitions(grvep_web PRIVATE
     SIMULATOR=1
     OOPSIE_LED_FLAG=1
     AMY_WAVETABLE=1
+    # Vendored engine (framework/engine/dsp/config.h defaults): match AMY's 44.1kHz,
+    # same as simulator/CMakeLists.txt's own ENGINE_SR define.
+    ENGINE_SR=44100
     MA_ENABLE_AUDIO_WORKLETS=1
 )
 

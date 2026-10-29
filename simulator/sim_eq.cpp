@@ -169,7 +169,7 @@ bool simEqInit() {
     // window, both along the screen's top edge — some window managers resolve
     // UNDEFINED to the same spot for every window, stacking them all on top of each
     // other (spectrogram is 400px wide at x=20, so 440 clears it with a 20px gap).
-    s_win = SDL_CreateWindow("GrvEP - EQ",
+    s_win = SDL_CreateWindow("GrvEP-FUSION - EQ",
         440, 20,
         EQ_W, EQ_H, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     if (!s_win) return false;

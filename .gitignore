@@ -34,3 +34,7 @@ android-native/SDL2/
 
 # graphify (knowledge-graph tool) output — generated, not source
 graphify-out/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
