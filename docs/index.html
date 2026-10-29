@@ -1,0 +1,722 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GrvEP — groovebox/synthé portable ESP32-S3</title>
+<meta name="description" content="GrvEP : boîte à rythmes / synthétiseur portable open source sur ESP32-S3. Plus de 30 modes, écran OLED, clavier 4×8, joystick, 7 potentiomètres, LEDs adressables. Essayez le simulateur directement dans votre navigateur.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@700;900&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<!-- The WASM build uses real Web Audio Worklets (see web/CMakeLists.txt's own comment on
+     why — AMY's own Emscripten web-audio backend has no non-worklet fallback), which
+     browsers only allow on a cross-origin-isolated page (COOP/COEP response headers) —
+     headers GitHub Pages has no way to set directly. This service worker (vendored
+     unmodified from github.com/gzuidhof/coi-serviceworker, MIT) injects those headers
+     client-side instead, so the page becomes cross-origin-isolated without any server
+     config. It causes exactly one silent page reload the very first time the page loads
+     in a given browser session — expected, not a bug. Must be the first script tag. -->
+<script src="coi-serviceworker.js"></script>
+<style>
+  :root {
+    --bg: #0c0d10;
+    --bg-alt: #111318;
+    --panel: #181a20;
+    --panel2: #20232a;
+    --line: #2a2d35;
+    --cyan: #6fd3ff;
+    --amber: #ffb020;
+    --text: #e9eaed;
+    --dim: #9196a1;
+    --key: #26282f;
+    --key-menu: #33363f;
+    --key-blank: #1b1c20;
+    --main-pot-fg: #c6c66a;
+    --sec-pot-fg: #4ac3dd;
+    --font-display: "Archivo", sans-serif;
+    --font-body: "IBM Plex Sans", -apple-system, system-ui, sans-serif;
+    --font-mono: "IBM Plex Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--font-body); line-height: 1.55;
+  }
+  img { max-width: 100%; display: block; }
+  a { color: var(--cyan); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, .mono { font-family: var(--font-mono); }
+  h1, h2, h3 { font-family: var(--font-display); text-wrap: balance; margin: 0; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+  section { padding: 64px 0; }
+  .eyebrow {
+    font-family: var(--font-mono); font-size: 12px; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--amber); margin: 0 0 10px;
+  }
+
+  /* ---- Top bar ---- */
+  header.site {
+    position: sticky; top: 0; z-index: 20; background: rgba(12,13,16,.88); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+  }
+  header.site .wrap { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; }
+  .brand { font-family: var(--font-display); font-weight: 900; font-size: 18px; letter-spacing: .02em; color: var(--text); }
+  .brand span { color: var(--cyan); }
+  nav.site-links { display: flex; gap: 20px; font-size: 14px; font-family: var(--font-mono); }
+  nav.site-links a { color: var(--dim); }
+  nav.site-links a:hover { color: var(--text); text-decoration: none; }
+
+  /* ---- Hero ---- */
+  .hero { padding: 56px 0 64px; }
+  .hero .grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 48px; align-items: center; }
+  .hero h1 { font-size: clamp(36px, 5vw, 60px); font-weight: 900; line-height: 1.03; }
+  .hero .tagline { font-size: 18px; color: var(--dim); margin: 18px 0 26px; max-width: 46ch; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 26px; }
+  .badge {
+    font-family: var(--font-mono); font-size: 12px; color: var(--dim); border: 1px solid var(--line);
+    border-radius: 999px; padding: 5px 12px; background: var(--panel);
+  }
+  .cta-row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px; font-family: var(--font-mono); font-size: 14px;
+    font-weight: 500; padding: 12px 20px; border-radius: 8px; border: 1px solid var(--line);
+    color: var(--text); transition: border-color .15s, transform .1s;
+  }
+  .btn:hover { text-decoration: none; border-color: var(--cyan); transform: translateY(-1px); }
+  .btn.primary { background: var(--cyan); color: #06151e; border-color: var(--cyan); font-weight: 600; }
+  .btn.primary:hover { border-color: var(--cyan); }
+  .hero-photo { border-radius: 14px; overflow: hidden; border: 1px solid var(--line); box-shadow: 0 20px 60px -20px rgba(111,211,255,.15); }
+
+  @media (max-width: 860px) {
+    .hero .grid { grid-template-columns: 1fr; }
+    .hero-photo { order: -1; }
+  }
+
+  /* ---- Features ---- */
+  .features-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 18px; margin-top: 28px; }
+  .feature { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  .feature h3 { font-size: 16px; font-weight: 700; margin-bottom: 8px; color: var(--text); }
+  .feature p { font-size: 14px; color: var(--dim); margin: 0; }
+  .feature .tag { font-family: var(--font-mono); font-size: 11px; color: var(--amber); letter-spacing: .04em; }
+
+  /* ---- Section headers ---- */
+  .section-head { max-width: 62ch; margin-bottom: 8px; }
+  .section-head h2 { font-size: clamp(26px, 3.4vw, 36px); font-weight: 900; }
+  .section-head p { color: var(--dim); font-size: 15px; margin-top: 10px; }
+  section.alt { background: var(--bg-alt); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+
+  /* ================= Embedded simulator (same component as the standalone
+     simulator page) — status line + two-column layout: screen | keys+joy+pots. ================= */
+  #sim-status { font-family: var(--font-mono); font-size: 12px; color: var(--dim); min-height: 16px; margin: 18px 0 14px; white-space: pre-wrap; }
+  #sim-status.err { color: #ff6b6b; }
+  .sim-layout { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
+  .sim-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .col-screen { flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .col-controls { flex: 1 1 380px; min-width: 300px; display: flex; flex-direction: column; gap: 14px; }
+  canvas#oled {
+    background: #05070a; border-radius: 4px; image-rendering: pixelated;
+    width: 256px; height: 256px; touch-action: none;
+  }
+  .joyrow { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; justify-content: center; }
+  #joypad {
+    width: 110px; height: 110px; background: var(--panel2); border-radius: 10px;
+    position: relative; touch-action: none; user-select: none; flex: 0 0 auto;
+  }
+  #joypad::before, #joypad::after { content: ""; position: absolute; background: #3a3d47; }
+  #joypad::before { left: 0; right: 0; top: 50%; height: 1px; }
+  #joypad::after  { top: 0; bottom: 0; left: 50%; width: 1px; }
+  #joyknob {
+    position: absolute; width: 24px; height: 24px; border-radius: 50%;
+    background: var(--cyan); left: 50%; top: 50%; margin: -12px;
+    box-shadow: 0 0 0 4px rgba(111,211,255,.2);
+  }
+  #joyknob.down { background: var(--amber); box-shadow: 0 0 0 4px rgba(255,176,32,.3); }
+  #joyhint { font-family: var(--font-mono); font-size: 10px; color: var(--dim); text-align: center; margin-top: 4px; }
+  .potgroups { display: flex; gap: 10px; flex-wrap: wrap; flex: 1 1 auto; }
+  .potgroup { display: flex; gap: 10px; padding: 8px 10px; border-radius: 8px; flex: 1 1 auto; }
+  .potgroup.main { background: #2a2619; }
+  .potgroup.sec  { background: #16262a; }
+  .pot { display: flex; flex-direction: column; align-items: center; gap: 4px; flex: 1 1 0; min-width: 34px; }
+  .pot label { font-family: var(--font-mono); font-size: 10px; color: var(--dim); white-space: nowrap; }
+  .pot input[type=range] { -webkit-appearance: slider-vertical; appearance: slider-vertical; width: 18px; height: 90px; }
+  .potgroup.main input[type=range] { accent-color: var(--main-pot-fg); }
+  .potgroup.sec input[type=range]  { accent-color: var(--sec-pot-fg); }
+  .keys { display: grid; grid-template-columns: repeat(8, 1fr); gap: 5px; }
+  .key {
+    aspect-ratio: 1; border-radius: 6px; border: 1px solid #3a3d47; background: var(--key);
+    color: var(--text); font-size: 11px; font-family: var(--font-mono); display: flex; align-items: center; justify-content: center;
+    user-select: none; touch-action: none; cursor: pointer; transition: background-color 60ms linear;
+  }
+  .key.menu { background: var(--key-menu); font-weight: 600; }
+  .key.blank { background: var(--key-blank); border-color: #1f2024; visibility: hidden; cursor: default; }
+  .key.active { box-shadow: inset 0 0 0 2px var(--cyan); }
+  .sim-help { font-size: 13px; color: var(--dim); margin-top: 14px; }
+  .sim-help .mono { color: var(--text); }
+  @media (max-width: 700px) {
+    .col-screen { width: 100%; }
+    canvas#oled { width: 100%; max-width: 384px; height: auto; aspect-ratio: 1; }
+  }
+
+  /* ---- Build targets ---- */
+  .targets { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; margin-top: 28px; }
+  .target { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  .target h3 { font-size: 16px; margin-bottom: 10px; }
+  .target pre {
+    background: #0a0b0e; border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+    font-family: var(--font-mono); font-size: 12.5px; color: #c8e6c9; overflow-x: auto; margin: 0 0 10px;
+  }
+  .target p { font-size: 13px; color: var(--dim); margin: 8px 0 0; }
+
+  /* ---- Footer ---- */
+  footer.site { border-top: 1px solid var(--line); padding: 40px 0; }
+  footer.site .wrap { display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; font-size: 13px; color: var(--dim); }
+  footer.site a { color: var(--dim); margin-right: 18px; }
+  footer.site a:hover { color: var(--cyan); }
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <div class="brand">Grv<span>EP</span></div>
+    <nav class="site-links">
+      <a href="#simulateur">Simulateur</a>
+      <a href="#fonctions">Fonctions</a>
+      <a href="#build">Build</a>
+      <a href="https://github.com/clement-chupin/SynthBox">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap grid">
+    <div>
+      <p class="eyebrow">ESP32-S3 · open source · firmware + simulateur</p>
+      <h1>Une groovebox portable qui tient dans la poche.</h1>
+      <p class="tagline">
+        Boîte à rythmes / synthétiseur basée sur un ESP32-S3&nbsp;: plus de 30 modes
+        (séquenceurs de drums, synthés subtractif/FM/wavetable/TB-303/granulaire/
+        échantillonneur, modes génératifs), lecture de samples SD, écran OLED, clavier
+        32 touches, joystick, 7 potentiomètres, LEDs adressables.
+      </p>
+      <div class="badges">
+        <span class="badge">30+ modes</span>
+        <span class="badge">AMY synth engine</span>
+        <span class="badge">4 cibles de build</span>
+        <span class="badge">100% open source</span>
+      </div>
+      <div class="cta-row">
+        <a class="btn primary" href="#simulateur">▶ Essayer dans le navigateur</a>
+        <a class="btn" href="https://github.com/clement-chupin/SynthBox">Code source sur GitHub</a>
+        <a class="btn" href="https://www.instagram.com/p/DdB59hfBGcy/">Vidéo de présentation</a>
+      </div>
+    </div>
+    <img class="hero-photo" src="images/hero.jpg" alt="Le boîtier GrvEP : écran OLED, clavier 4×8, joystick et potentiomètres">
+  </div>
+</section>
+
+<section id="fonctions" class="alt">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Fonctions</p>
+      <h2>Un seul firmware, 30+ instruments.</h2>
+      <p>Chaque mode partage le même moteur audio (AMY), la même chaîne d'effets et les
+         mêmes conventions d'interface — changer de mode, c'est changer d'instrument,
+         pas de machine.</p>
+    </div>
+    <div class="features-grid">
+      <div class="feature">
+        <p class="tag">SÉQUENCEURS</p>
+        <h3>Drums &amp; groove unifié</h3>
+        <p>Séquenceurs de percussions (DRUM2, DR2, BREAK, FELU...), MODE_GROOVE
+           (drums/synthé/303 sur une seule grille), MODE_EUCLI (rythmes euclidiens
+           polymétriques), MODE_CRUNCH (tracker 4 pistes façon MothOS).</p>
+      </div>
+      <div class="feature">
+        <p class="tag">SYNTHÉS</p>
+        <h3>Subtractif, FM, wavetable, 303...</h3>
+        <p>Synthé subtractif multi-oscillateur, FM, wavetable (MODULAR, 2 oscillateurs
+           sur wavetables AMY), émulation TB-303 (303S/I303), granulaire, lecteur de
+           samples SD.</p>
+      </div>
+      <div class="feature">
+        <p class="tag">GÉNÉRATIF</p>
+        <h3>Des modes qui composent avec vous</h3>
+        <p>Automate cellulaire (LIFE, Jeu de la vie sur la grille), essaim de boids
+           (SWARM), thérémine, physique de balles, ambiances génératives.</p>
+      </div>
+      <div class="feature">
+        <p class="tag">EFFETS</p>
+        <h3>Chaîne FX + modulation automatisable</h3>
+        <p>Delay, reverb, chorus, filtres LPF/HPF/BPF/LADDER à résonance élargie,
+           "FX punch" multi-touches instantané, LFO assignable à n'importe quel
+           paramètre d'effet.</p>
+      </div>
+      <div class="feature">
+        <p class="tag">MATÉRIEL</p>
+        <h3>Écran, clavier, joystick, LEDs</h3>
+        <p>OLED, clavier de 32 touches (4×8), joystick 2 axes + clic, 7 potentiomètres,
+           LEDs adressables (FastLED) pour un retour visuel immédiat sur chaque mode.</p>
+      </div>
+      <div class="feature">
+        <p class="tag">PORTABILITÉ</p>
+        <h3>Le même code, quatre cibles</h3>
+        <p>ESP32-S3 réel, simulateur desktop Linux/Windows (SDL2), APK Android natif,
+           et ce simulateur web (WebAssembly) — un seul code applicatif (<code>src/</code>).</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="simulateur">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Simulateur navigateur</p>
+      <h2>Essayez GrvEP sans rien installer.</h2>
+      <p>Même code C++ que le firmware ESP32 et le simulateur desktop, compilé en
+         WebAssembly. Pas de carte SD, pas de MP3, pas de MIDI USB dans cette version —
+         pour ça, voir les builds natifs plus bas.</p>
+    </div>
+    <div id="sim-status">Chargement…</div>
+
+    <div class="sim-layout">
+      <div class="col-screen sim-panel">
+        <canvas id="oled" width="128" height="128"></canvas>
+      </div>
+
+      <div class="col-controls">
+        <div class="sim-panel">
+          <div class="keys" id="keys"></div>
+        </div>
+        <div class="sim-panel joyrow">
+          <div>
+            <div id="joypad"><div id="joyknob"></div></div>
+            <div id="joyhint">glisser = déplacer · clic/Entrée = valider</div>
+          </div>
+          <div class="potgroups" id="potgroups"></div>
+        </div>
+      </div>
+    </div>
+
+    <p class="sim-help">
+      Clavier physique : touches <span class="mono">1-8</span> / <span class="mono">Q..I</span> /
+      <span class="mono">A..K</span> / <span class="mono">Z..M,</span> pour les notes,
+      <span class="mono">F1-F4</span> pour B1-B4, flèches pour le joystick,
+      <span class="mono">Entrée</span>/<span class="mono">Espace</span> pour son clic.
+      Un premier clic sur une touche ou le joystick est nécessaire pour démarrer l'audio
+      (politique autoplay des navigateurs).
+    </p>
+  </div>
+</section>
+
+<section id="build" class="alt">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Build</p>
+      <h2>Quatre cibles, un seul code applicatif.</h2>
+      <p>Le détail complet (flashage, releases, cross-compilation Windows, APK Android)
+         est dans le <a href="https://github.com/clement-chupin/SynthBox#readme">README du dépôt</a>.</p>
+    </div>
+    <div class="targets">
+      <div class="target">
+        <h3>ESP32-S3 (matériel réel)</h3>
+        <pre>pio run -e esp32-s3-devkitc-1 -t upload
+pio run -e esp32-s3-devkitc-1 -t monitor</pre>
+        <p>Via <a href="https://platformio.org/">PlatformIO</a>. Configuration (partitions
+           16MB, PSRAM, USB MIDI) dans <code>platformio.ini</code>.</p>
+      </div>
+      <div class="target">
+        <h3>Simulateur desktop (Linux/Windows)</h3>
+        <pre>cd simulator && ./build.sh
+DISPLAY=:1 ./build/grvep_sim</pre>
+        <p>SDL2 — écran, clavier, joystick et LEDs simulées, plus un spectrogramme et
+           une courbe EQ temps réel. <code>build_windows.sh</code> pour un .exe
+           autonome via MinGW-w64.</p>
+      </div>
+      <div class="target">
+        <h3>Android (APK natif)</h3>
+        <pre>cd android-native && ./setup_android.sh
+cd .. && ./build_native_apk.sh --install</pre>
+        <p>Le même simulateur SDL2, compilé nativement en C++ (pas de WebView).
+           APK déjà compilé : <a href="https://github.com/clement-chupin/SynthBox/blob/main/releases/GrvEP.apk">releases/GrvEP.apk</a>.</p>
+      </div>
+      <div class="target">
+        <h3>Web (WebAssembly)</h3>
+        <pre>cd web && ./build.sh</pre>
+        <p>Ce que vous testez juste au-dessus — via Emscripten + Audio Worklets.
+           Détails dans <a href="https://github.com/clement-chupin/SynthBox/blob/main/structure/WEB_SIMULATOR.md">structure/WEB_SIMULATOR.md</a>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="site">
+  <div class="wrap">
+    <div>
+      <a href="https://github.com/clement-chupin/SynthBox">Code source</a>
+      <a href="https://github.com/clement-chupin/SynthBox/blob/main/docs/GUIDE_UTILISATEUR.md">Guide utilisateur</a>
+      <a href="https://github.com/clement-chupin/SynthBox/blob/main/CLAUDE.md">Contribuer</a>
+      <a href="https://www.instagram.com/p/DdB59hfBGcy/">Instagram</a>
+    </div>
+    <div>GrvEP — projet personnel open source.</div>
+  </div>
+</footer>
+
+<script src="grvep.js"></script>
+<script>
+(function () {
+  "use strict";
+  var statusEl = document.getElementById("sim-status");
+  function setStatus(msg, isErr) {
+    statusEl.textContent = msg;
+    statusEl.className = isErr ? "err" : "";
+  }
+
+  var Module = null;
+  var ptrJoyX = 0, ptrJoyY = 0, ptrJoySW = 0, ptrSlider = 0;
+  var oledW = 128, oledH = 128;
+  var ledCount = 36;
+
+  // ---- OLED canvas (1-bit page-major buffer, see structure/WEB_SIMULATOR.md) ----
+  var oledCanvas = document.getElementById("oled");
+  var oledCtx = oledCanvas.getContext("2d");
+  var oledImg = oledCtx.createImageData(128, 128);
+
+  function drawOled(buf) {
+    // buf[page*128 + col], bit 0 = top pixel of that page (8 rows per page).
+    var data = oledImg.data;
+    for (var page = 0; page < 16; page++) {
+      for (var col = 0; col < 128; col++) {
+        var byte = buf[page * 128 + col];
+        for (var bit = 0; bit < 8; bit++) {
+          var y = page * 8 + bit;
+          var on = (byte >> bit) & 1;
+          var idx = (y * 128 + col) * 4;
+          data[idx] = on ? 0xbf : 0x05;
+          data[idx + 1] = on ? 0xe8 : 0x07;
+          data[idx + 2] = on ? 0xff : 0x0a;
+          data[idx + 3] = 255;
+        }
+      }
+    }
+    oledCtx.putImageData(oledImg, 0, 0);
+  }
+
+  // ---- LED → key color mapping, ported verbatim from simulator/sim_window.cpp's
+  // kLedTable[]/keyLedColor() (OOPSIE_LED_FLAG layout). LEDs are shown ON the keys
+  // themselves (their background color), like the desktop simulator — no separate
+  // LED canvas/display.
+  var kLedTable = [
+    32, 33, 34, 35,
+    32, 33, 34, 35,
+    31, 30, 29, 28, 27, 26, 25, 24,
+    16, 17, 18, 19, 20, 21, 22, 23,
+    15, 14, 13, 12, 11, 10,  9,  8,
+     0,  1,  2,  3,  4,  5,  6,  7,
+  ];
+  function keyLedIndex(row, col) {
+    var x = (4 - row) * 8 + (7 - col);
+    if (x < 0 || x >= kLedTable.length) return -1;
+    var idx = kLedTable[x];
+    if (idx < 0 || idx >= ledCount) return -1;
+    return idx;
+  }
+  // Default (unlit) key shading, ported from renderKeyboard()'s fallback colors.
+  function defaultKeyColor(row) {
+    if (row === 4) return "rgb(45,45,65)";
+    var shade = 35 + row * 5;
+    return "rgb(" + shade + "," + shade + "," + (shade + 8) + ")";
+  }
+
+  // ---- Key grid (5 rows x 8 cols). Built in the SAME visual order as the desktop
+  // simulator: menu row (B1-B4) on top, note rows below it from row3 (just under
+  // the menu row) down to row0 (bottom row); within every row, columns run
+  // col7..col0 left-to-right (col7 = lowest notes, col0 = highest — see
+  // simulator/sim_window.cpp's kKeyMap comment). The menu row's real buttons are
+  // cols 4-7 but B1-B4 map to col7..col4 respectively (NoteMap::getMenuButton()
+  // gives rawBtn=col-4, then handleButton() remaps btn=3-rawBtn — verified against
+  // main.cpp), so col7 is physically B1 and sits leftmost; the other half of that
+  // row has no real key and is left blank, matching the real keybed. ----
+  var keysEl = document.getElementById("keys");
+  var keyEls = {}; // "row_col" -> element, for real (non-blank) keys only
+
+  function makeKeyDiv(row, col, label, extraClass) {
+    var div = document.createElement("div");
+    div.className = "key" + (extraClass ? " " + extraClass : "");
+    div.textContent = label;
+    div.style.backgroundColor = defaultKeyColor(row);
+    bindKey(div, row, col);
+    keysEl.appendChild(div);
+    keyEls[row + "_" + col] = div;
+  }
+  function makeBlankDiv() {
+    var div = document.createElement("div");
+    div.className = "key blank";
+    keysEl.appendChild(div);
+  }
+
+  (function buildKeys() {
+    var displayRows = [4, 3, 2, 1, 0];
+    for (var ri = 0; ri < displayRows.length; ri++) {
+      var row = displayRows[ri];
+      if (row === 4) {
+        var menuCols = [7, 6, 5, 4]; // left to right = B1, B2, B3, B4
+        for (var mi = 0; mi < menuCols.length; mi++) {
+          makeKeyDiv(row, menuCols[mi], "B" + (mi + 1), "menu");
+        }
+        for (var bi = 0; bi < 4; bi++) makeBlankDiv();
+      } else {
+        var noteCols = [7, 6, 5, 4, 3, 2, 1, 0];
+        for (var ni = 0; ni < noteCols.length; ni++) {
+          var col = noteCols[ni];
+          makeKeyDiv(row, col, String(row * 8 + ni + 1), "");
+        }
+      }
+    }
+  })();
+
+  function bindKey(el, row, col) {
+    function press(e) { e.preventDefault(); maybeBoot(); el.classList.add("active"); simKeyPress(row, col, true); }
+    function release(e) { e.preventDefault(); el.classList.remove("active"); simKeyPress(row, col, false); }
+    el.addEventListener("mousedown", press);
+    el.addEventListener("mouseup", release);
+    el.addEventListener("mouseleave", function (e) { if (el.classList.contains("active")) release(e); });
+    el.addEventListener("touchstart", press, { passive: false });
+    el.addEventListener("touchend", release, { passive: false });
+    el.addEventListener("touchcancel", release, { passive: false });
+  }
+
+  function simKeyPress(row, col, pressed) {
+    if (!Module) return;
+    Module.ccall("simKeyPress", null, ["number", "number", "number"], [row, col, pressed ? 1 : 0]);
+  }
+
+  // ---- PC keyboard: play notes + menu buttons, ported from simulator/sim_window.cpp's
+  // kKeyMap[] (physical key position, QWERTY — e.code is layout-independent just like
+  // SDL_Scancode). Columns reversed (low notes left, high notes right), same as the
+  // on-screen key grid above. Highlights the matching on-screen key for visual parity. ----
+  var pcKeyMap = {
+    // Number row
+    "Digit1": [3,7], "Digit2": [3,6], "Digit3": [3,5], "Digit4": [3,4],
+    "Digit5": [3,3], "Digit6": [3,2], "Digit7": [3,1], "Digit8": [3,0],
+    // Row 2 (QWERTY: Q W E R T Y U I)
+    "KeyQ": [2,7], "KeyW": [2,6], "KeyE": [2,5], "KeyR": [2,4],
+    "KeyT": [2,3], "KeyY": [2,2], "KeyU": [2,1], "KeyI": [2,0],
+    // Row 1 (QWERTY: A S D F G H J K)
+    "KeyA": [1,7], "KeyS": [1,6], "KeyD": [1,5], "KeyF": [1,4],
+    "KeyG": [1,3], "KeyH": [1,2], "KeyJ": [1,1], "KeyK": [1,0],
+    // Row 0 (QWERTY: Z X C V B N M ,)
+    "KeyZ": [0,7], "KeyX": [0,6], "KeyC": [0,5], "KeyV": [0,4],
+    "KeyB": [0,3], "KeyN": [0,2], "KeyM": [0,1], "Comma": [0,0],
+    // Menu row = B1-B4
+    "F1": [4,4], "F2": [4,5], "F3": [4,6], "F4": [4,7],
+  };
+  var pcKeysDown = {};
+  window.addEventListener("keydown", function (e) {
+    if (e.repeat) return;
+    var tag = document.activeElement && document.activeElement.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    var rc = pcKeyMap[e.code];
+    if (!rc || pcKeysDown[e.code]) return;
+    e.preventDefault();
+    maybeBoot();
+    pcKeysDown[e.code] = rc;
+    var el = keyEls[rc[0] + "_" + rc[1]];
+    if (el) el.classList.add("active");
+    simKeyPress(rc[0], rc[1], true);
+  });
+  window.addEventListener("keyup", function (e) {
+    var rc = pcKeysDown[e.code];
+    if (!rc) return;
+    e.preventDefault();
+    delete pcKeysDown[e.code];
+    var el = keyEls[rc[0] + "_" + rc[1]];
+    if (el) el.classList.remove("active");
+    simKeyPress(rc[0], rc[1], false);
+  });
+
+  // ---- Joystick (2D drag pad) ----
+  var joypad = document.getElementById("joypad");
+  var joyknob = document.getElementById("joyknob");
+  var joyDragging = false;
+  function setJoy(x, y) {
+    x = Math.max(-1, Math.min(1, x));
+    y = Math.max(-1, Math.min(1, y));
+    joyknob.style.left = (50 + x * 40) + "%";
+    joyknob.style.top = (50 - y * 40) + "%";
+    if (Module && ptrJoyX) {
+      Module.HEAPF32[ptrJoyX >> 2] = x;
+      Module.HEAPF32[ptrJoyY >> 2] = y;
+    }
+  }
+  function setJoySW(down) {
+    joyknob.classList.toggle("down", down);
+    if (Module && ptrJoySW) Module.HEAPU8[ptrJoySW] = down ? 1 : 0;
+  }
+  function joyFromEvent(ev) {
+    var r = joypad.getBoundingClientRect();
+    var px = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left;
+    var py = (ev.touches ? ev.touches[0].clientY : ev.clientY) - r.top;
+    setJoy((px / r.width) * 2 - 1, -((py / r.height) * 2 - 1));
+  }
+  function joyStart(e) { e.preventDefault(); maybeBoot(); joyDragging = true; setJoySW(true); joyFromEvent(e); }
+  function joyMove(e) { if (joyDragging) { e.preventDefault(); joyFromEvent(e); } }
+  function joyEnd(e) { if (joyDragging) { e.preventDefault(); joyDragging = false; setJoySW(false); setJoy(0, 0); } }
+  joypad.addEventListener("mousedown", joyStart);
+  window.addEventListener("mousemove", joyMove);
+  window.addEventListener("mouseup", joyEnd);
+  joypad.addEventListener("touchstart", joyStart, { passive: false });
+  joypad.addEventListener("touchmove", joyMove, { passive: false });
+  joypad.addEventListener("touchend", joyEnd, { passive: false });
+
+  // Enter/Space = joystick switch click, matching the desktop simulator's
+  // SDL_SCANCODE_RETURN/SDL_SCANCODE_SPACE binding.
+  var joyKeyDown = false;
+  window.addEventListener("keydown", function (e) {
+    if (e.repeat) return;
+    var tag = document.activeElement && document.activeElement.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    if (e.code === "Enter" || e.code === "NumpadEnter" || e.code === "Space") {
+      e.preventDefault();
+      maybeBoot();
+      joyKeyDown = true;
+      setJoySW(true);
+    }
+  });
+  window.addEventListener("keyup", function (e) {
+    if (e.code === "Enter" || e.code === "NumpadEnter" || e.code === "Space") {
+      if (joyKeyDown) { e.preventDefault(); joyKeyDown = false; setJoySW(false); }
+    }
+  });
+
+  // Arrow keys = move the joystick, matching the desktop simulator's
+  // SDL_SCANCODE_LEFT/RIGHT/UP/DOWN → updateJoyFromKeys() binding.
+  var arrowLeft = false, arrowRight = false, arrowUp = false, arrowDown = false;
+  function updateJoyFromArrows() {
+    var x = 0, y = 0;
+    if (arrowLeft) x -= 1;
+    if (arrowRight) x += 1;
+    if (arrowUp) y += 1;
+    if (arrowDown) y -= 1;
+    setJoy(x, y);
+  }
+  window.addEventListener("keydown", function (e) {
+    var tag = document.activeElement && document.activeElement.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    switch (e.code) {
+      case "ArrowLeft":  e.preventDefault(); maybeBoot(); arrowLeft = true;  updateJoyFromArrows(); break;
+      case "ArrowRight": e.preventDefault(); maybeBoot(); arrowRight = true; updateJoyFromArrows(); break;
+      case "ArrowUp":    e.preventDefault(); maybeBoot(); arrowUp = true;    updateJoyFromArrows(); break;
+      case "ArrowDown":  e.preventDefault(); maybeBoot(); arrowDown = true;  updateJoyFromArrows(); break;
+    }
+  });
+  window.addEventListener("keyup", function (e) {
+    switch (e.code) {
+      case "ArrowLeft":  arrowLeft = false;  updateJoyFromArrows(); break;
+      case "ArrowRight": arrowRight = false; updateJoyFromArrows(); break;
+      case "ArrowUp":    arrowUp = false;    updateJoyFromArrows(); break;
+      case "ArrowDown":  arrowDown = false;  updateJoyFromArrows(); break;
+    }
+  });
+
+  // ---- 7 potentiometers, grouped like the simulator: main (VOL/P2/BPM) + secondary
+  // (P4-P7 FX params) — vertical sliders so the grouping reads the same way. ----
+  var potgroupsEl = document.getElementById("potgroups");
+  var potLabels = ["VOL", "P2", "BPM", "P4", "P5", "P6", "P7"];
+  var potDefaults = [0.35, 0.50, 0.00, 0.00, 0.00, 0.00, 0.00];
+  var mainGroup = document.createElement("div");
+  mainGroup.className = "potgroup main";
+  var secGroup = document.createElement("div");
+  secGroup.className = "potgroup sec";
+  potgroupsEl.appendChild(mainGroup);
+  potgroupsEl.appendChild(secGroup);
+  for (var p = 0; p < 7; p++) {
+    (function (i) {
+      var wrap = document.createElement("div");
+      wrap.className = "pot";
+      var label = document.createElement("label");
+      label.textContent = potLabels[i];
+      var input = document.createElement("input");
+      input.type = "range"; input.min = "0"; input.max = "1"; input.step = "0.001";
+      input.value = String(potDefaults[i]);
+      input.addEventListener("input", function () {
+        maybeBoot();
+        if (Module && ptrSlider) Module.HEAPF32[(ptrSlider >> 2) + i] = parseFloat(input.value);
+      });
+      wrap.appendChild(label); wrap.appendChild(input);
+      (i < 3 ? mainGroup : secGroup).appendChild(wrap);
+    })(p);
+  }
+
+  // ---- Boot ----
+  // grvepBoot() can hit an ASYNCIFY unwind/rewind internally (miniaudio's Emscripten
+  // Audio Worklet setup is asynchronous under the hood — creating the worklet means
+  // loading a separate script) — calling it as a plain synchronous ccall throws an
+  // uncaught "unwind" the moment that happens. `{async: true}` makes ccall return a
+  // Promise instead, which is required whenever the callee might unwind, not optional.
+  var booted = false;
+  function maybeBoot() {
+    if (booted || !Module) return;
+    booted = true;
+    Module.ccall("grvepBoot", null, [], [], { async: true }).then(function () {
+      setStatus("En cours d'exécution.");
+    }).catch(function (err) {
+      console.error(err);
+      setStatus("grvepBoot() a échoué : " + err, true);
+    });
+  }
+
+  if (typeof createGrvEP !== "function") {
+    setStatus("grvep.js n'a pas défini createGrvEP() — build manquant ou obsolète.", true);
+    return;
+  }
+
+  createGrvEP({
+    print: function (t) { console.log(t); },
+    printErr: function (t) { console.error(t); }
+  }).then(function (mod) {
+    Module = mod;
+    ptrJoyX  = Module.ccall("getJoyXPtr", "number", [], []);
+    ptrJoyY  = Module.ccall("getJoyYPtr", "number", [], []);
+    ptrJoySW = Module.ccall("getJoySWPtr", "number", [], []);
+    ptrSlider = Module.ccall("getSliderPtr", "number", [], []);
+    for (var i = 0; i < 7; i++) Module.HEAPF32[(ptrSlider >> 2) + i] = potDefaults[i];
+    oledW = Module.ccall("getOledWidth", "number", [], []) || 128;
+    oledH = Module.ccall("getOledHeight", "number", [], []) || 128;
+    ledCount = Module.ccall("getLedsCount", "number", [], []) || 36;
+    setStatus("Prêt — cliquez sur une touche ou le joystick pour démarrer l'audio (politique autoplay du navigateur).");
+
+    function frame() {
+      if (Module) {
+        if (Module.ccall("isOledDirty", "number", [], [])) {
+          var optr = Module.ccall("getOledBuffer", "number", [], []);
+          drawOled(Module.HEAPU8.subarray(optr, optr + 16 * 128));
+        }
+        if (Module.ccall("isLedsDirty", "number", [], [])) {
+          var lptr = Module.ccall("getLedsBuffer", "number", [], []);
+          var lbuf = Module.HEAPU8.subarray(lptr, lptr + ledCount * 3);
+          for (var key in keyEls) {
+            var parts = key.split("_");
+            var row = +parts[0], col = +parts[1];
+            var li = keyLedIndex(row, col);
+            var bg = defaultKeyColor(row);
+            if (li >= 0) {
+              var r = lbuf[li * 3], g = lbuf[li * 3 + 1], b = lbuf[li * 3 + 2];
+              if (r || g || b) bg = "rgb(" + r + "," + g + "," + b + ")";
+            }
+            keyEls[key].style.backgroundColor = bg;
+          }
+        }
+      }
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  }).catch(function (err) {
+    console.error(err);
+    setStatus("Échec du chargement du module WASM : " + err, true);
+  });
+})();
+</script>
+</body>
+</html>

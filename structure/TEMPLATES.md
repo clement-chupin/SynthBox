@@ -1,0 +1,415 @@
+# GrvEP — Mode Templates
+
+Un **template** est un ensemble de conventions UX partagées entre plusieurs modes.
+Créer un nouveau mode dans un template existant revient à brancher son logique spécifique
+sur une structure d'interaction déjà éprouvée (boutons, pots, LED, overlays, navigation).
+
+---
+
+## 1. Template SYNTH
+
+> Modes : `SYNTH`, `POKEMON`, `I303`, `MOD2`
+
+Instrument polyphonique ou monophonique joué sur la grille-clavier.
+L'accent est mis sur la sélection d'un **algorithme de synthèse** et le contrôle en temps réel
+via les potards et les overlays.
+
+### Pots
+
+| Pot | Rôle |
+|-----|------|
+| P1 | Volume global (0–1). En MODE_POKEMON : multiplié par `PokemonDef.gain`. |
+| P2 | Paramètre principal de l'instrument (onde, texture, algo, dusty…). |
+| P3 | BPM (partagé avec le séquenceur interne si activé). |
+| P4–P7 | Paramètres de modulation — sémantique fixe (SYNTH/POKEMON/I303) ou algo-spécifique (MOD2). |
+
+### Boutons (B1–B4, appui court sur la grille)
+
+| Bouton | Action |
+|--------|--------|
+| B1 | Overlay ARP / Scale (`OVERLAY_SCALE_ARP`) — toggle. |
+| B2 | Overlay Envelope (`OVERLAY_ENV`) — toggle. |
+| B3 | Overlay Browser d'instrument (`OVERLAY_INSTR`, `OVERLAY_I303_WAVE`, `OVERLAY_MOD2_ALGO`) — toggle. |
+| B4 | Octave (SYNTH/POKEMON/I303) · Cycle LFO mode (MOD2) · Mode-spécifique selon instrument. |
+
+### Joystick
+
+| Axe | Rôle |
+|-----|------|
+| JX | Vélocité des notes (dead-zone ±15 %). |
+| JY | Pitch-bend (±2 demi-tons, dead-zone ±15 %). |
+
+En présence d'un overlay browser (OVERLAY_INSTR, OVERLAY_I303_WAVE, OVERLAY_PKMN) :
+JX/JY naviguent dans le browser ; le pitch-bend est suspendu.
+
+### LEDs
+
+Palette **4 couleurs** par instrument, indexée `note % 4`.
+
+- Touche relâchée : `CHSV(pal[note%4], 200, 16)` (faible luminosité).
+- Touche pressée  : `CHSV(pal[note%4], 230, 255)` (pleine luminosité).
+
+Chaque mode déclare sa palette dans sa structure de données
+(ex. `PokemonDef.pal[4]` pour POKEMON).
+
+### Affichage OLED (ligne de statut)
+
+Format libre sur 128 px mais doit afficher au minimum :
+- Nom de l'instrument / algo courant.
+- Octave courante (`Oct:+0`).
+- Informations de sélection si applicable (ex. `26/42` pour POKEMON).
+
+### Overlays disponibles
+
+| Overlay | Description |
+|---------|-------------|
+| `OVERLAY_SCALE_ARP` | Sélection de gamme + mode arpège. |
+| `OVERLAY_ENV` | Paramètres d'enveloppe ADSR. |
+| `OVERLAY_INSTR` | Browser d'algorithmes de synthèse (SYNTH, MOD2). |
+| `OVERLAY_I303_WAVE` | Browser des 12 formes d'onde I303 (TRI, TRI2, SAW, SW3, SQR, SQ2, SIN, NAP, SWF, SQF, SNF, PINK). |
+| `OVERLAY_PKMN` | Browser Pokémon (POKEMON uniquement) : JX = type, JY = item. |
+| `OVERLAY_FX` | Sélection d'effet actif (modes qui exposent les FX via B1). |
+
+### Créer un nouveau mode SYNTH
+
+1. Définir la structure de données de l'instrument (forme d'onde, enveloppe, filtre, palette LEDs, gain).
+2. Implémenter `<mode>Apply()` qui appelle `audioSetShape / audioSetEnvelope / audioSetFilter / audioSetVolume`.
+3. Câbler P1–P7 dans le switch du pot-handler.
+4. Câbler B1–B4 dans `handleButton()` en suivant le tableau ci-dessus.
+5. Ajouter l'entrée dans `kMenuCatInstr[]` et `kMenuCatSizes[]`.
+6. Implémenter le bloc LED dans `updateLedsAndShow()`.
+7. Implémenter le bloc OLED dans `drawScreen()`.
+
+---
+
+## 2. Template SEQUENCER
+
+> Modes : `DRUM2`, `303S`, `303S2`, `SYSEQ`, `SS2`, `GRANULAR2`
+
+Pattern-sequencer pas-à-pas.
+L'accent est mis sur la **programmation de patterns** et la synchronisation BPM.
+
+### Pots
+
+| Pot | Rôle commun |
+|-----|-------------|
+| P1 | Volume global. |
+| P3 | BPM. |
+| P4–P7 | Paramètres de l'instrument courant **ou** paramètres FX actifs. |
+
+Le rôle de P2 est mode-spécifique (cutoff, texture, blend…).
+
+### Boutons (B1–B4)
+
+| Bouton | Action générique |
+|--------|-----------------|
+| B1 | FX / Transport (play/stop selon mode). |
+| B2 | Accent ou paramètre binaire mode-spécifique. |
+| B3 | Clear / Reset pattern ou sélection de preset. |
+| B4 | Navigation octave ou vue séquenceur. |
+
+La grille clavier est utilisée pour **entrer / effacer** des pas ou jouer en live.
+Le mode B hold (appui long) peut accéder à des overlays secondaires (`OVERLAY_SEQB2`, `OVERLAY_303`, `OVERLAY_FX`).
+
+### Joystick
+
+| Axe | Rôle |
+|-----|------|
+| JX | Cycle de forme d'onde (pour les modes à onde variable : 303S, I303, SS2). |
+| JY | Octave (haut = +1 oct, bas = -1 oct). |
+
+### LEDs
+
+Affichage de l'état des pas du pattern en cours.
+
+- Pas actif + tête de lecture : pleine luminosité accent.
+- Pas actif + hors lecture : luminosité intermédiaire.
+- Pas vide : éteint ou très faible.
+
+### Affichage OLED
+
+Grille de pas (typiquement 8 ou 16 pas sur 2 lignes), BPM, octave, slide/accent.
+
+### Overlays disponibles
+
+| Overlay | Description |
+|---------|-------------|
+| `OVERLAY_FX` | Sélection et paramétrage d'effets. |
+| `OVERLAY_303` | Options 303 : wave, slide, accent, octave. |
+| `OVERLAY_303_PRESET` | Presets 303 prédéfinis. |
+| `OVERLAY_SEQ_OPT` | Options de lecture (loop, 1-shot, cut-note). |
+| `OVERLAY_SEQB2` | Grille FX + octave + shape (accès par B hold). |
+| `OVERLAY_SYSEQ` | Options spécifiques SYSEQ. |
+
+### Créer un nouveau mode SEQUENCER
+
+1. Définir le buffer de pattern (`step[]`, taille, résolution).
+2. Implémenter le tick séquenceur dans le timer ISR ou le task loop.
+3. Câbler B1–B4 (transport, accent, clear, navigation).
+4. Afficher les pas dans l'OLED et les LEDs.
+5. Synchroniser sur `bpmToMs(bpm)` via le timer global.
+
+---
+
+## 2b. GROOVE — Séquenceur unifié drums/synth/303 (variante du template SEQUENCER)
+
+GROOVE suit la philosophie SEQUENCER (programmation de pattern + sync BPM) mais s'écarte du
+gabarit "8-16 pas sur 2 lignes" : **toute la grille 4×8 = le pattern d'une seule piste**
+(10 pistes disponibles, cyclées au joystick X), pas de vue "pad" séparée. Voir
+`structure/SOFTWARE.md`'s section MODE_GROOVE pour l'architecture complète.
+
+### Pots
+
+| Pot | Rôle |
+|-----|------|
+| P1 | Volume global. |
+| P2 | Swing (persistant, sauvegardé avec le pattern — pas transitoire comme DRUM2/SYSEQ). |
+| P3 | BPM. |
+| P4 | Longueur de pattern de la piste focus (1-32). |
+| P5 | Stamp d'écriture (accent/slide ou probabilité/ratchet selon le type de piste). |
+| P6-P7 | Spécifique à la piste focus (303 : Reso/Cutoff ; synthé : Volume) **ou**, si un FX est actif, paramètres de cet FX (P4-P7 basculent entièrement). |
+
+### Boutons (B1–B4)
+
+Convention séquenceur classique (**B1**=Play/Stop, **B2**=FX — pas la convention SYNTH
+où B1=FX) :
+
+| Bouton | Court | Double-clic |
+|--------|-------|--------------|
+| B1 | Play/Stop | — |
+| B2 | `OVERLAY_FX` | `OVERLAY_SCALE_ARP` (octave/gamme des pistes mélodiques) |
+| B3 | Mute piste focus | Solo piste focus |
+| B4 | Cycle banque de pattern (4 slots) | Copier/coller (identique à DR2) |
+
+### Joystick
+
+| Axe | Rôle |
+|-----|------|
+| JX | Cycle la piste focus (10 pistes) — déclenché par franchissement de seuil, pas proportionnel (le stick est à rappel auto). |
+| JY | Curseur de note d'écriture (pistes synthé/303 uniquement), un demi-ton par franchissement. |
+
+### Édition de pas — modèle "stamp" (pas de nouvel overlay)
+
+Une pression courte sur une case vide pose un pas avec le stamp courant (P5 + JY) ; une
+pression sur une case déjà posée l'efface. Identique au principe déjà utilisé par
+DR2/303S/SYSEQ/SS2 — aucune nouvelle mécanique d'édition per-pas nécessaire.
+
+### LEDs / OLED
+
+Même convention que le template SEQUENCER (tête de lecture = pleine luminosité, pas actif =
+intermédiaire, pas vide = éteint), mais sur les 32 touches physiques 1:1 avec les 32 pas du
+pattern affiché — pas de vue à 2 lignes.
+
+---
+
+## 2c. EUCLI — Séquenceur euclidien (variante du template SEQUENCER)
+
+EUCLI suit la philosophie SEQUENCER (BPM partagé, B1=Play/Stop) mais la grille clavier n'y
+édite pas des pas — une touche choisit d'un coup le nombre de pas d'une piste dans une
+palette fixe (`{4,6,8,12,16,20,26,32}`, une valeur par colonne), le nombre de coups étant
+réparti automatiquement par un algorithme euclidien (accumulateur à la Bjorklund). Voir
+`structure/SOFTWARE.md`'s section MODE_EUCLI pour l'architecture complète.
+
+### Pots
+
+| Pot | Rôle |
+|-----|------|
+| P1 | Volume global. |
+| P3 | BPM. |
+| P4-P7 | Nombre de coups (une piste par potard) **ou**, si un FX est actif, paramètres de cet FX. |
+
+### Boutons (B1–B4)
+
+| Bouton | Action |
+|--------|--------|
+| B1 | Play/Stop |
+| B2 | `OVERLAY_FX` |
+| B3 | Cycle banque de sons (4 kits curés parmi les 32 pads partagés) |
+| B4 | Reset toutes les têtes de lecture à 0 (sans toucher aux pas/coups) |
+
+### Clavier — palette, pas placement de pas
+
+Une ligne = une piste, une colonne = un choix dans la palette de pas (pas un instant
+temporel comme dans DRUM2/GROOVE). Appuyer sur une case sélectionne directement le nombre
+de pas de cette piste et reconstruit son pattern.
+
+### LEDs / OLED
+
+Anneaux concentriques (un par piste, tête de lecture = pleine luminosité) en haut de
+l'écran, barre + `X/S` + nom du pad par piste en bas.
+
+---
+
+## 3. Template STANDALONE / PERFORMANCE
+
+> Modes : `EXP`, `EXP2`, `EXP3`, `LIFE`, `SWARM`
+
+`LIFE` et `SWARM` (Conway's-Game-of-Life sur la grille / boids flocking) suivent ce même
+template : grille de touches réinterprétée librement (cellule vivante/morte pour LIFE,
+spawn de boid pour SWARM — pas un clavier note-par-note classique), pots/joystick
+sémantique libre définie en tête de chaque bloc. `SWARM` réutilise volontairement la
+structure de balle/l'arène tournante/le clamp de vitesse déjà écrits pour `EXP2` plutôt
+que d'en réinventer une — voir `structure/SOFTWARE.md`, section « Modes expérimentaux ».
+
+Mode autonome de performance ou d'exploration ne nécessitant pas de grille-clavier fixe.
+L'interface est entièrement définie par le mode lui-même.
+
+### Pots
+
+Libres. Chaque mode définit la sémantique de P1–P7.
+
+### Boutons
+
+Libres. Pas de convention B1–B4 imposée.
+
+### Joystick
+
+Libre (peut contrôler pitch, filtre, panoramique, position, etc.).
+
+### LEDs
+
+Visualisation libre (animation, vu-mètre, spectre, palette fixe, etc.).
+
+### Affichage OLED
+
+Libre — interface propre au mode.
+
+### Créer un nouveau mode STANDALONE
+
+Aucune convention stricte. Décrire dans un commentaire en tête du bloc la sémantique
+de chaque contrôle, puis implémenter librement dans les sections
+`handleButton`, `handlePots`, `drawScreen`, `updateLedsAndShow`.
+
+---
+
+## 1b. MOD2 — Synthétiseur Modulaire (variante du template SYNTH)
+
+MOD2 suit le template SYNTH mais introduit le concept d'**algorithme de synthèse** :
+au lieu d'un son fixe, chaque algo est une topologie audio complète avec ses 4 paramètres exposés.
+
+### Algorithmes disponibles (P2 = sélection, B3 = browser visuel)
+
+| Algo | Shape AMY | P4 | P5 | P6 | P7 |
+|------|-----------|----|----|----|----|
+| VCO  | SAW | Cutoff | Resonance | Drive | Decay |
+| DUO  | SUPERSAW | Cutoff | Resonance | Saturation | Reverb |
+| FM2  | SAW_FM | FM Depth | Cutoff | Resonance | Drive |
+| ACID | SAW | Cutoff (80–2kHz) | Resonance (2–16) | Decay | Drive |
+| PAD  | SUPERSAW | Cutoff | Chorus | Reverb | Saturation |
+| NOIS | NOISE_WHITE | Cutoff | Resonance | Drive | Decay |
+| PLCK | PLUCK | Brightness | Resonance | Drive | Decay |
+| LEAD | HOOVER | Drive (1–8) | Cutoff | Resonance | FM Depth |
+
+### Mapping des boutons MOD2
+
+| Bouton | Action |
+|--------|--------|
+| B1 | Overlay FX (`OVERLAY_FX`) — toggle. |
+| B2 | Overlay ENV (enveloppe ADSR) — toggle. |
+| B3 | Algo browser (`OVERLAY_MOD2_ALGO`) — grille 2×4, 8 algos — toggle. |
+| B4 | Cycle play mode (Poly → Mono → Slide → Poly). |
+
+### LFO
+
+Moteur LFO background (10ms tick) indépendant des pots.  
+- **Destination** : Pitch ou Filter (selon mode LFO)  
+- **Waveforms** : SIN, TRI, SAW, RevSAW, SQR, S&H  
+- **Rate** : 2 Hz (fixe)  
+- **Depth** : 0.5 st (pitch) / 500 Hz (filter)  
+- **B4** = cycle parmi 13 modes (Off + 6 Pitch + 6 Filter)  
+
+### Ajouter un nouvel algo MOD2
+
+1. Ajouter une entrée dans `kMod2Algos[]` (`config.h`) avec shape + 4 `Mod2ParamDef`
+2. Ajouter un `case N:` dans `mod2ApplyP4P7()` qui appelle les fonctions audio correspondantes
+3. Mettre à jour `MOD2_ALGO_COUNT`
+4. (optionnel) Ajouter des LEDs algo-spécifiques dans `updateLedsAndShow()`
+
+---
+
+## 4. Template MOTHOS TRACKER
+
+> Mode : `CRUNCH` (le seul pour l'instant)
+
+Gabarit importé tel quel du firmware [MothOS](https://github.com/MothSynths/MothOS), pas
+une convention GrvEP native — à utiliser pour tout futur mode qui voudrait porter un autre
+firmware/contrôleur externe plutôt que d'inventer sa propre UI. Contrairement aux templates
+SYNTH/SEQUENCER, ce n'est pas B1-B4 + pots qui portent l'essentiel du contrôle : c'est la
+**grille clavier elle-même**, qui simule le clavier 4×4 (4 touches shift + 12 touches
+note/commande) du firmware d'origine. Voir `structure/SOFTWARE.md`'s section MODE_CRUNCH
+pour l'architecture complète et ce qui n'a pas été porté (effets par voix sans équivalent
+DSP dans GrvEP).
+
+### Grille clavier = clavier 4×4 + 4 shifts d'origine
+
+- Ligne physique du haut = les 4 touches shift (collantes : un appui arme, l'appui suivant
+  — n'importe lequel, y compris une autre touche shift — consomme l'armement et exécute la
+  commande). Les 3 lignes du dessous = les 12 touches note/commande.
+- Colonnes dupliquées par moitié (`3-(col%4)` dans ce codebase — voir la note sur la
+  convention colonne dans `structure/SOFTWARE.md`) pour occuper les 8 colonnes physiques
+  avec les 4 colonnes logiques d'origine.
+- Overlay légende (grille 4×4 statique, un texte par cellule) affiché à la place de l'écran
+  principal tant qu'une touche shift est armée — remplace le manuel/l'étiquetage physique
+  du clavier d'origine.
+
+### Boutons/pots — rôle réduit, pas la convention SEQUENCER standard
+
+B1 (Play/Stop) et B4 (browser d'instrument) restent câblés comme un bonus de confort — pas
+strictement nécessaires, tout est aussi joignable au clavier. B2 fait exception : il ouvre
+le bus FX partagé standard de GrvEP (`OVERLAY_FX`), qui **remplace** les effets par voix de
+l'original plutôt que de les porter (aucun équivalent DSP disponible). P2/P4/P5 dupliquent
+en continu ce que certaines commandes clavier ne font qu'en discret (octave, volume, durée
+de relâchement) — les deux chemins écrivent le même état, aucun conflit.
+
+### Créer un nouveau mode MOTHOS TRACKER
+
+1. Définir la table de résolution touche→(banque de bits fixes / instrument mélodique
+   pitché) — ne pas supposer que toutes les touches d'un même slot jouent le même
+   échantillon à des hauteurs différentes, vérifier dans la source d'origine.
+2. Porter la logique d'armement/consommation des touches shift (`crunchFnc[]`/
+   `crunchDispatchCommand()` dans `main.cpp` comme patron direct).
+3. Écrire l'overlay légende (texte statique par cellule, un jeu de 4 grilles — une par
+   touche shift armée).
+4. Identifier les effets/paramètres du firmware d'origine sans équivalent DSP GrvEP et les
+   documenter explicitement comme non portés plutôt que de deviner un mapping approximatif.
+
+---
+
+## Résumé des templates par mode
+
+| Mode | Template | B3 overlay instrument | B4 |
+|------|----------|-----------------------|----|
+| SYNTH | SYNTH | `OVERLAY_INSTR` | Octave |
+| POKEMON | SYNTH | `OVERLAY_PKMN` | Octave |
+| I303 | SYNTH | `OVERLAY_I303_WAVE` | Octave |
+| MOD2 | SYNTH (variante) | `OVERLAY_MOD2_ALGO` | Cycle play mode (Poly/Mono/Slide) |
+| DRUM2 | SEQUENCER | — | Vue |
+| 303S | SEQUENCER | — | Octave / JX cycle |
+| 303S2 | SEQUENCER | — | Clear |
+| SYSEQ | SEQUENCER | — | Octave |
+| SS2 | SEQUENCER | — | Mode play |
+| GRANULAR2 | SEQUENCER | — | Granular opts |
+| GROOVE | SEQUENCER (variante 2b) | — | Cycle banque pattern / copier-coller |
+| EUCLI | SEQUENCER (variante 2c) | — | Reset têtes de lecture |
+| CRUNCH | MOTHOS TRACKER | `OVERLAY_CRUNCH` (12 slots) | Browser d'instrument (bonus) |
+| EXP | STANDALONE | libre | libre |
+| EXP2 | STANDALONE | libre | libre |
+| EXP3 | STANDALONE | libre | libre |
+
+---
+
+## Conventions transverses (tous templates)
+
+- **Pots P1/P3 réservés** (Volume/BPM) dans tous les modes — un mode ne peut utiliser que P2 et
+  P4-P7. Détail et bug LANIM associé : SOFTWARE.md, section « Pots ».
+- **Curseurs de pots = grille 2×2 placée selon la position PHYSIQUE des potards** (`potGridPos()`,
+  `main.cpp` : P4=haut-droite, P5=bas-droite, P6=bas-gauche, P7=haut-gauche autour du joystick ;
+  P2, sans coin propre, prend haut-gauche) — jamais `i%2`/`i/2`. Jamais alignés en colonne : 4 paramètres liés aux pots
+  s'affichent en deux rangées de deux barres étiquetées (panneau FX, LANIM, NOOB, moitié basse
+  d'EUCLI). Exceptions assumées : la bande de 7 faders de MIDI (elle reproduit le matériel) et
+  les listes de texte de MOD2 (pas des curseurs).
+- **Grille FX** : voir SOFTWARE.md « Effets » (interface, sélection au clavier cols 4-7, appui
+  long = automatisation). L'ouverture de l'overlay est câblée **mode par mode** dans
+  `handleButton()` ; un nouveau mode doit choisir un bouton libre et ajouter son propre cas
+  (état des lieux et modes qui n'y ont pas accès : HANDOFF.md).
+- **Légende console** : chaque mode a besoin d'une entrée dans `ctrlLabelsFor()`.

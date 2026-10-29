@@ -1,0 +1,103 @@
+// Copyright 2012 Emilie Gillet.
+//
+// Author: Emilie Gillet (emilie.o.gillet@gmail.com)
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+// 
+// See http://creativecommons.org/licenses/MIT/ for more information.
+//
+// -----------------------------------------------------------------------------
+//
+// Settings
+
+#ifndef BRAIDS_SETTINGS_H_
+#define BRAIDS_SETTINGS_H_
+
+// SevenSynth: trimmed to the oscillator shapes (the module's settings, UI and flash storage are not used; VENDOR.md)
+
+#include "engine/dsp/fdsp.h"
+
+namespace braids {
+
+enum MacroOscillatorShape {
+  MACRO_OSC_SHAPE_CSAW,
+  MACRO_OSC_SHAPE_MORPH,
+  MACRO_OSC_SHAPE_SAW_SQUARE,
+  MACRO_OSC_SHAPE_SINE_TRIANGLE,
+  MACRO_OSC_SHAPE_BUZZ,
+  
+  MACRO_OSC_SHAPE_SQUARE_SUB,
+  MACRO_OSC_SHAPE_SAW_SUB,
+  MACRO_OSC_SHAPE_SQUARE_SYNC,
+  MACRO_OSC_SHAPE_SAW_SYNC,
+  MACRO_OSC_SHAPE_TRIPLE_SAW,
+  MACRO_OSC_SHAPE_TRIPLE_SQUARE,
+  MACRO_OSC_SHAPE_TRIPLE_TRIANGLE,
+  MACRO_OSC_SHAPE_TRIPLE_SINE,
+  MACRO_OSC_SHAPE_TRIPLE_RING_MOD,
+  MACRO_OSC_SHAPE_SAW_SWARM,
+  MACRO_OSC_SHAPE_SAW_COMB,
+  MACRO_OSC_SHAPE_TOY,
+
+  MACRO_OSC_SHAPE_DIGITAL_FILTER_LP,
+  MACRO_OSC_SHAPE_DIGITAL_FILTER_PK,
+  MACRO_OSC_SHAPE_DIGITAL_FILTER_BP,
+  MACRO_OSC_SHAPE_DIGITAL_FILTER_HP,
+  MACRO_OSC_SHAPE_VOSIM,
+  MACRO_OSC_SHAPE_VOWEL,
+  MACRO_OSC_SHAPE_VOWEL_FOF,
+  
+  MACRO_OSC_SHAPE_HARMONICS,
+
+  MACRO_OSC_SHAPE_FM,
+  MACRO_OSC_SHAPE_FEEDBACK_FM,
+  MACRO_OSC_SHAPE_CHAOTIC_FEEDBACK_FM,
+
+  MACRO_OSC_SHAPE_PLUCKED,
+  MACRO_OSC_SHAPE_BOWED,
+  MACRO_OSC_SHAPE_BLOWN,
+  MACRO_OSC_SHAPE_FLUTED,
+  MACRO_OSC_SHAPE_STRUCK_BELL,
+  MACRO_OSC_SHAPE_STRUCK_DRUM,
+  MACRO_OSC_SHAPE_KICK,
+  MACRO_OSC_SHAPE_CYMBAL,
+  MACRO_OSC_SHAPE_SNARE,
+
+  MACRO_OSC_SHAPE_WAVETABLES,
+  MACRO_OSC_SHAPE_WAVE_MAP,
+  MACRO_OSC_SHAPE_WAVE_LINE,
+  MACRO_OSC_SHAPE_WAVE_PARAPHONIC,
+
+  MACRO_OSC_SHAPE_FILTERED_NOISE,
+  MACRO_OSC_SHAPE_TWIN_PEAKS_NOISE,
+  MACRO_OSC_SHAPE_CLOCKED_NOISE,
+  MACRO_OSC_SHAPE_GRANULAR_CLOUD,
+  MACRO_OSC_SHAPE_PARTICLE_NOISE,
+  
+  MACRO_OSC_SHAPE_DIGITAL_MODULATION,
+
+  MACRO_OSC_SHAPE_QUESTION_MARK,
+  // MACRO_OSC_SHAPE_YOUR_ALGO
+  MACRO_OSC_SHAPE_LAST,
+  MACRO_OSC_SHAPE_LAST_ACCESSIBLE_FROM_META = MACRO_OSC_SHAPE_DIGITAL_MODULATION
+};
+
+}  // namespace braids
+
+#endif  // BRAIDS_SETTINGS_H_
